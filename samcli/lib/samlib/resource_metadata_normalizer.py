@@ -2,14 +2,15 @@
 Class that Normalizes a Template based on Resource Metadata
 """
 
-import logging
-from pathlib import Path
 import json
+import logging
 import re
+from copy import deepcopy
+from pathlib import Path
 from typing import Dict
 
+from samcli.lib.cfn_language_extensions.utils import iter_regular_resources
 from samcli.lib.iac.cdk.utils import is_cdk_project
-
 from samcli.lib.utils.resources import AWS_CLOUDFORMATION_STACK
 
 CDK_NESTED_STACK_RESOURCE_ID_SUFFIX = ".NestedStack"
@@ -25,12 +26,14 @@ ASSET_PROPERTY_METADATA_KEY = "aws:asset:property"
 IMAGE_ASSET_PROPERTY = "Code.ImageUri"
 ASSET_DOCKERFILE_PATH_KEY = "aws:asset:dockerfile-path"
 ASSET_DOCKERFILE_BUILD_ARGS_KEY = "aws:asset:docker-build-args"
+ASSET_DOCKER_BUILD_EXTRA_PARAMS_KEY = "aws:asset:docker-build-extra-params"
 
 SAM_RESOURCE_ID_KEY = "SamResourceId"
 SAM_IS_NORMALIZED = "SamNormalized"
 SAM_METADATA_DOCKERFILE_KEY = "Dockerfile"
 SAM_METADATA_DOCKER_CONTEXT_KEY = "DockerContext"
 SAM_METADATA_DOCKER_BUILD_ARGS_KEY = "DockerBuildArgs"
+SAM_METADATA_DOCKER_BUILD_EXTRA_PARAMS_KEY = "DockerBuildExtraParams"
 
 ASSET_BUNDLED_METADATA_KEY = "aws:asset:is-bundled"
 SAM_METADATA_SKIP_BUILD_KEY = "SkipBuild"
@@ -61,11 +64,10 @@ class ResourceMetadataNormalizer:
         """
         resources = template_dict.get(RESOURCES_KEY, {})
 
-        for logical_id, resource in resources.items():
-            resource_metadata = resource.get(METADATA_KEY)
-            if resource_metadata is None:
-                resource_metadata = {}
-                resource[METADATA_KEY] = resource_metadata
+        for logical_id, resource in iter_regular_resources(template_dict):
+
+            # copy metadata to another variable, change its values and assign it back in the end
+            resource_metadata = deepcopy(resource.get(METADATA_KEY)) or {}
 
             is_normalized = resource_metadata.get(SAM_IS_NORMALIZED, False)
             if not is_normalized:
@@ -98,6 +100,7 @@ class ResourceMetadataNormalizer:
                 resource_metadata,
                 {SAM_RESOURCE_ID_KEY: ResourceMetadataNormalizer.get_resource_id(resource, logical_id)},
             )
+            resource[METADATA_KEY] = resource_metadata
 
         # This is a work around to allow the customer to use sam deploy or package commands without the need to provide
         # values for the CDK auto generated asset parameters. The suggested solution is to let CDK add some metadata to
@@ -186,12 +189,11 @@ class ResourceMetadataNormalizer:
         """
         asset_path = Path(metadata.get(ASSET_PATH_METADATA_KEY, ""))
         dockerfile_path = Path(metadata.get(ASSET_DOCKERFILE_PATH_KEY), "")
-        dockerfile, path_from_asset = dockerfile_path.stem, dockerfile_path.parent
-        dockerfile_context = str(Path(asset_path.joinpath(path_from_asset)))
         return {
-            SAM_METADATA_DOCKERFILE_KEY: dockerfile,
-            SAM_METADATA_DOCKER_CONTEXT_KEY: dockerfile_context,
+            SAM_METADATA_DOCKERFILE_KEY: str(dockerfile_path.as_posix()),
+            SAM_METADATA_DOCKER_CONTEXT_KEY: str(asset_path),
             SAM_METADATA_DOCKER_BUILD_ARGS_KEY: metadata.get(ASSET_DOCKERFILE_BUILD_ARGS_KEY, {}),
+            SAM_METADATA_DOCKER_BUILD_EXTRA_PARAMS_KEY: metadata.get(ASSET_DOCKER_BUILD_EXTRA_PARAMS_KEY, []),
         }
 
     @staticmethod
@@ -255,10 +257,15 @@ class ResourceMetadataNormalizer:
         # aws:cdk:path metadata format of functions: {stack_id}/{function_id}/Resource
         # Design doc of CDK path: https://github.com/aws/aws-cdk/blob/master/design/construct-tree.md
         cdk_path_partitions = resource_cdk_path.split("/")
+        min_cdk_path_partitions_length = 2
+        max_cdk_path_partitions_length = 3
 
         LOG.debug("CDK Path for resource %s is %s", logical_id, cdk_path_partitions)
 
-        if len(cdk_path_partitions) < 2:
+        if (
+            len(cdk_path_partitions) < min_cdk_path_partitions_length
+            or len(cdk_path_partitions) > max_cdk_path_partitions_length
+        ):
             LOG.warning(
                 "Cannot detect function id from aws:cdk:path metadata '%s', using default logical id", resource_cdk_path
             )

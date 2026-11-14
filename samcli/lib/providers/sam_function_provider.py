@@ -1,27 +1,33 @@
 """
 Class that provides functions from a given SAM template
 """
+
 import logging
-from typing import Dict, List, Optional, cast, Iterator, Any
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
 
 from samtranslator.policy_template_processor.exceptions import TemplateNotFoundException
 
+from samcli.cli.context import Context
+from samcli.commands._utils.template import TemplateFailedParsingException
+from samcli.commands.local.cli_common.user_exceptions import InvalidLayerVersionArn
+from samcli.lib.build.constants import DEPRECATED_RUNTIMES
+from samcli.lib.build.exceptions import MissingFunctionHandlerException
+from samcli.lib.providers.exceptions import InvalidLayerReference, MissingFunctionNameException
+from samcli.lib.providers.provider import Function, LayerVersion, Stack, get_full_path, get_function_build_info
+from samcli.lib.providers.sam_base_provider import SamBaseProvider
+from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
+from samcli.lib.utils.colors import Colored, Colors
+from samcli.lib.utils.file_observer import FileObserver
+from samcli.lib.utils.packagetype import IMAGE, ZIP
+from samcli.lib.utils.path_utils import check_path_valid_type
 from samcli.lib.utils.resources import (
     AWS_LAMBDA_FUNCTION,
     AWS_LAMBDA_LAYERVERSION,
     AWS_SERVERLESS_FUNCTION,
     AWS_SERVERLESS_LAYERVERSION,
 )
-from samcli.commands.local.cli_common.user_exceptions import InvalidLayerVersionArn
-from samcli.commands._utils.template import TemplateFailedParsingException
-from samcli.lib.providers.exceptions import InvalidLayerReference
-from samcli.lib.utils.colors import Colored
-from samcli.lib.utils.packagetype import ZIP, IMAGE
-from samcli.lib.utils.file_observer import FileObserver
-from .provider import Function, LayerVersion, Stack
-from .sam_base_provider import SamBaseProvider
-from .sam_stack_provider import SamLocalStackProvider
-from ..build.app_builder import DEPRECATED_RUNTIMES
 
 LOG = logging.getLogger(__name__)
 
@@ -35,7 +41,12 @@ class SamFunctionProvider(SamBaseProvider):
     """
 
     def __init__(
-        self, stacks: List[Stack], use_raw_codeuri: bool = False, ignore_code_extraction_warnings: bool = False
+        self,
+        stacks: List[Stack],
+        use_raw_codeuri: bool = False,
+        ignore_code_extraction_warnings: bool = False,
+        locate_layer_nested: bool = False,
+        function_logical_ids: Optional[Tuple[str, ...]] = None,
     ) -> None:
         """
         Initialize the class with SAM template data. The SAM template passed to this provider is assumed
@@ -51,16 +62,19 @@ class SamFunctionProvider(SamBaseProvider):
         :param bool use_raw_codeuri: Do not resolve adjust core_uri based on the template path, use the raw uri.
             Note(xinhol): use_raw_codeuri is temporary to fix a bug, and will be removed for a permanent solution.
         :param bool ignore_code_extraction_warnings: Ignores Log warnings
+        :param bool locate_layer_nested: resolved nested layer reference to their actual location in the nested stack
+        :param tuple function_logical_ids: Optional tuple of function logical IDs to filter by
         """
 
         self._stacks = stacks
+        self._function_logical_ids = function_logical_ids
 
         for stack in stacks:
             LOG.debug("%d resources found in the stack %s", len(stack.resources), stack.stack_path)
 
         # Store a map of function full_path to function information for quick reference
         self.functions = SamFunctionProvider._extract_functions(
-            self._stacks, use_raw_codeuri, ignore_code_extraction_warnings
+            self._stacks, use_raw_codeuri, ignore_code_extraction_warnings, locate_layer_nested, function_logical_ids
         )
 
         self._colored = Colored()
@@ -73,6 +87,28 @@ class SamFunctionProvider(SamBaseProvider):
         :return list: list of stacks
         """
         return self._stacks
+
+    def update(
+        self,
+        stacks: List[Stack],
+        use_raw_codeuri: bool = False,
+        ignore_code_extraction_warnings: bool = False,
+        locate_layer_nested: bool = False,
+        function_logical_ids: Optional[Tuple[str, ...]] = None,
+    ) -> None:
+        """
+        Hydrate the function provider with updated stacks
+        :param dict stacks: List of stacks functions are extracted from
+        :param bool use_raw_codeuri: Do not resolve adjust core_uri based on the template path, use the raw uri.
+            Note(xinhol): use_raw_codeuri is temporary to fix a bug, and will be removed for a permanent solution.
+        :param bool ignore_code_extraction_warnings: Ignores Log warnings
+        :param bool locate_layer_nested: resolved nested layer reference to their actual location in the nested stack
+        :param tuple function_logical_ids: Optional tuple of function logical IDs to filter by
+        """
+        self._stacks = stacks
+        self.functions = SamFunctionProvider._extract_functions(
+            self._stacks, use_raw_codeuri, ignore_code_extraction_warnings, locate_layer_nested, function_logical_ids
+        )
 
     def get(self, name: str) -> Optional[Function]:
         """
@@ -89,7 +125,8 @@ class SamFunctionProvider(SamBaseProvider):
         """
 
         if not name:
-            raise ValueError("Function name is required")
+            LOG.debug("Function name is not defined, unable to fetch Lambda function.")
+            raise MissingFunctionNameException()
 
         resolved_function = None
 
@@ -137,7 +174,7 @@ class SamFunctionProvider(SamBaseProvider):
                 "runtime. For more information please check AWS Lambda Runtime Support Policy: "
                 "https://docs.aws.amazon.com/lambda/latest/dg/runtime-support-policy.html"
             )
-            LOG.warning(self._colored.yellow(message))
+            LOG.warning(self._colored.color_log(msg=message, color=Colors.WARNING), extra=dict(markup=True))
 
     def get_all(self) -> Iterator[Function]:
         """
@@ -150,8 +187,28 @@ class SamFunctionProvider(SamBaseProvider):
             yield function
 
     @staticmethod
+    def _should_include_function(function: Function, function_logical_ids: set) -> bool:
+        """
+        Determines if a function should be included based on the filter.
+        Matches against function_id, name, and functionname.
+
+        :param function: Function object to check
+        :param function_logical_ids: Set of function logical IDs to match against
+        :return bool: True if function should be included, False otherwise
+        """
+        return bool(
+            function.function_id in function_logical_ids
+            or function.name in function_logical_ids
+            or (function.functionname and function.functionname in function_logical_ids)
+        )
+
+    @staticmethod
     def _extract_functions(
-        stacks: List[Stack], use_raw_codeuri: bool = False, ignore_code_extraction_warnings: bool = False
+        stacks: List[Stack],
+        use_raw_codeuri: bool = False,
+        ignore_code_extraction_warnings: bool = False,
+        locate_layer_nested: bool = False,
+        function_logical_ids: Optional[Tuple[str, ...]] = None,
     ) -> Dict[str, Function]:
         """
         Extracts and returns function information from the given dictionary of SAM/CloudFormation resources. This
@@ -160,6 +217,8 @@ class SamFunctionProvider(SamBaseProvider):
         :param stacks: List of SAM/CloudFormation stacks to extract functions from
         :param bool use_raw_codeuri: Do not resolve adjust core_uri based on the template path, use the raw uri.
         :param bool ignore_code_extraction_warnings: suppress log statements on code extraction from resources.
+        :param bool locate_layer_nested: resolved nested layer reference to their actual location in the nested stack
+        :param tuple function_logical_ids: Optional tuple of function logical IDs to filter by
         :return dict(string : samcli.commands.local.lib.provider.Function): Dictionary of function full_path to the
             Function configuration object
         """
@@ -167,7 +226,6 @@ class SamFunctionProvider(SamBaseProvider):
         result: Dict[str, Function] = {}  # a dict with full_path as key and extracted function as value
         for stack in stacks:
             for name, resource in stack.resources.items():
-
                 resource_type = resource.get("Type")
                 resource_properties = resource.get("Properties", {})
                 resource_metadata = resource.get("Metadata", None)
@@ -184,7 +242,6 @@ class SamFunctionProvider(SamBaseProvider):
                     if resource_package_type == ZIP and SamBaseProvider._is_s3_location(
                         resource_properties.get(code_property_key)
                     ):
-
                         # CodeUri can be a dictionary of S3 Bucket/Key or a S3 URI, neither of which are supported
                         if not ignore_code_extraction_warnings:
                             SamFunctionProvider._warn_code_extraction(resource_type, name, code_property_key)
@@ -208,6 +265,9 @@ class SamFunctionProvider(SamBaseProvider):
                         resource_properties.get("Layers", []),
                         use_raw_codeuri,
                         ignore_code_extraction_warnings=ignore_code_extraction_warnings,
+                        locate_layer_nested=locate_layer_nested,
+                        stacks=stacks if locate_layer_nested else None,
+                        function_id=resource_metadata.get("SamResourceId", "") if locate_layer_nested else None,
                     )
                     function = SamFunctionProvider._convert_sam_function_resource(
                         stack,
@@ -224,6 +284,9 @@ class SamFunctionProvider(SamBaseProvider):
                         resource_properties.get("Layers", []),
                         use_raw_codeuri,
                         ignore_code_extraction_warnings=ignore_code_extraction_warnings,
+                        locate_layer_nested=locate_layer_nested,
+                        stacks=stacks if locate_layer_nested else None,
+                        function_id=resource_metadata.get("SamResourceId", "") if locate_layer_nested else None,
                     )
                     function = SamFunctionProvider._convert_lambda_function_resource(
                         stack, name, resource_properties, layers, use_raw_codeuri
@@ -232,6 +295,19 @@ class SamFunctionProvider(SamBaseProvider):
 
                 # We don't care about other resource types. Just ignore them
 
+        # Apply filtering if function_logical_ids provided
+        if function_logical_ids:
+            function_logical_ids_set = set(function_logical_ids)
+            filtered_functions = {}
+
+            for full_path, function in result.items():
+                if SamFunctionProvider._should_include_function(function, function_logical_ids_set):
+                    filtered_functions[full_path] = function
+
+            SamFunctionProvider._track_function_field_usage(filtered_functions)
+            return filtered_functions
+
+        SamFunctionProvider._track_function_field_usage(result)
         return result
 
     @staticmethod
@@ -410,12 +486,26 @@ class SamFunctionProvider(SamBaseProvider):
             LOG.debug("--base-dir is not presented, adjusting uri %s relative to %s", codeuri, stack.location)
             codeuri = SamLocalStackProvider.normalize_resource_path(stack.location, codeuri)
 
+        if imageuri and check_path_valid_type(imageuri) and codeuri != ".":
+            normalized_image_uri = SamLocalStackProvider.normalize_resource_path(stack.location, imageuri)
+            if Path(normalized_image_uri).is_file():
+                LOG.debug("--base-dir is not presented, adjusting uri %s relative to %s", codeuri, stack.location)
+                imageuri = normalized_image_uri
+
+        package_type = resource_properties.get("PackageType", ZIP)
+        if package_type == ZIP and not resource_properties.get("Handler"):
+            raise MissingFunctionHandlerException(f"Could not find handler for function: {name}")
+
+        function_build_info = get_function_build_info(
+            get_full_path(stack.stack_path, function_id), package_type, inlinecode, codeuri, imageuri, metadata
+        )
+
         return Function(
             stack_path=stack.stack_path,
             function_id=function_id,
             name=name,
             functionname=resource_properties.get("FunctionName", name),
-            packagetype=resource_properties.get("PackageType", ZIP),
+            packagetype=package_type,
             runtime=resource_properties.get("Runtime"),
             memory=resource_properties.get("MemorySize"),
             timeout=resource_properties.get("Timeout"),
@@ -432,6 +522,13 @@ class SamFunctionProvider(SamBaseProvider):
             codesign_config_arn=resource_properties.get("CodeSigningConfigArn", None),
             architectures=resource_properties.get("Architectures", None),
             function_url_config=resource_properties.get("FunctionUrlConfig"),
+            runtime_management_config=resource_properties.get("RuntimeManagementConfig"),
+            function_build_info=function_build_info,
+            logging_config=resource_properties.get("LoggingConfig"),
+            capacity_provider_config=resource_properties.get("CapacityProviderConfig", None),
+            publish_to_latest_published=resource_properties.get("PublishToLatestPublished", None),
+            tenancy_config=resource_properties.get("TenancyConfig"),
+            durable_config=resource_properties.get("DurableConfig", None),
         )
 
     @staticmethod
@@ -440,6 +537,9 @@ class SamFunctionProvider(SamBaseProvider):
         list_of_layers: List[Any],
         use_raw_codeuri: bool = False,
         ignore_code_extraction_warnings: bool = False,
+        locate_layer_nested: bool = False,
+        stacks: Optional[List[Stack]] = None,
+        function_id: Optional[str] = None,
     ) -> List[LayerVersion]:
         """
         Creates a list of Layer objects that are represented by the resources and the list of layers
@@ -455,6 +555,12 @@ class SamFunctionProvider(SamBaseProvider):
             Do not resolve adjust core_uri based on the template path, use the raw uri.
         ignore_code_extraction_warnings : bool
             Whether to print warning when codeuri is not a local pth
+        locate_layer_nested: bool
+            Resolved nested layer reference to their actual location in the nested stack
+        stacks: List[Stack]
+            List of stacks generates from templates
+        function_id: str
+            Logical id for the function resources
 
         Returns
         -------
@@ -465,6 +571,19 @@ class SamFunctionProvider(SamBaseProvider):
             I.E: list_of_layers = ["layer1", "layer2"] the return would be [Layer("layer1"), Layer("layer2")]
         """
         layers = []
+
+        if locate_layer_nested and stacks and function_id:
+            # The layer can be a parameter pass from parent stack, we need to locate to where the
+            # layer is actually defined
+            func_template = stack.template_dict.get("Resources", {}).get(function_id, {})
+            a_list_of_layers = func_template.get("Properties", {}).get("Layers", [])
+            for layer in a_list_of_layers:
+                found_layer = SamFunctionProvider._locate_layer_from_nested(
+                    stack, stacks, layer, use_raw_codeuri, ignore_code_extraction_warnings
+                )
+                if found_layer:
+                    layers.append(found_layer)
+
         for layer in list_of_layers:
             if layer == "arn:aws:lambda:::awslayer:AmazonLinux1803":
                 LOG.debug("Skipped arn:aws:lambda:::awslayer:AmazonLinux1803 as the containers are AmazonLinux1803")
@@ -479,6 +598,10 @@ class SamFunctionProvider(SamBaseProvider):
 
             # If the layer is a string, assume it is the arn
             if isinstance(layer, str):
+                if locate_layer_nested and "arn:" not in layer:
+                    # the layer is not an arn
+                    continue
+
                 layers.append(
                     LayerVersion(
                         layer,
@@ -491,6 +614,10 @@ class SamFunctionProvider(SamBaseProvider):
             # In the list of layers that is defined within a template, you can reference a LayerVersion resource.
             # When running locally, we need to follow that Ref so we can extract the local path to the layer code.
             if isinstance(layer, dict) and layer.get("Ref"):
+                # if search_layer is set, this case should be resolved already
+                if locate_layer_nested:
+                    continue
+
                 found_layer = SamFunctionProvider._locate_layer_from_ref(
                     stack, layer, use_raw_codeuri, ignore_code_extraction_warnings
                 )
@@ -504,6 +631,138 @@ class SamFunctionProvider(SamBaseProvider):
                 )
 
         return layers
+
+    @staticmethod
+    def _locate_layer_from_nested(  # pylint: disable=too-many-return-statements
+        stack: Stack,
+        stacks: List[Stack],
+        layer: Any,
+        use_raw_codeuri: bool = False,
+        ignore_code_extraction_warnings: bool = False,
+    ) -> Optional[LayerVersion]:
+        """
+        Search the layer reference through all the local templates and try to find it's actual location then create a
+        layer object and return
+
+        Right now this method does not support more complicated intrinsics like Fn:Sub and Fn:If, future task to
+        expand support. One of possible solutions can be adding in an intrinsic resovler.
+
+        TODO: this function have too many return statemnets, we may need to refactor it, break it down to multiple
+        sub functions for example.
+
+        Parameters
+        ----------
+        stack : Stack
+            The stack the layer is defined in
+        stacks: List[Stack]
+            List of stacks generates from templates
+        layer : Any
+            layer that are defined within the Layers Property on a function,
+            layer can be defined as string or Dict, in case customers define it in other types, use "Any" here.
+        use_raw_codeuri : bool
+            Do not resolve adjust core_uri based on the template path, use the raw uri.
+        ignore_code_extraction_warnings : bool
+            Whether to print warning when codeuri is not a local path
+
+        Returns
+        -------
+        samcli.commands.local.lib.provider.Layer
+            The Layer object created from the template and layer defined on the function.
+        """
+
+        if isinstance(layer, str):
+            outputs = stack.template_dict.get("Outputs", {})
+            # if the layer is not in the output section, it may be an layer arn and cannot be located in the template
+            LOG.debug("Search layer %s in %s 's Output section", layer, stack.stack_path)
+            if layer not in outputs:
+                LOG.debug("Layer not in Output section, layer can not be located in templates")
+                return None
+            layer = outputs.get(layer).get("Value")
+            LOG.debug("Layer found in Output section, try to search it in current stack %s", stack.stack_path)
+
+        layer_reference = None
+        # if the layer is in format {Ref:LayerName}, it is passed from the parent stack through parameter or is a
+        # reference to the layer in current stack
+        if isinstance(layer, dict) and layer.get("Ref"):
+            layer_reference = layer.get("Ref")
+
+        # if the layer is in the format {"Fn::GetAtt": ["LayerStackName", "Outputs.LayerName"]},
+        # it is passed from another child stack inside the same parent stack
+        elif isinstance(layer, dict) and layer.get("Fn::GetAtt"):
+            layer_attribute: List = layer.get("Fn::GetAtt", [])
+            if not SamFunctionProvider._validate_layer_get_attr_format(layer):
+                return None
+            layer_stack_reference = layer_attribute[0]
+            layer_reference = layer_attribute[1].split(".")[1]
+            LOG.debug("Search layer %s in child stack", layer_reference)
+
+            child_stacks = Stack.get_child_stacks(stack, stacks)
+            stack_prefix = stack.stack_path + "/" if stack.stack_path else ""
+            stack_path = stack_prefix + layer_stack_reference
+            child_stack = Stack.get_stack_by_full_path(stack_path, child_stacks)
+            if not child_stack:
+                LOG.debug("Child stack not found, layer can not be located in templates")
+                return None
+            # search in child stack
+            LOG.debug("Child stack %s found", child_stack.stack_path)
+            return SamFunctionProvider._locate_layer_from_nested(
+                child_stack, stacks, layer_reference, use_raw_codeuri, ignore_code_extraction_warnings
+            )
+
+        # If the layer reference is not in the stack's parameters section, it must be a layer reference in current stack
+        parameters: Dict = stack.template_dict.get("Parameters", {})
+        if not parameters or (layer_reference and layer_reference not in parameters):
+            LOG.debug("Resolved layer: %s in current stack %s", layer_reference, stack.stack_path)
+            # layer reference should be in current stack
+            try:
+                resolve_layer = SamFunctionProvider._locate_layer_from_ref(
+                    stack, layer, use_raw_codeuri, ignore_code_extraction_warnings
+                )
+            except InvalidLayerReference:
+                LOG.debug("Layer reference (%s) can't be located in the template", layer)
+                return None
+            return resolve_layer
+
+        # search in parent stack
+        parent_stack = Stack.get_parent_stack(stack, stacks)
+        LOG.debug("Search layer: %s in parent stack", layer_reference)
+        # If it can't find the parent stack, it mean's the current stack is root stack and the layer reference may be a
+        # layer arn passing from root stack's parameters, which means the actual layer can't be located in templates
+        if not parent_stack:
+            LOG.debug("Parent stack not found, layer can not be located in templates")
+            return None
+        LOG.debug("Found parent stack: %s", parent_stack.stack_path)
+        layer = (
+            parent_stack.template_dict.get("Resources", {})
+            .get(stack.name, {})
+            .get("Properties", {})
+            .get("Parameters", {})
+            .get(layer_reference)
+        )
+
+        return SamFunctionProvider._locate_layer_from_nested(
+            parent_stack, stacks, layer, use_raw_codeuri, ignore_code_extraction_warnings
+        )
+
+    @staticmethod
+    def _validate_layer_get_attr_format(layer: Dict) -> bool:
+        # validate if the layer is in the format {"Fn::GetAtt": ["LayerStackName", "Outputs.LayerName"]}
+        warn_message = "Fn::GetAtt with unsupported format in accelerate nested stack"
+        layer_attribute = layer.get("Fn::GetAtt", [])
+        required_layer_attr_length = 2
+        reqauired_layer_reference_length = 2
+        if not isinstance(layer_attribute, List):
+            LOG.warning(warn_message)
+            return False
+
+        if len(layer_attribute) != required_layer_attr_length:
+            LOG.warning(warn_message)
+            return False
+        layer_reference_array = layer_attribute[1].split(".")
+        if len(layer_reference_array) != reqauired_layer_reference_length:
+            LOG.warning(warn_message)
+            return False
+        return True
 
     @staticmethod
     def _locate_layer_from_ref(
@@ -565,6 +824,57 @@ class SamFunctionProvider(SamBaseProvider):
         """
         return isinstance(metadata, dict) and bool(metadata.get("DockerContext"))
 
+    @staticmethod
+    def _track_function_field_usage(functions: Dict[str, Function]) -> None:
+        """
+        Track which function fields are being used across all functions.
+        Stores list of used fields in context for telemetry collection.
+
+        Parameters
+        ----------
+        functions : Dict[str, Function]
+            Dictionary of functions to analyze
+        """
+
+        exclude_fields = {
+            "function_id",
+            "name",
+            "functionname",
+            "runtime",
+            "memory",
+            "timeout",
+            "handler",
+            "packagetype",
+            "metadata",
+            "inlinecode",
+            "architectures",
+            "stack_path",
+            "function_build_info",
+            "rolearn",
+        }
+
+        used_fields: defaultdict[str, int] = defaultdict(int)
+        for function in functions.values():
+            try:
+                for field_name in function._fields:
+                    if field_name in exclude_fields:
+                        continue
+
+                    value = getattr(function, field_name)
+                    if value is not None and value not in ([], {}):
+                        used_fields[field_name] += 1
+            except (AttributeError, TypeError):
+                # Function object doesn't have _fields like we're expecting, probably for Mock in tests
+                continue
+
+        if used_fields:
+            try:
+                ctx = Context.get_current_context()
+                setattr(ctx, "function_fields_used", dict(used_fields))
+            except RuntimeError:
+                # No context available, skip telemetry
+                pass
+
 
 class RefreshableSamFunctionProvider(SamFunctionProvider):
     """
@@ -582,6 +892,9 @@ class RefreshableSamFunctionProvider(SamFunctionProvider):
         global_parameter_overrides: Optional[Dict] = None,
         use_raw_codeuri: bool = False,
         ignore_code_extraction_warnings: bool = False,
+        function_logical_ids: Optional[Tuple[str, ...]] = None,
+        no_watch: Optional[bool] = False,
+        language_extensions_enabled: bool = False,
     ) -> None:
         """
         Initialize the class with SAM template data. The SAM template passed to this provider is assumed
@@ -597,9 +910,17 @@ class RefreshableSamFunctionProvider(SamFunctionProvider):
         :param bool use_raw_codeuri: Do not resolve adjust core_uri based on the template path, use the raw uri.
             Note(xinhol): use_raw_codeuri is temporary to fix a bug, and will be removed for a permanent solution.
         :param bool ignore_code_extraction_warnings: Ignores Log warnings
+        :param tuple function_logical_ids: Optional tuple of function logical IDs to filter by
+        :param bool no_watch: If True, skip creating the FileObserver entirely. The provider will not
+            detect template changes and stack/function refreshes will not be triggered.
         """
 
-        super().__init__(stacks, use_raw_codeuri, ignore_code_extraction_warnings)
+        # Store function_logical_ids before calling super().__init__
+        self._function_logical_ids = function_logical_ids
+
+        super().__init__(
+            stacks, use_raw_codeuri, ignore_code_extraction_warnings, function_logical_ids=function_logical_ids
+        )
 
         # initialize root templates. Usually it will be one template, as sam commands only support processing
         # one template. These templates will be fixed.
@@ -607,15 +928,20 @@ class RefreshableSamFunctionProvider(SamFunctionProvider):
         self._ignore_code_extraction_warnings = ignore_code_extraction_warnings
         self._parameter_overrides = parameter_overrides
         self._global_parameter_overrides = global_parameter_overrides
+        self._language_extensions_enabled = language_extensions_enabled
         self.parent_templates_paths = []
         for stack in self._stacks:
             if stack.is_root_stack:
                 self.parent_templates_paths.append(stack.location)
 
         self.is_changed = False
-        self._observer = FileObserver(self._set_templates_changed)
-        self._observer.start()
-        self._watch_stack_templates(stacks)
+
+        self._observer: Optional[FileObserver] = None
+        # Only initialize file watcher when --no-watch is not set
+        if not no_watch:
+            self._observer = FileObserver(self._set_templates_changed)
+            self._observer.start()
+            self._watch_stack_templates(stacks)
 
     @property
     def stacks(self) -> List[Stack]:
@@ -678,21 +1004,25 @@ class RefreshableSamFunctionProvider(SamFunctionProvider):
             ", ".join(paths),
         )
         self.is_changed = True
-        for stack in self._stacks:
-            self._observer.unwatch(stack.location)
+        if self._observer:
+            for stack in self._stacks:
+                self._observer.unwatch(stack.location)
 
     def _watch_stack_templates(self, stacks: List[Stack]) -> None:
         """
         initialize the list of stack template watchers
         """
-        for stack in stacks:
-            self._observer.watch(stack.location)
+        if self._observer:
+            for stack in stacks:
+                self._observer.watch(stack.location)
 
     def _refresh_loaded_functions(self) -> None:
         """
         Reload the stacks, and lambda functions from template files.
+        Applies the same function filter during refresh.
         """
         LOG.debug("A change got detected in one of the stack templates. Reload the lambda function resources")
+
         self._stacks = []
 
         for template_file in self.parent_templates_paths:
@@ -701,14 +1031,19 @@ class RefreshableSamFunctionProvider(SamFunctionProvider):
                     template_file,
                     parameter_overrides=self._parameter_overrides,
                     global_parameter_overrides=self._global_parameter_overrides,
+                    language_extensions_enabled=self._language_extensions_enabled,
                 )
                 self._stacks += template_stacks
             except (TemplateNotFoundException, TemplateFailedParsingException) as ex:
                 raise ex
 
         self.is_changed = False
+        # Pass function_logical_ids to maintain filter during refresh
         self.functions = self._extract_functions(
-            self._stacks, self._use_raw_codeuri, self._ignore_code_extraction_warnings
+            self._stacks,
+            self._use_raw_codeuri,
+            self._ignore_code_extraction_warnings,
+            function_logical_ids=self._function_logical_ids,
         )
         self._watch_stack_templates(self._stacks)
 
@@ -716,4 +1051,5 @@ class RefreshableSamFunctionProvider(SamFunctionProvider):
         """
         Stop Observing.
         """
-        self._observer.stop()
+        if self._observer:
+            self._observer.stop()

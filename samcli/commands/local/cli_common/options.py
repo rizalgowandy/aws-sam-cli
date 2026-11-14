@@ -1,12 +1,20 @@
 """
 Common CLI options for invoke command
 """
+
 from pathlib import Path
 
 import click
 
-from samcli.commands._utils.options import template_click_option, docker_click_options, parameter_override_click_option
+from samcli.cli.types import DockerAdditionalHostType
+from samcli.commands._utils.options import (
+    docker_click_options,
+    local_add_host_callback,
+    parameter_override_click_option,
+    template_click_option,
+)
 from samcli.commands.local.cli_common.invoke_context import ContainersInitializationMode
+from samcli.local.docker.container import DEFAULT_CONTAINER_HOST_INTERFACE
 
 
 def get_application_dir():
@@ -46,24 +54,42 @@ def local_common_options(f):
             "--shutdown",
             is_flag=True,
             default=False,
-            help="If set, will emulate a shutdown event after the invoke completes, "
-            "in order to test extension handling of shutdown behavior.",
+            help="Emulate a shutdown event after invoke completes, " "to test extension handling of shutdown behavior.",
         ),
         click.option(
             "--container-host",
             default="localhost",
             show_default=True,
             help="Host of locally emulated Lambda container. "
-            "This option is useful when the container runs on a different host than SAM CLI. "
-            "For example, if you want to run SAM CLI in a Docker container on macOS, "
-            "use this option with host.docker.internal",
+            "This option is useful when the container runs on a different host than AWS SAM CLI. "
+            "For example, if one wants to run AWS SAM CLI in a Docker container on macOS, "
+            "this option could specify `host.docker.internal`",
         ),
         click.option(
             "--container-host-interface",
-            default="127.0.0.1",
+            default=DEFAULT_CONTAINER_HOST_INTERFACE,
             show_default=True,
             help="IP address of the host network interface that container ports should bind to. "
             "Use 0.0.0.0 to bind to all interfaces.",
+        ),
+        click.option(
+            "--add-host",
+            multiple=True,
+            type=DockerAdditionalHostType(),
+            callback=local_add_host_callback,
+            required=False,
+            help="Passes a hostname to IP address mapping to the Docker container's host file. "
+            "This parameter can be passed multiple times."
+            ""
+            "Example:"
+            "--add-host example.com:127.0.0.1",
+        ),
+        click.option(
+            "--container-dns",
+            multiple=True,
+            help="Set custom DNS servers for the Lambda container. "
+            "This parameter can be passed multiple times to specify multiple DNS servers. "
+            "Example: --container-dns 8.8.8.8 --container-dns 1.1.1.1",
         ),
         click.option(
             "--invoke-image",
@@ -72,12 +98,19 @@ def local_common_options(f):
             required=False,
             multiple=True,
             help="Container image URIs for invoking functions or starting api and function. "
-            "You can specify the image URI used for the local function invocation "
-            "(--invoke-image public.ecr.aws/sam/build-nodejs14.x:latest). "
-            "You can specify for each individual function with "
-            "(--invoke-image Function1=public.ecr.aws/sam/build-nodejs14.x:latest). "
-            "If a function does not have invoke image specified, the default SAM CLI "
+            "One can specify the image URI used for the local function invocation "
+            "(--invoke-image public.ecr.aws/sam/build-nodejs20.x:latest). "
+            "One can also specify for each individual function with "
+            "(--invoke-image Function1=public.ecr.aws/sam/build-nodejs20.x:latest). "
+            "If a function does not have invoke image specified, the default AWS SAM CLI "
             "emulation image will be used.",
+        ),
+        click.option(
+            "--no-memory-limit",
+            default=False,
+            is_flag=True,
+            help="Removes the Memory limit during emulation. "
+            "With this parameter, the underlying container will run without a --memory parameter",
         ),
     ]
 
@@ -167,22 +200,23 @@ def invoke_common_options(f):
             click.option(
                 "--container-env-vars",
                 type=click.Path(exists=True),
-                help="JSON file containing environment variables to be set within the container environment",
+                help="JSON file containing additional environment variables to be set within the container when "
+                "used in a debugging session locally.",
             ),
             click.option(
                 "--docker-volume-basedir",
                 "-v",
                 envvar="SAM_DOCKER_VOLUME_BASEDIR",
-                help="Specifies the location basedir where the SAM file exists. If the Docker is running on "
-                "a remote machine, you must mount the path where the SAM file exists on the docker machine "
-                "and modify this value to match the remote machine.",
+                help="Specify the location basedir where the SAM template exists. If Docker is running on "
+                "a remote machine, Path of the SAM template must be mounted on the Docker machine "
+                "and modified to match the remote machine.",
             ),
-            click.option("--log-file", "-l", help="logfile to send runtime logs to."),
+            click.option("--log-file", "-l", help="File to capture output logs."),
             click.option(
                 "--layer-cache-basedir",
                 type=click.Path(exists=False, file_okay=False),
                 envvar="SAM_LAYER_CACHE_BASEDIR",
-                help="Specifies the location basedir where the Layers your template uses will be downloaded to.",
+                help="Specify the location basedir where the lambda layers used by the template will be downloaded to.",
                 default=get_default_layer_cache_dir(),
             ),
         ]
@@ -191,7 +225,7 @@ def invoke_common_options(f):
             click.option(
                 "--force-image-build",
                 is_flag=True,
-                help="Specify whether CLI should rebuild the image used for invoking functions with layers.",
+                help="Force rebuilding the image used for invoking functions with layers.",
                 envvar="SAM_FORCE_IMAGE_BUILD",
                 default=False,
             )
@@ -217,25 +251,32 @@ def warm_containers_common_options(f):
             "--warm-containers",
             help="""
             \b
-            Optional. Specifies how AWS SAM CLI manages 
-            containers for each function.
+            Optional. Specifies how AWS SAM CLI manages containers for each function.'            
+            \b
             Two modes are available:
-            EAGER: Containers for all functions are 
-            loaded at startup and persist between 
-            invocations.
-            LAZY:  Containers are only loaded when each 
-            function is first invoked. Those containers 
-            persist for additional invocations.
+            EAGER: Containers for all functions are loaded at startup and persist between invocations.
+            LAZY:  Containers are only loaded when each function is first invoked. 
+                   Those containers persist for additional invocations.
             """,
             type=click.Choice(ContainersInitializationMode.__members__, case_sensitive=False),
         ),
         click.option(
             "--debug-function",
             help="Optional. Specifies the Lambda Function logicalId to apply debug options to when"
-            " --warm-containers is specified.  This parameter applies to --debug-port, --debugger-path,"
+            " --warm-containers is specified. This parameter applies to --debug-port, --debugger-path,"
             " and --debug-args.",
             type=click.STRING,
             multiple=False,
+        ),
+        click.option(
+            "--no-watch",
+            is_flag=True,
+            default=False,
+            help="Disable file watching for hot reload. Only applies when --warm-containers is set. "
+            "When enabled, local code or template changes will not restart the running container; "
+            "stop and rerun the command to pick up changes. Useful when file watching causes "
+            "high CPU/IO (e.g. Microsoft Defender on Windows, large monorepos, or projects "
+            "using auto-generated directories like .sandbox).",
         ),
     ]
 

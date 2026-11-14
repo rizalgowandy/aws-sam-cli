@@ -2,7 +2,9 @@
 Supplies the environment variables necessary to set up Local Lambda runtime
 """
 
-import sys
+from typing import Optional
+
+from samcli.lib.providers.provider import CapacityProviderConfig
 
 
 class EnvironmentVariables:
@@ -39,10 +41,13 @@ class EnvironmentVariables:
         function_memory=None,
         function_timeout=None,
         function_handler=None,
+        function_logging_config=None,
         variables=None,
         shell_env_values=None,
         override_values=None,
         aws_creds=None,
+        capacity_provider_configuration: Optional[CapacityProviderConfig] = None,
+        is_debugging=False,
     ):
         """
         Initializes this class. It takes in two sets of properties:
@@ -53,6 +58,7 @@ class EnvironmentVariables:
         :param integer function_memory: Memory size of the function in megabytes
         :param integer function_timeout: Function's timeout in seconds
         :param string function_handler: Handler of the function
+        :param string function_logging_config: Logging Config for the function
         :param dict variables: Optional. Dict whose key is the environment variable names and value is the default
             values for the variable.
         :param dict shell_env_values: Optional. Dict containing values for the variables grabbed from the shell's
@@ -61,6 +67,8 @@ class EnvironmentVariables:
             from ``default_values`` and ``shell_env_values``.
         :param dict aws_creds: Optional. Dictionary containing AWS credentials passed to the Lambda runtime through
             environment variables. It should contain "key", "secret", "region" and optional "sessiontoken" keys
+        :param CapacityProviderConfig capacity_provider_configuration: Optional. Configuration for LMI function
+            capacity provider
         """
 
         self._function = {
@@ -68,12 +76,15 @@ class EnvironmentVariables:
             "timeout": function_timeout,
             "handler": function_handler,
             "name": function_name,
+            "capacity_provider_configuration": capacity_provider_configuration,
         }
 
         self.variables = variables or {}
         self.shell_env_values = shell_env_values or {}
         self.override_values = override_values or {}
         self.aws_creds = aws_creds or {}
+        self.logging_config = function_logging_config or {}
+        self.is_debugging = is_debugging
 
     def resolve(self):
         """
@@ -89,18 +100,19 @@ class EnvironmentVariables:
 
         # Default value for the variable gets lowest priority
         for name, value in self.variables.items():
+            override_value = value
 
             # Shell environment values, second priority
             if name in self.shell_env_values:
-                value = self.shell_env_values[name]
+                override_value = self.shell_env_values[name]
 
             # Overridden values, highest priority
             if name in self.override_values:
-                value = self.override_values[name]
+                override_value = self.override_values[name]
 
             # Any value must be a string when passed to Lambda runtime.
             # Runtime expects a Map<String, String> for environment variables
-            result[name] = self._stringify_value(value)
+            result[name] = self._stringify_value(override_value)
 
         return result
 
@@ -117,6 +129,10 @@ class EnvironmentVariables:
     @timeout.setter
     def timeout(self, value):
         self._function["timeout"] = value
+
+    @property
+    def capacity_provider_configuration(self) -> Optional[CapacityProviderConfig]:
+        return self._function.get("capacity_provider_configuration")
 
     @property
     def memory(self):
@@ -167,11 +183,31 @@ class EnvironmentVariables:
             "AWS_ACCESS_KEY_ID": self.aws_creds.get("key", self._DEFAULT_AWS_CREDS["key"]),
             "AWS_SECRET_ACCESS_KEY": self.aws_creds.get("secret", self._DEFAULT_AWS_CREDS["secret"]),
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
         }
 
         # Session Token should be added **only** if the input creds have a token and the value is not empty.
         if self.aws_creds.get("sessiontoken"):
             result["AWS_SESSION_TOKEN"] = self.aws_creds.get("sessiontoken")
+
+        # Set AWS_LAMBDA_MAX_CONCURRENCY based on capacity provider configuration
+        # If no capacity provider configuration, AWS_LAMBDA_MAX_CONCURRENCY is not set
+        if self.capacity_provider_configuration and not self.is_debugging:
+            # If capacity provider configuration exists, use its max concurrency value (default is 4)
+            result["AWS_LAMBDA_MAX_CONCURRENCY"] = str(
+                self.capacity_provider_configuration.execution_environment_max_concurrency
+            )
+
+        # Add the ApplicationLogLevel as a env variable and also update the function's LogGroup name
+        log_group = self.logging_config.get("LogGroup")
+        if log_group:
+            result["AWS_LAMBDA_LOG_GROUP_NAME"] = log_group
+
+        log_format = self.logging_config.get("LogFormat")
+        if log_format:
+            result["AWS_LAMBDA_LOG_FORMAT"] = log_format
+            if log_format == "JSON":
+                result["AWS_LAMBDA_LOG_LEVEL"] = self.logging_config.get("ApplicationLogLevel", "INFO")
 
         return result
 
@@ -196,13 +232,8 @@ class EnvironmentVariables:
             result = "false"
 
         # value is a scalar type like int, str which can be stringified
-        # do not stringify unicode in Py2, Py3 str supports unicode
-        elif sys.version_info.major > 2:
-            result = str(value)
-        elif not isinstance(value, unicode):  # noqa: F821 pylint: disable=undefined-variable
-            result = str(value)
         else:
-            result = value
+            result = str(value)
 
         return result
 

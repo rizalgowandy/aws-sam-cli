@@ -11,19 +11,15 @@ Resources:
           return response;
         };
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         Api:
           Type: Api
           Properties:
             Auth:
               ResourcePolicy:
-                AwsAccountWhitelist: [
-                  "12345"
-                ]
-                AwsAccountBlacklist: [
-                  "67890"
-                ]
+                AwsAccountWhitelist: ['12345']
+                AwsAccountBlacklist: ['67890']
             Method: Put
             Path: /get
         Any:
@@ -31,11 +27,7 @@ Resources:
           Properties:
             Auth:
               ResourcePolicy:
-                AwsAccountWhitelist: [
-                  "12345"
-                ]
-                AwsAccountBlacklist: [
-                  "67890"
-                ]
+                AwsAccountWhitelist: ['12345']
+                AwsAccountBlacklist: ['67890']
             Method: any
             Path: /any

@@ -1,12 +1,12 @@
 Resources:
-  RestApiFunction: 
+  RestApiFunction:
     Type: AWS::Serverless::Function
     DeletionPolicy: Delete
     UpdateReplacePolicy: Retain
     Properties:
       CodeUri: s3://sam-demo-bucket/todo_list.zip
       Handler: index.restapi
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Policies: AmazonDynamoDBFullAccess
       Events:
         GetHtml:
@@ -22,7 +22,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/todo_list.zip
       Handler: index.gethtml
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Policies: AmazonDynamoDBReadOnlyAccess
       Events:
         GetHtml:

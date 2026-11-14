@@ -36,7 +36,7 @@ class TestCWPrettyPrintFormatter(TestCase):
         result = self.pretty_print_formatter.map(event)
 
         self.assertEqual(expected, result.message)
-        self.colored.yellow.has_calls()
+        self.colored.yellow.assert_called()
         self.colored.cyan.assert_called_with(self.stream_name)
 
 
@@ -115,7 +115,6 @@ class TestCWJsonFormatter(TestCase):
 
     @parameterized.expand(["this is not json", '{"not a valid json"}'])
     def test_ignore_non_json(self, input_msg):
-
         event = CWLogEvent("group_name", {"message": input_msg})
 
         result = self.formatter.map(event)

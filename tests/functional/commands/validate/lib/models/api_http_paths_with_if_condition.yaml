@@ -8,12 +8,12 @@ Description: >
 Conditions:
   TrueCondition:
     Fn::Equals:
-      - true
-      - true
+    - true
+    - true
   FalseCondition:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
 
 Resources:
   MyAuthFn:
@@ -21,7 +21,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/hello.zip
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
 
   MyApi:
     Type: AWS::Serverless::HttpApi
@@ -29,17 +29,17 @@ Resources:
       Auth:
         Authorizers:
           MyLambdaAuthUpdated:
-            FunctionArn: 
+            FunctionArn:
               Fn::GetAtt:
-                - MyAuthFn
-                - Arn
+              - MyAuthFn
+              - Arn
             FunctionInvokeRole:
               Fn::GetAtt:
-                - MyAuthFnRole
-                - Arn
+              - MyAuthFnRole
+              - Arn
             Identity:
               Headers:
-                - Authorization
+              - Authorization
               ReauthorizeEvery: 37
             EnableSimpleResponses: false
             AuthorizerPayloadFormatVersion: 1.0
@@ -51,18 +51,16 @@ Resources:
         paths:
           /post:
             Fn::If:
-                - FalseCondition
-                - 
-                  post:
-                    x-amazon-apigateway-integration:
-                      httpMethod: POST
-                      type: aws_proxy
-                      uri: https://www.otherURI.co/
-                      payloadFormatVersion: '1.0'
-                - 
-                  post:
-                    x-amazon-apigateway-integration:
-                      httpMethod: POST
-                      type: aws_proxy
-                      uri: https://www.alphavantage.co/
-                      payloadFormatVersion: '1.0'
+            - FalseCondition
+            - post:
+                x-amazon-apigateway-integration:
+                  httpMethod: POST
+                  type: aws_proxy
+                  uri: https://www.otherURI.co/
+                  payloadFormatVersion: '1.0'
+            - post:
+                x-amazon-apigateway-integration:
+                  httpMethod: POST
+                  type: aws_proxy
+                  uri: https://www.alphavantage.co/
+                  payloadFormatVersion: '1.0'

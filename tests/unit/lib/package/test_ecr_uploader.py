@@ -1,5 +1,10 @@
+import docker
+
 from unittest import TestCase
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, Mock, call, mock_open, patch
+
+from pathlib import Path
+from uuid import uuid4
 
 from botocore.exceptions import ClientError
 from docker.errors import APIError, BuildError
@@ -14,6 +19,7 @@ from samcli.commands.package.exceptions import (
     DeleteArtifactFailedError,
 )
 from samcli.lib.package.ecr_uploader import ECRUploader
+from samcli.lib.package.image_utils import SHA_CHECKSUM_TRUNCATION_LENGTH
 from samcli.lib.utils.stream_writer import StreamWriter
 
 
@@ -42,6 +48,84 @@ class TestECRUploader(TestCase):
             ecr_repo_multi=self.ecr_repo_multi,
             tag=self.tag,
         )
+
+    def test_ecr_uploader_init_with_none_docker_client(self):
+        """Test ECRUploader initialization with None docker_client (lazy initialization)"""
+        ecr_uploader = ECRUploader(
+            docker_client=None,  # Pass None to trigger lazy initialization
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+
+        # Docker client should not be validated yet
+        self.assertIsNone(ecr_uploader._container_client_param)
+        self.assertIsNone(ecr_uploader._validated_container_client)
+
+    @patch("samcli.lib.package.ecr_uploader.get_validated_container_client")
+    def test_lazy_docker_client_validation_on_first_access(self, mock_get_validated_client):
+        """Test that Docker client is only validated when first accessed"""
+        mock_docker_client = MagicMock()
+        mock_get_validated_client.return_value = mock_docker_client
+
+        ecr_uploader = ECRUploader(
+            docker_client=None,  # Trigger lazy initialization
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+
+        # Docker client should not be validated yet
+        self.assertIsNone(ecr_uploader._validated_container_client)
+        mock_get_validated_client.assert_not_called()
+
+        # First access should trigger validation
+        docker_client = ecr_uploader.docker_client
+
+        # Validation should have been called
+        mock_get_validated_client.assert_called_once()
+        self.assertEqual(docker_client, mock_docker_client)
+        self.assertEqual(ecr_uploader._validated_container_client, mock_docker_client)
+
+    @patch("samcli.lib.package.ecr_uploader.get_validated_container_client")
+    def test_lazy_docker_client_validation_cached_after_first_access(self, mock_get_validated_client):
+        """Test that Docker client validation is cached after first access"""
+        mock_docker_client = MagicMock()
+        mock_get_validated_client.return_value = mock_docker_client
+
+        ecr_uploader = ECRUploader(
+            docker_client=None,
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+
+        # First access
+        docker_client1 = ecr_uploader.docker_client
+        # Second access
+        docker_client2 = ecr_uploader.docker_client
+
+        # Validation should only be called once
+        mock_get_validated_client.assert_called_once()
+        self.assertEqual(docker_client1, docker_client2)
+        self.assertEqual(docker_client1, mock_docker_client)
+
+    def test_docker_client_property_with_provided_client(self):
+        """Test that provided Docker client is used without validation"""
+        ecr_uploader = ECRUploader(
+            docker_client=self.docker_client,  # Provide actual client
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+
+        # Should return the provided client
+        docker_client = ecr_uploader.docker_client
+        self.assertEqual(docker_client, self.docker_client)
 
         self.assertEqual(ecr_uploader.docker_client, self.docker_client)
         self.assertEqual(ecr_uploader.ecr_repo, self.ecr_repo)
@@ -194,6 +278,126 @@ class TestECRUploader(TestCase):
         with self.assertRaises(DockerPushFailedError):
             ecr_uploader.upload(image, resource_name="HelloWorldFunction")
 
+    @patch.object(Path, "is_file", return_value=True)
+    @patch("builtins.open", new_callable=mock_open)
+    def test_upload_from_image_archive(self, mock_open, mock_is_file):
+        resource_name = "HelloWorldFunction"
+        digest = uuid4().hex
+        id = f"sha256:{digest}"
+        image = "./path/to/archive.tar.gz"
+
+        # Mock the container client's load_image_from_archive method
+        mock_image = Mock()
+        mock_image.id = id
+        self.docker_client.load_image_from_archive.return_value = mock_image
+        self.docker_client.api.push.return_value.__iter__.return_value = iter(
+            [
+                {"status": "Pushing to xyz"},
+                {"id": "1", "status": "Preparing", "progress": ""},
+                {"id": "2", "status": "Preparing", "progress": ""},
+                {"id": "3", "status": "Preparing", "progress": ""},
+                {"id": "1", "status": "Pushing", "progress": "[====>   ]"},
+                {"id": "3", "status": "Pushing", "progress": "[====>   ]"},
+                {"id": "2", "status": "Pushing", "progress": "[====>   ]"},
+                {"id": "3", "status": "Pushed", "progress": "[========>]"},
+                {"id": "1", "status": "Pushed", "progress": "[========>]"},
+                {"id": "2", "status": "Pushed", "progress": "[========>]"},
+                {"status": f"image {resource_name} pushed digest: {digest}"},
+                {},
+            ]
+        )
+
+        ecr_uploader = ECRUploader(
+            docker_client=self.docker_client,
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+        ecr_uploader.login = MagicMock()
+        tag = ecr_uploader.upload(image, resource_name=resource_name)
+        self.assertEqual(f"{self.ecr_repo}:{resource_name}-{digest[:SHA_CHECKSUM_TRUNCATION_LENGTH]}-{self.tag}", tag)
+
+    @patch.object(Path, "is_file", return_value=False)
+    def test_upload_from_digest(self, mock_is_file):
+        resource_name = "HelloWorldFunction"
+        digest = uuid4().hex
+        id = f"sha256:{digest}"
+        image = id
+
+        self.docker_client.images.get.return_value = Mock(id=id)
+        self.docker_client.api.push.return_value.__iter__.return_value = iter(
+            [
+                {"status": "Pushing to xyz"},
+                {"id": "1", "status": "Preparing", "progress": ""},
+                {"id": "2", "status": "Preparing", "progress": ""},
+                {"id": "3", "status": "Preparing", "progress": ""},
+                {"id": "1", "status": "Pushing", "progress": "[====>   ]"},
+                {"id": "3", "status": "Pushing", "progress": "[====>   ]"},
+                {"id": "2", "status": "Pushing", "progress": "[====>   ]"},
+                {"id": "3", "status": "Pushed", "progress": "[========>]"},
+                {"id": "1", "status": "Pushed", "progress": "[========>]"},
+                {"id": "2", "status": "Pushed", "progress": "[========>]"},
+                {"status": f"image {resource_name} pushed digest: {digest}"},
+                {},
+            ]
+        )
+
+        ecr_uploader = ECRUploader(
+            docker_client=self.docker_client,
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+        ecr_uploader.login = MagicMock()
+        tag = ecr_uploader.upload(image, resource_name=resource_name)
+        self.assertEqual(f"{self.ecr_repo}:{resource_name}-{digest[:SHA_CHECKSUM_TRUNCATION_LENGTH]}-{self.tag}", tag)
+
+    @patch.object(Path, "is_file", return_value=True)
+    @patch("builtins.open", new_callable=mock_open)
+    def test_upload_failure_if_archive_represents_multiple_images(self, mock_open, mock_is_file):
+        resource_name = "HelloWorldFunction"
+        image = "./path/to/archive.tar.gz"
+
+        # Mock the container client's load_image_from_archive method to raise an exception for multiple images
+        self.docker_client.load_image_from_archive.side_effect = DockerPushFailedError(
+            "Archive represents multiple images"
+        )
+
+        ecr_uploader = ECRUploader(
+            docker_client=self.docker_client,
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+        ecr_uploader.login = MagicMock()
+
+        with self.assertRaises(DockerPushFailedError):
+            ecr_uploader.upload(image, resource_name=resource_name)
+
+    @patch.object(Path, "is_file", return_value=False)
+    def test_upload_failure_if_image_archive_does_not_exist(self, mock_is_file):
+        resource_name = "HelloWorldFunction"
+        image = "./path/to/archive.tar.gz"
+
+        # this error is raised because we ask the docker service for an image
+        # with an id or tag which resembles a file path (as `image` above)
+        self.docker_client.images.get.side_effect = docker.errors.ImageNotFound("no such image")
+
+        ecr_uploader = ECRUploader(
+            docker_client=self.docker_client,
+            ecr_client=self.ecr_client,
+            ecr_repo=self.ecr_repo,
+            ecr_repo_multi=self.ecr_repo_multi,
+            tag=self.tag,
+        )
+        ecr_uploader.login = MagicMock()
+
+        with self.assertRaises(DockerPushFailedError):
+            ecr_uploader.upload(image, resource_name=resource_name)
+
     @patch("samcli.lib.package.ecr_uploader.click.echo")
     def test_delete_artifact_successful(self, patched_click_echo):
         ecr_uploader = ECRUploader(
@@ -307,7 +511,6 @@ class TestECRUploader(TestCase):
         self.assertEqual(expected_click_echo_calls, patched_click_echo.call_args_list)
 
     def test_parse_image_url(self):
-
         valid = [
             {"url": self.image_uri, "result": {"repository": "mock-image-repo", "image_tag": "mock-tag"}},
             {"url": "mock-image-rep:mock-tag", "result": {"repository": "mock-image-rep", "image_tag": "mock-tag"}},

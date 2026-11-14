@@ -1,10 +1,11 @@
 import re
 
-import boto3
 import logging
 
 from unittest import TestCase
 from unittest.mock import patch, ANY
+
+from rich.console import Console
 
 from samcli.cli.context import Context
 from samcli.lib.utils.sam_logging import (
@@ -20,6 +21,10 @@ class TestContext(TestCase):
         ctx = Context()
 
         self.assertEqual(ctx.debug, False, "debug must default to False")
+
+    def test_must_have_console(self):
+        ctx = Context()
+        self.assertTrue(isinstance(ctx.console, Console))
 
     def test_must_set_get_debug_flag(self):
         ctx = Context()
@@ -63,6 +68,8 @@ class TestContext(TestCase):
         self.assertEqual(ctx.debug, False, "debug must be set to False")
 
     def test_must_set_aws_region_in_boto_session(self):
+        import boto3
+
         region = "myregion"
         ctx = Context()
 
@@ -70,27 +77,25 @@ class TestContext(TestCase):
         self.assertEqual(ctx.region, region)
         self.assertEqual(region, boto3._get_default_session().region_name)
 
-    @patch("samcli.cli.context.boto3")
-    def test_must_set_aws_profile_in_boto_session(self, boto_mock):
+    @patch("boto3.setup_default_session")
+    def test_must_set_aws_profile_in_boto_session(self, mock_setup_default_session):
         profile = "foo"
 
         ctx = Context()
 
         ctx.profile = profile
         self.assertEqual(ctx.profile, profile)
-        boto_mock.setup_default_session.assert_called_with(region_name=None, profile_name=profile, botocore_session=ANY)
+        mock_setup_default_session.assert_called_with(region_name=None, profile_name=profile, botocore_session=ANY)
 
-    @patch("samcli.cli.context.boto3")
-    def test_must_set_all_aws_session_properties(self, boto_mock):
+    @patch("boto3.setup_default_session")
+    def test_must_set_all_aws_session_properties(self, mock_setup_default_session):
         profile = "foo"
         region = "myregion"
         ctx = Context()
 
         ctx.profile = profile
         ctx.region = region
-        boto_mock.setup_default_session.assert_called_with(
-            region_name=region, profile_name=profile, botocore_session=ANY
-        )
+        mock_setup_default_session.assert_called_with(region_name=region, profile_name=profile, botocore_session=ANY)
 
     @patch("samcli.cli.context.uuid")
     def test_must_set_session_id_to_uuid(self, uuid_mock):
@@ -101,7 +106,6 @@ class TestContext(TestCase):
 
     @patch("samcli.cli.context.click")
     def test_must_find_context(self, click_mock):
-
         ctx = Context()
         result = ctx.get_current_context()
 
@@ -110,7 +114,6 @@ class TestContext(TestCase):
 
     @patch("samcli.cli.context.click")
     def test_create_new_context_if_not_found(self, click_mock):
-
         # Context can't be found
         click_mock.get_current_context.return_value.find_object.return_value = None
 

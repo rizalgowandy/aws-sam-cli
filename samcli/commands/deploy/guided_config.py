@@ -1,13 +1,15 @@
 """
 Set of Utilities to deal with reading/writing to configuration file during sam deploy
 """
+
 from typing import Any
 
 import click
 
 from samcli.cli.context import get_cmd_names
 from samcli.commands.deploy.exceptions import GuidedDeployFailedError
-from samcli.lib.config.samconfig import SamConfig, DEFAULT_ENV, DEFAULT_CONFIG_FILE_NAME
+from samcli.lib.config.exceptions import SamConfigFileReadException
+from samcli.lib.config.samconfig import DEFAULT_ENV, SamConfig
 
 
 class GuidedConfig:
@@ -19,20 +21,25 @@ class GuidedConfig:
         ctx = click.get_current_context()
 
         samconfig_dir = getattr(ctx, "samconfig_dir", None)
+        config_dir = samconfig_dir if samconfig_dir else SamConfig.config_dir(template_file_path=self.template_file)
         samconfig = SamConfig(
-            config_dir=samconfig_dir if samconfig_dir else SamConfig.config_dir(template_file_path=self.template_file),
-            filename=config_file or DEFAULT_CONFIG_FILE_NAME,
+            config_dir=config_dir,
+            filename=config_file or SamConfig.get_default_file(config_dir=config_dir),
         )
         return ctx, samconfig
 
     def read_config_showcase(self, config_file=None):
-        _, samconfig = self.get_config_ctx(config_file)
-
-        status = "Found" if samconfig.exists() else "Not found"
         msg = (
             "Syntax invalid in samconfig.toml; save values "
             "through sam deploy --guided to overwrite file with a valid set of values."
         )
+        try:
+            _, samconfig = self.get_config_ctx(config_file)
+        except SamConfigFileReadException:
+            raise GuidedDeployFailedError(msg)
+
+        status = "Found" if samconfig.exists() else "Not found"
+
         config_sanity = samconfig.sanity_check()
         click.secho("\nConfiguring SAM deploy\n======================", fg="yellow")
         click.echo(f"\n\tLooking for config file [{config_file}] :  {status}")
@@ -51,16 +58,19 @@ class GuidedConfig:
         image_repositories=None,
         **kwargs,
     ):
-
         ctx, samconfig = self.get_config_ctx(config_file)
 
         cmd_names = get_cmd_names(ctx.info_name, ctx)
 
         for key, value in kwargs.items():
-            if isinstance(value, (list, tuple)):
-                value = " ".join(val for val in value)
-            if value:
-                samconfig.put(cmd_names, self.section, key, value, env=config_env)
+            v = value
+            if isinstance(v, (list, tuple)):
+                v = " ".join(val for val in v)
+            if v:
+                samconfig.put(cmd_names, self.section, key, v, env=config_env)
+                # Also save region to global parameters section for Toolkit AppBuilder
+                if key == "region":
+                    samconfig.put(["global"], "parameters", "region", v, env=config_env)
 
         self._save_parameter_overrides(cmd_names, config_env, parameter_overrides, samconfig)
         self._save_image_repositories(cmd_names, config_env, samconfig, image_repositories)

@@ -1,13 +1,13 @@
 """
 Keeps XRay event definitions
 """
+
 import json
 import operator
-from typing import List
+from typing import List, Optional
 
 from samcli.lib.observability.observability_info_puller import ObservabilityEvent
 from samcli.lib.utils.hash import str_checksum
-
 
 start_time_getter = operator.attrgetter("start_time")
 
@@ -18,9 +18,12 @@ class XRayTraceEvent(ObservabilityEvent[dict]):
     See XRayTracePuller
     """
 
-    def __init__(self, event: dict):
+    def __init__(self, event: dict, revision: Optional[int] = None):
         super().__init__(event, 0)
         self.id = event.get("Id", "")
+        # A revision number will be passed to link with the event
+        # The same x-ray event will differ in information on different revisions
+        self.revision = revision
         self.duration = event.get("Duration", 0.0)
         self.message = json.dumps(event)
         self.segments: List[XRayTraceSegment] = []
@@ -46,8 +49,7 @@ class XRayTraceEvent(ObservabilityEvent[dict]):
         latest_event_time = 0
         for segment in self.segments:
             segment_latest_event_time = segment.get_latest_event_time()
-            if segment_latest_event_time > latest_event_time:
-                latest_event_time = segment_latest_event_time
+            latest_event_time = max(latest_event_time, segment_latest_event_time)
 
         return latest_event_time
 
@@ -81,8 +83,7 @@ class XRayTraceSegment:
         latest_event_time = self.end_time
         for sub_segment in self.sub_segments:
             sub_segment_latest_time = sub_segment.get_latest_event_time()
-            if sub_segment_latest_time > latest_event_time:
-                latest_event_time = sub_segment_latest_time
+            latest_event_time = max(latest_event_time, sub_segment_latest_time)
 
         return latest_event_time
 

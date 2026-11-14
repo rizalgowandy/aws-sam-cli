@@ -4,19 +4,29 @@ routes in a standardized format
 """
 
 import logging
+import os
 from collections import defaultdict
-from typing import Iterator, Tuple, Union, Optional, List, Set, Dict
+from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
 
-from samcli.local.apigw.local_apigw_service import Route
-from samcli.lib.providers.provider import Cors, Api
+from samcli.lib.providers.provider import Api, Cors
+from samcli.lib.utils.colors import Colored, Colors
+from samcli.local.apigw.authorizers.authorizer import Authorizer
+from samcli.local.apigw.route import Route
 
 LOG = logging.getLogger(__name__)
 
 
 class ApiCollector:
+    # Authorizer types that are valid but not Lambda-based, so cannot be emulated locally
+    _NON_LAMBDA_AUTHORIZERS = {"AWS_IAM", "NONE"}
+
     def __init__(self) -> None:
         # Route properties stored per resource.
         self._route_per_resource: Dict[str, List[Route]] = defaultdict(list)
+
+        # Authorizer definitions and default authorizers for each api
+        self._authorizers_per_resources: Dict[str, Dict[str, Authorizer]] = defaultdict(dict)
+        self._default_authorizer_per_resource: Dict[str, str] = {}
 
         # processed values to be set before creating the api
         self._routes: List[Route] = []
@@ -39,6 +49,83 @@ class ApiCollector:
 
         for logical_id, _ in self._route_per_resource.items():
             yield logical_id, self._get_routes(logical_id)
+
+    def add_authorizers(self, logical_id: str, authorizers: Dict[str, Authorizer]) -> None:
+        """
+        Adds Authorizers to a API Gateway resource
+
+        Parameters
+        ----------
+        logical_id: str
+            Logical ID of API Gateway resource
+        authorizers: Dict[str, Authorizer]
+            Dictionary with key as authorizer name, and value as Authorizer object
+        """
+        self._authorizers_per_resources[logical_id].update(authorizers)
+
+    def set_default_authorizer(self, logical_id: str, authorizer_name: str) -> None:
+        """
+        Sets the default authorizer used for the API Gateway resource
+
+        Parameters
+        ----------
+        logical_id: str
+            Logical ID of API Gateway resource
+        authorizer_name: str
+            Name of the authorizer to reference
+        """
+        self._default_authorizer_per_resource[logical_id] = authorizer_name
+
+    def _link_authorizers(self) -> None:
+        """
+        Links the routes to the correct authorizer object
+        """
+        for apigw_id, routes in self._route_per_resource.items():
+            authorizers = self._authorizers_per_resources.get(apigw_id, {})
+
+            default_authorizer = self._default_authorizer_per_resource.get(apigw_id, None)
+
+            for route in routes:
+                if route.authorizer_name is None and not route.use_default_authorizer:
+                    LOG.debug(
+                        "Linking authorizer skipped, route '%s' is set to not use any authorizer.",
+                        route.path,
+                    )
+
+                    continue
+
+                # determine the name of the authorizer object we want to search for in our dict
+                authorizer_name_lookup = route.authorizer_name or default_authorizer or ""
+                authorizer_object = authorizers.get(authorizer_name_lookup, None)
+
+                if authorizer_object:
+                    route.authorizer_name = authorizer_name_lookup
+                    route.authorizer_object = authorizer_object
+
+                    LOG.debug(
+                        "Linking authorizer '%s', for route '%s'",
+                        route.authorizer_name,
+                        route.path,
+                    )
+
+                    continue
+
+                if not authorizer_object and authorizer_name_lookup:
+                    if authorizer_name_lookup in self._NON_LAMBDA_AUTHORIZERS:
+                        LOG.info(
+                            "Authorizer '%s' for route '%s' is not supported for local emulation,"
+                            " requests will not be authorized",
+                            authorizer_name_lookup,
+                            route.path,
+                        )
+                    else:
+                        LOG.warning(
+                            "Authorizer '%s' for route '%s' was not found, skipping",
+                            authorizer_name_lookup,
+                            route.path,
+                        )
+
+                    route.authorizer_name = None
 
     def add_routes(self, logical_id: str, routes: List[Route]) -> None:
         """
@@ -102,13 +189,29 @@ class ApiCollector:
         An Api object with all the properties
         """
         api = Api()
+
+        self._link_authorizers()
+
         routes = self.dedupe_function_routes(self.routes)
         routes = self.normalize_cors_methods(routes, self.cors)
+
         api.routes = routes
         api.binary_media_types_set = self.binary_media_types_set
         api.stage_name = self.stage_name
         api.stage_variables = self.stage_variables
         api.cors = self.cors
+
+        for authorizers in self._authorizers_per_resources.values():
+            if len(authorizers):
+                message = f"""{os.linesep}AWS SAM CLI does not guarantee 100% fidelity between authorizers locally 
+and authorizers deployed on AWS. Any application critical behavior should
+be validated thoroughly before deploying to production.
+
+Testing application behaviour against authorizers deployed on AWS can be done using the sam sync command.{os.linesep}"""
+                LOG.warning(Colored().color_log(message, color=Colors.WARNING), extra=dict(markup=True))
+
+                break
+
         return api
 
     @staticmethod
@@ -157,6 +260,8 @@ class ApiCollector:
             if config:
                 methods += config.methods
             sorted_methods = sorted(methods)
+            # Prefer route-specific CORS over None
+            cors = route.cors if route.cors is not None else (config.cors if config else None)
             grouped_routes[key] = Route(
                 function_name=route.function_name,
                 path=route.path,
@@ -165,6 +270,9 @@ class ApiCollector:
                 payload_format_version=route.payload_format_version,
                 operation_name=route.operation_name,
                 stack_path=route.stack_path,
+                authorizer_name=route.authorizer_name,
+                authorizer_object=route.authorizer_object,
+                cors=cors,
             )
         return list(grouped_routes.values())
 

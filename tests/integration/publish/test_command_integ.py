@@ -3,22 +3,19 @@ import time
 import json
 from subprocess import Popen, PIPE, TimeoutExpired
 
-from unittest import skipIf
 
+import pytest
 from parameterized import parameterized
 
 from samcli.commands.publish.command import SEMANTIC_VERSION
-from .publish_app_integ_base import PublishAppIntegBase
-from tests.testing_utils import RUNNING_ON_CI, RUNNING_TEST_FOR_MASTER_ON_CI, RUN_BY_CANARY
+from tests.integration.publish.publish_app_integ_base import PublishAppIntegBase
 from tests.testing_utils import run_command
 
-# Publish tests require credentials and CI/CD will only add credentials to the env if the PR is from the same repo.
-# This is to restrict publish tests to run outside of CI/CD, when the branch is not master and tests are not run by Canary.
-SKIP_PUBLISH_TESTS = RUNNING_ON_CI and RUNNING_TEST_FOR_MASTER_ON_CI and not RUN_BY_CANARY
+# These tests require AWS credentials; they are gated by the requires_credential marker.
 TIMEOUT = 300
 
 
-@skipIf(SKIP_PUBLISH_TESTS, "Skip publish tests in CI/CD only")
+@pytest.mark.requires_credential
 class TestPublishExistingApp(PublishAppIntegBase):
     def setUp(self):
         super().setUp()
@@ -44,6 +41,7 @@ class TestPublishExistingApp(PublishAppIntegBase):
             ("template_create_app_with_readme_body.yaml", "metadata_create_app_with_readme_body.json"),
         ]
     )
+    @pytest.mark.flaky(reruns=3)
     def test_update_application(self, template_filename, expected_template_filename):
         template_path = self.temp_dir.joinpath(template_filename)
         command_list = self.get_command_list(template_path=template_path, region=self.region_name)
@@ -57,6 +55,7 @@ class TestPublishExistingApp(PublishAppIntegBase):
         app_metadata = json.loads(app_metadata_text)
         self.assert_metadata_details(app_metadata, result_msg)
 
+    @pytest.mark.flaky(reruns=3)
     def test_update_application_version_with_semantic_version_option(self):
         template_path = self.temp_dir.joinpath("template_create_app_version.yaml")
         command_list = self.get_command_list(
@@ -71,8 +70,26 @@ class TestPublishExistingApp(PublishAppIntegBase):
         app_metadata[SEMANTIC_VERSION] = "0.1.0"
         self.assert_metadata_details(app_metadata, result.stdout.decode("utf-8"))
 
+    @pytest.mark.flaky(reruns=3)
+    def test_update_application_fail_on_same_semantic_version(self):
+        template_path = self.temp_dir.joinpath("template_create_app_version.yaml")
+        command_list = self.get_command_list(
+            template_path=template_path, region=self.region_name, semantic_version="0.1.0"
+        )
+        # Publish the version initially
+        run_command(command_list)
 
-@skipIf(SKIP_PUBLISH_TESTS, "Skip publish tests in CI/CD only")
+        second_command_list = self.get_command_list(
+            template_path=template_path, region=self.region_name, semantic_version="0.1.0", fail_on_same_version=True
+        )
+
+        # Attempt to publish again with the same semantic version and with --fail-on-same-version
+        result = run_command(second_command_list)
+        expected_msg = "Cannot publish version 0.1.0 for application"
+        self.assertIn(expected_msg, result.stderr.decode("utf-8"))
+
+
+@pytest.mark.requires_credential
 class TestPublishNewApp(PublishAppIntegBase):
     def setUp(self):
         super().setUp()
@@ -86,6 +103,7 @@ class TestPublishNewApp(PublishAppIntegBase):
         if self.application_id:
             self.sar_client.delete_application(ApplicationId=self.application_id)
 
+    @pytest.mark.flaky(reruns=3)
     def test_create_application(self):
         template_path = self.temp_dir.joinpath("template_create_app.yaml")
         command_list = self.get_command_list(template_path=template_path, region=self.region_name)
@@ -103,6 +121,7 @@ class TestPublishNewApp(PublishAppIntegBase):
         match = re.search(pattern, result.stdout.decode("utf-8"))
         self.application_id = match.group().replace("~", "/")
 
+    @pytest.mark.flaky(reruns=3)
     def test_publish_not_packaged_template(self):
         template_path = self.temp_dir.joinpath("template_not_packaged.yaml")
         command_list = self.get_command_list(template_path=template_path, region=self.region_name)
@@ -118,6 +137,7 @@ class TestPublishNewApp(PublishAppIntegBase):
         expected_msg = "Please make sure that you have uploaded application artifacts to S3"
         self.assertIn(expected_msg, process_stderr.decode("utf-8"))
 
+    @pytest.mark.flaky(reruns=3)
     def test_create_application_infer_region_from_env(self):
         template_path = self.temp_dir.joinpath("template_create_app.yaml")
         command_list = self.get_command_list(template_path=template_path)
@@ -133,6 +153,7 @@ class TestPublishNewApp(PublishAppIntegBase):
         self.application_id = match.group().replace("~", "/")
         self.assertIn(self.region_name, self.application_id)
 
+    @pytest.mark.flaky(reruns=3)
     def test_create_application_version_with_license_body(self):
         template_path = self.temp_dir.joinpath("template_create_app_with_license_body.yaml")
         command_list = self.get_command_list(

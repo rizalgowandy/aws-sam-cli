@@ -1,22 +1,24 @@
+import os
 import json
 import shutil
 import subprocess
 import tempfile
-from unittest.case import expectedFailure
+from unittest import mock
+from parameterized import parameterized
 import requests
 from pathlib import Path
 from typing import Dict, Any
 from unittest import TestCase
-from unittest.mock import patch, ANY
+from unittest.mock import patch, ANY, Mock
 
 import botocore.exceptions
 import click
 from click.testing import CliRunner
 
-from samcli.commands.exceptions import UserException
+from samcli.commands.exceptions import PopularRuntimeNotFoundException, UserException
 from samcli.commands.init import cli as init_cmd
-from samcli.commands.init import do_cli as init_cli
-from samcli.commands.init import PackageType
+from samcli.commands.init.command import do_cli as init_cli
+from samcli.commands.init.command import PackageType
 from samcli.commands.init.init_templates import (
     InitTemplates,
     APP_TEMPLATES_REPO_URL,
@@ -25,10 +27,10 @@ from samcli.commands.init.init_templates import (
     get_template_value,
     template_does_not_meet_filter_criteria,
 )
-from samcli.commands.init.interactive_init_flow import get_sorted_runtimes
+from samcli.commands.init.interactive_init_flow import _get_latest_python_runtime, get_sorted_runtimes
+from samcli.commands.init.init_flow_helpers import compare_runtimes
 from samcli.lib.init import GenerateProjectFailedError
 from samcli.lib.utils import osutils
-from samcli.lib.utils import packagetype
 from samcli.lib.utils.git_repo import GitRepo
 from samcli.lib.utils.packagetype import IMAGE, ZIP
 from samcli.lib.utils.architecture import X86_64, ARM64
@@ -41,7 +43,7 @@ class MockInitTemplates:
             url=APP_TEMPLATES_REPO_URL,
         )
         self._git_repo.clone_attempted = True
-        self._git_repo.local_path = Path("tests/unit/commands/init")
+        self._git_repo.local_path = os.path.dirname(__file__)
         self.manifest_file_name = "test_manifest.json"
 
 
@@ -52,17 +54,17 @@ class TestCli(TestCase):
         self.location = None
         self.pt_explicit = True
         self.package_type = ZIP
-        self.runtime = "python3.6"
+        self.runtime = "python3.9"
         self.base_image = None
         self.dependency_manager = "pip"
         self.output_dir = "."
         self.name = "testing project"
         self.app_template = "hello-world"
         self.no_input = False
-        self.extra_context = '{"project_name": "testing project", "runtime": "python3.6"}'
-        self.extra_context_as_json = {"project_name": "testing project", "runtime": "python3.6"}
+        self.extra_context = '{"project_name": "testing project", "runtime": "python3.9"}'
+        self.extra_context_as_json = {"project_name": "testing project", "runtime": "python3.9"}
 
-        with open("tests/unit/commands/init/test_manifest.json") as f:
+        with open(os.path.join(os.path.dirname(__file__), "test_manifest.json")) as f:
             self.data = json.load(f)
 
     # setup cache for clone, so that if `git clone` is called multiple times on the same URL,
@@ -117,6 +119,9 @@ class TestCli(TestCase):
             app_template=self.app_template,
             no_input=self.no_input,
             extra_context=None,
+            tracing=False,
+            application_insights=False,
+            structured_logging=True,
         )
 
         # THEN we should receive no errors
@@ -131,6 +136,50 @@ class TestCli(TestCase):
             self.name,
             True,
             self.extra_context_as_json,
+            False,
+            False,
+            True,
+        )
+
+    @patch("samcli.lib.utils.git_repo.GitRepo.clone")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_node(self, generate_project_patch, git_repo_clone_mock):
+        # GIVEN generate_project successfully created a project
+        # WHEN a project name has been passed
+        init_cli(
+            ctx=self.ctx,
+            no_interactive=self.no_interactive,
+            location=self.location,
+            pt_explicit=self.pt_explicit,
+            package_type=self.package_type,
+            runtime="nodejs22.x",
+            architecture=X86_64,
+            base_image=self.base_image,
+            dependency_manager="npm",
+            output_dir=None,
+            name=self.name,
+            app_template=self.app_template,
+            no_input=self.no_input,
+            extra_context=None,
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
+        )
+
+        # THEN we should receive no errors
+        generate_project_patch.assert_called_once_with(
+            # need to change the location validation check
+            ANY,
+            ZIP,
+            "nodejs22.x",
+            "npm",
+            self.output_dir,
+            self.name,
+            True,
+            {"runtime": "nodejs22.x", "project_name": "testing project", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -146,13 +195,16 @@ class TestCli(TestCase):
             package_type=IMAGE,
             runtime=None,
             architecture=ARM64,
-            base_image="amazon/nodejs12.x-base",
+            base_image="amazon/nodejs20.x-base",
             dependency_manager="npm",
             output_dir=None,
             name=self.name,
             app_template=None,
             no_input=self.no_input,
             extra_context=None,
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
 
         # THEN we should receive no errors
@@ -160,12 +212,99 @@ class TestCli(TestCase):
             # need to change the location validation check
             ANY,
             IMAGE,
-            "nodejs12.x",
+            "nodejs20.x",
             "npm",
             self.output_dir,
             self.name,
             True,
-            {"runtime": "nodejs12.x", "project_name": "testing project", "architectures": {"value": [ARM64]}},
+            {"runtime": "nodejs20.x", "project_name": "testing project", "architectures": {"value": [ARM64]}},
+            False,
+            False,
+            False,
+        )
+
+    @patch("samcli.lib.utils.git_repo.GitRepo.clone")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_with_tracing(self, generate_project_patch, git_repo_clone_mock):
+        # GIVEN generate_project successfully created a project
+        # WHEN a project name has been passed
+        init_cli(
+            ctx=self.ctx,
+            no_interactive=self.no_interactive,
+            location=self.location,
+            pt_explicit=self.pt_explicit,
+            package_type=self.package_type,
+            runtime=self.runtime,
+            architecture=X86_64,
+            base_image=self.base_image,
+            dependency_manager=self.dependency_manager,
+            output_dir=None,
+            name=self.name,
+            app_template=self.app_template,
+            no_input=self.no_input,
+            extra_context=None,
+            tracing=True,
+            application_insights=False,
+            structured_logging=False,
+        )
+
+        # THEN we should receive no errors
+        self.extra_context_as_json["architectures"] = {"value": [X86_64]}
+        generate_project_patch.assert_called_once_with(
+            # need to change the location validation check
+            ANY,
+            ZIP,
+            self.runtime,
+            self.dependency_manager,
+            self.output_dir,
+            self.name,
+            True,
+            self.extra_context_as_json,
+            True,
+            False,
+            False,
+        )
+
+    @patch("samcli.lib.utils.git_repo.GitRepo.clone")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_with_application_insights(self, generate_project_patch, git_repo_clone_mock):
+        # GIVEN generate_project successfully created a project
+        # WHEN a project name has been passed
+        init_cli(
+            ctx=self.ctx,
+            no_interactive=self.no_interactive,
+            location=self.location,
+            pt_explicit=self.pt_explicit,
+            package_type=self.package_type,
+            runtime=self.runtime,
+            architecture=X86_64,
+            base_image=self.base_image,
+            dependency_manager=self.dependency_manager,
+            output_dir=None,
+            name=self.name,
+            app_template=self.app_template,
+            no_input=self.no_input,
+            extra_context=None,
+            tracing=False,
+            application_insights=True,
+            structured_logging=False,
+        )
+
+        # THEN we should receive no errors
+        self.extra_context_as_json["architectures"] = {"value": [X86_64]}
+        generate_project_patch.assert_called_once_with(
+            # need to change the location validation check
+            ANY,
+            ZIP,
+            self.runtime,
+            self.dependency_manager,
+            self.output_dir,
+            self.name,
+            True,
+            self.extra_context_as_json,
+            False,
+            True,
+            False,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -188,6 +327,9 @@ class TestCli(TestCase):
             app_template=None,
             no_input=self.no_input,
             extra_context=None,
+            tracing=False,
+            application_insights=False,
+            structured_logging=True,
         )
 
         # THEN we should receive no errors
@@ -201,6 +343,9 @@ class TestCli(TestCase):
             self.name,
             True,
             {"runtime": "java11", "project_name": "testing project", "architectures": {"value": [X86_64]}},
+            False,
+            False,
+            True,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -223,6 +368,9 @@ class TestCli(TestCase):
                 app_template="wrong-and-bad",
                 no_input=self.no_input,
                 extra_context=None,
+                tracing=False,
+                application_insights=False,
+                structured_logging=False,
             )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -245,6 +393,9 @@ class TestCli(TestCase):
                 app_template=self.app_template,
                 no_input=self.no_input,
                 extra_context=None,
+                tracing=False,
+                application_insights=False,
+                structured_logging=False,
             )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -273,10 +424,21 @@ class TestCli(TestCase):
                 app_template=None,
                 no_input=self.no_input,
                 extra_context=None,
+                tracing=False,
+                application_insights=False,
+                structured_logging=False,
             )
 
             generate_project_patch.assert_called_with(
-                self.location, self.runtime, self.dependency_manager, self.output_dir, self.name, self.no_input
+                self.location,
+                self.runtime,
+                self.dependency_manager,
+                self.output_dir,
+                self.name,
+                self.no_input,
+                False,
+                False,
+                False,
             )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -298,17 +460,28 @@ class TestCli(TestCase):
                 package_type=IMAGE,
                 runtime=None,
                 architecture=X86_64,
-                base_image="python3.6-base",
+                base_image="python3.9-base",
                 dependency_manager="wrong-dependency-manager",
                 output_dir=self.output_dir,
                 name=self.name,
                 app_template=None,
                 no_input=self.no_input,
                 extra_context=None,
+                tracing=False,
+                application_insights=False,
+                structured_logging=False,
             )
 
             generate_project_patch.assert_called_with(
-                self.location, self.runtime, self.dependency_manager, self.output_dir, self.name, self.no_input
+                self.location,
+                self.runtime,
+                self.dependency_manager,
+                self.output_dir,
+                self.name,
+                self.no_input,
+                False,
+                False,
+                False,
             )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -331,12 +504,25 @@ class TestCli(TestCase):
             app_template=self.app_template,
             no_input=self.no_input,
             extra_context=None,
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
 
         # THEN we should receive no errors
         self.extra_context_as_json["architectures"] = {"value": [ARM64]}
         generate_project_patch.assert_called_once_with(
-            ANY, ZIP, self.runtime, self.dependency_manager, ".", self.name, True, self.extra_context_as_json
+            ANY,
+            ZIP,
+            self.runtime,
+            self.dependency_manager,
+            ".",
+            self.name,
+            True,
+            self.extra_context_as_json,
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -359,6 +545,9 @@ class TestCli(TestCase):
             app_template=self.app_template,
             no_input=self.no_input,
             extra_context='{"schema_name":"events", "schema_type":"aws"}',
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
 
         # THEN we should receive no errors and right extra_context should be passed
@@ -372,11 +561,14 @@ class TestCli(TestCase):
             True,
             {
                 "project_name": "testing project",
-                "runtime": "python3.6",
+                "runtime": "python3.9",
                 "schema_name": "events",
                 "schema_type": "aws",
                 "architectures": {"value": [X86_64]},
             },
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -400,7 +592,10 @@ class TestCli(TestCase):
             name=self.name,
             app_template=self.app_template,
             no_input=self.no_input,
-            extra_context='{"project_name": "my_project", "runtime": "java8", "schema_name":"events", "schema_type": "aws"}',
+            extra_context='{"project_name": "my_project", "runtime": "java17", "schema_name":"events", "schema_type": "aws"}',
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
 
         # THEN extra_context should have not overridden default_parameters(name, runtime)
@@ -414,11 +609,14 @@ class TestCli(TestCase):
             True,
             {
                 "project_name": "testing project",
-                "runtime": "python3.6",
+                "runtime": "python3.9",
                 "schema_name": "events",
                 "schema_type": "aws",
                 "architectures": {"value": [ARM64]},
             },
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -440,7 +638,10 @@ class TestCli(TestCase):
                 name=self.name,
                 app_template=self.app_template,
                 no_input=self.no_input,
-                extra_context='{"project_name", "my_project", "runtime": "java8", "schema_name":"events", "schema_type": "aws"}',
+                extra_context='{"project_name", "my_project", "runtime": "java8.al2", "schema_name":"events", "schema_type": "aws"}',
+                tracing=False,
+                application_insights=False,
+                structured_logging=False,
             )
 
     @patch("samcli.commands.init.init_generator.generate_project")
@@ -453,7 +654,7 @@ class TestCli(TestCase):
             location="custom location",
             pt_explicit=self.pt_explicit,
             package_type=self.package_type,
-            runtime="java8",
+            runtime="java8.al2",
             architecture=X86_64,
             base_image=self.base_image,
             dependency_manager=None,
@@ -462,13 +663,16 @@ class TestCli(TestCase):
             app_template=None,
             no_input=None,
             extra_context='{"schema_name":"events", "schema_type": "aws"}',
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
 
         # THEN should set default parameter(name, runtime) as extra_context
         generate_project_patch.assert_called_once_with(
             "custom location",
             ZIP,
-            "java8",
+            "java8.al2",
             None,
             ".",
             "test-project",
@@ -476,10 +680,13 @@ class TestCli(TestCase):
             {
                 "schema_name": "events",
                 "schema_type": "aws",
-                "runtime": "java8",
+                "runtime": "java8.al2",
                 "project_name": "test-project",
                 "architectures": {"value": [X86_64]},
             },
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.commands.init.init_generator.generate_project")
@@ -501,6 +708,9 @@ class TestCli(TestCase):
             app_template=None,
             no_input=None,
             extra_context='{"schema_name":"events", "schema_type": "aws"}',
+            tracing=False,
+            application_insights=False,
+            structured_logging=True,
         )
 
         # THEN extra_context should be without runtime
@@ -518,6 +728,9 @@ class TestCli(TestCase):
                 "project_name": "test-project",
                 "architectures": {"value": [ARM64]},
             },
+            False,
+            False,
+            True,
         )
 
     @patch("samcli.commands.init.init_generator.generate_project")
@@ -530,7 +743,7 @@ class TestCli(TestCase):
             location="custom location",
             pt_explicit=self.pt_explicit,
             package_type=self.package_type,
-            runtime="java8",
+            runtime="java8.al2",
             architecture=ARM64,
             base_image=self.base_image,
             dependency_manager=None,
@@ -539,13 +752,16 @@ class TestCli(TestCase):
             app_template=None,
             no_input=None,
             extra_context='{"schema_name":"events", "schema_type": "aws"}',
+            tracing=False,
+            application_insights=False,
+            structured_logging=True,
         )
 
         # THEN extra_context should be without name
         generate_project_patch.assert_called_once_with(
             "custom location",
             ZIP,
-            "java8",
+            "java8.al2",
             None,
             ".",
             None,
@@ -553,9 +769,12 @@ class TestCli(TestCase):
             {
                 "schema_name": "events",
                 "schema_type": "aws",
-                "runtime": "java8",
+                "runtime": "java8.al2",
                 "architectures": {"value": [ARM64]},
             },
+            False,
+            False,
+            True,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -579,6 +798,9 @@ class TestCli(TestCase):
             no_input=self.no_input,
             # fmt: off
             extra_context='{\"schema_name\":\"events\", \"schema_type\":\"aws\"}',
+            tracing=False,
+            application_insights= False,
+            structured_logging=False
             # fmt: on
         )
 
@@ -593,11 +815,14 @@ class TestCli(TestCase):
             True,
             {
                 "project_name": "testing project",
-                "runtime": "python3.6",
+                "runtime": "python3.9",
                 "schema_name": "events",
                 "schema_type": "aws",
                 "architectures": {"value": [X86_64]},
             },
+            False,
+            False,
+            False,
         )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -709,6 +934,9 @@ class TestCli(TestCase):
         user_input = """
 1
 2
+N
+N
+N
 test-project
 Y
 1
@@ -737,6 +965,9 @@ Y
                 "AWS_Schema_root": "schemas.aws.AWSAPICallViaCloudTrail",
                 "architectures": {"value": [X86_64]},
             },
+            False,
+            False,
+            False,
         )
         get_schemas_client_mock.assert_called_once_with(None, "ap-northeast-1")
         do_extract_and_merge_schemas_code_mock.do_extract_and_merge_schemas_code_mock(
@@ -752,7 +983,7 @@ Y
     ):
         init_options_from_manifest_mock.return_value = [
             {
-                "directory": "java8-image/cookiecutter-aws-sam-hello-java-maven-lambda-image",
+                "directory": "java8.al2-image/cookiecutter-aws-sam-hello-java-maven-lambda-image",
                 "displayName": "Hello World Lambda Image Example: Maven",
                 "dependencyManager": "maven",
                 "appTemplate": "hello-world-lambda-image",
@@ -763,10 +994,10 @@ Y
 
         get_preprocessed_manifest_mock.return_value = {
             "Serverless API": {
-                "java8": {
+                "java8.al2": {
                     "Image": [
                         {
-                            "directory": "java8-image/cookiecutter-aws-sam-hello-java-maven-lambda-image",
+                            "directory": "java8.al2-image/cookiecutter-aws-sam-hello-java-maven-lambda-image",
                             "displayName": "Hello World Lambda Image Example: Maven",
                             "dependencyManager": "maven",
                             "appTemplate": "hello-world-lambda-image",
@@ -782,13 +1013,16 @@ Y
 
         # 2: AWS Quick Start Templates
         # 1: Serverless API - Use case
-        # Java8
+        # Java8.al2
         # Package type - Image
         # Hello World Lambda Image Example: Maven
         # test-project: response to name
 
         user_input = """
 1
+N
+N
+y
 test-project
             """
         runner = CliRunner()
@@ -797,12 +1031,15 @@ test-project
         generate_project_patch.assert_called_once_with(
             ANY,
             IMAGE,
-            "java8",
+            "java8.al2",
             "maven",
             ".",
             "test-project",
             True,
-            {"project_name": "test-project", "runtime": "java8", "architectures": {"value": [X86_64]}},
+            {"project_name": "test-project", "runtime": "java8.al2", "architectures": {"value": [X86_64]}},
+            False,
+            False,
+            True,
         )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -917,6 +1154,9 @@ test-project
         user_input = """
 1
 2
+N
+N
+N
 test-project
 N
 1
@@ -947,6 +1187,9 @@ us-east-1
                 "AWS_Schema_root": "schemas.aws.AWSAPICallViaCloudTrail",
                 "architectures": {"value": [X86_64]},
             },
+            False,
+            False,
+            False,
         )
         get_schemas_client_mock.assert_called_once_with("default", "us-east-1")
         do_extract_and_merge_schemas_code_mock.do_extract_and_merge_schemas_code("result.zip", ".", "test-project", ANY)
@@ -1042,6 +1285,9 @@ us-east-1
 2
 1
 1
+N
+N
+N
 test-project
 N
 1
@@ -1167,6 +1413,9 @@ invalid-region
         user_input = """
 1
 2
+N
+N
+N
 test-project
 Y
 1
@@ -1195,6 +1444,9 @@ Y
                 "AWS_Schema_root": "schemas.aws.AWSAPICallViaCloudTrail",
                 "architectures": {"value": [X86_64]},
             },
+            False,
+            False,
+            False,
         )
         get_schemas_client_mock.assert_called_once_with(None, "ap-northeast-1")
         do_extract_and_merge_schemas_code_mock.do_extract_and_merge_schemas_code_mock(
@@ -1307,6 +1559,9 @@ Y
 2
 1
 1
+N
+N
+N
 test-project
 Y
 1
@@ -1340,6 +1595,9 @@ Y
             no_input=self.no_input,
             extra_context=None,
             architecture=ARM64,
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
 
         self.extra_context_as_json["architectures"] = {"value": [ARM64]}
@@ -1353,6 +1611,9 @@ Y
             self.name,
             True,
             self.extra_context_as_json,
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -1382,6 +1643,9 @@ foo
             None,
             False,
             None,
+            None,
+            None,
+            None,
         )
 
     @patch("samcli.commands.init.init_templates.InitTemplates._get_manifest")
@@ -1389,7 +1653,6 @@ foo
     @patch("samcli.commands.init.init_generator.generate_project")
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
     def test_init_cli_no_package_type(self, generate_project_patch, git_repo_clone_mock, _get_manifest_mock):
-
         _get_manifest_mock.return_value = self.data
 
         # WHEN the user follows interactive init prompts
@@ -1400,6 +1663,7 @@ foo
 1
 n
 1
+N
         """
         args = [
             "--no-input",
@@ -1409,6 +1673,7 @@ n
             "amazon/python3.8-base",
             "--dependency-manager",
             "pip",
+            "--no-structured-logging",
         ]
         runner = CliRunner()
         result = runner.invoke(init_cmd, args=args, input=user_input)
@@ -1416,14 +1681,7 @@ n
         # THEN we should receive no errors
         self.assertFalse(result.exception)
         generate_project_patch.assert_called_once_with(
-            ANY,
-            IMAGE,
-            "python3.8",
-            "pip",
-            ".",
-            "untitled6",
-            True,
-            ANY,
+            ANY, IMAGE, "python3.8", "pip", ".", "untitled6", True, ANY, False, False, False
         )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -1464,6 +1722,9 @@ n
                 runtime=None,
                 no_input=self.no_input,
                 extra_context=self.extra_context,
+                tracing=False,
+                application_insights=False,
+                structured_logging=False,
             )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -1504,6 +1765,9 @@ n
                 runtime=None,
                 no_input=self.no_input,
                 extra_context=self.extra_context,
+                tracing=False,
+                application_insights=False,
+                structured_logging=False,
             )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -1545,6 +1809,9 @@ n
             runtime=None,
             no_input=None,
             extra_context=None,
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
         generate_project_patch.assert_called_once_with(
             ANY,  # location
@@ -1555,6 +1822,9 @@ n
             self.name,
             True,  # no_input
             ANY,
+            False,
+            False,
+            False,
         )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -1588,7 +1858,10 @@ n
             runtime=None,
             no_input=None,
             extra_context=None,
+            tracing=False,
+            application_insights=False,
             architecture=None,
+            structured_logging=False,
         )
         generate_project_patch.assert_called_once_with(
             ANY,  # location
@@ -1599,6 +1872,9 @@ n
             self.name,
             True,  # no_input
             ANY,
+            False,
+            False,
+            False,
         )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -1632,7 +1908,10 @@ n
             runtime=None,
             no_input=None,
             extra_context=None,
+            tracing=False,
+            application_insights=False,
             architecture=None,
+            structured_logging=False,
         )
         generate_project_patch.assert_called_once_with(
             ANY,  # location
@@ -1643,6 +1922,9 @@ n
             self.name,
             True,  # no_input
             ANY,
+            False,
+            False,
+            False,
         )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -1662,7 +1944,7 @@ n
                 "packageType": "Image",
             },
         ]
-        with (self.assertRaises(UserException)):
+        with self.assertRaises(UserException):
             init_cli(
                 ctx=self.ctx,
                 no_interactive=True,
@@ -1677,7 +1959,10 @@ n
                 runtime=None,
                 no_input=None,
                 extra_context=None,
+                tracing=False,
+                application_insights=False,
                 architecture=None,
+                structured_logging=False,
             )
 
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
@@ -1707,14 +1992,7 @@ n
         # THEN we should receive no errors
         self.assertFalse(result.exception)
         generate_project_patch.assert_called_once_with(
-            ANY,
-            IMAGE,
-            "java11",
-            "gradle",
-            ".",
-            "untitled6",
-            True,
-            ANY,
+            ANY, IMAGE, "java11", "gradle", ".", "untitled6", True, ANY, None, None, None
         )
         PackageType.explicit = (
             False  # Other tests fail after we pass --packge-type in this test, so let's reset this variable
@@ -1731,15 +2009,15 @@ n
         request_mock.side_effect = requests.Timeout()
         init_options_from_manifest_mock.return_value = [
             {
-                "directory": "python3.9/cookiecutter-aws-sam-hello-python",
+                "directory": "python3.15/cookiecutter-aws-sam-hello-python",
                 "displayName": "Hello World Example",
-                "dependencyManager": "npm",
+                "dependencyManager": "pip",
                 "appTemplate": "hello-world",
                 "packageType": "Zip",
                 "useCaseName": "Hello World Example",
             },
             {
-                "directory": "java11/cookiecutter-aws-sam-eventbridge-schema-app-java-maven",
+                "directory": "java25/cookiecutter-aws-sam-eventbridge-schema-app-java-maven",
                 "displayName": "EventBridge App from scratch (100+ Event Schemas): Maven",
                 "dependencyManager": "maven",
                 "appTemplate": "eventBridge-schema-app",
@@ -1751,10 +2029,10 @@ n
 
         get_preprocessed_manifest_mock.return_value = {
             "Hello World Example": {
-                "python3.9": {
+                "python3.15": {
                     "Zip": [
                         {
-                            "directory": "python3.9/cookiecutter-aws-sam-hello-python3.9",
+                            "directory": "python3.15/cookiecutter-aws-sam-hello-python3.12",
                             "displayName": "Hello World Example",
                             "dependencyManager": "pip",
                             "appTemplate": "hello-world",
@@ -1763,7 +2041,7 @@ n
                         },
                     ]
                 },
-                "java11": {
+                "java25": {
                     "Zip": [
                         {
                             "directory": "java11/cookiecutter-aws-sam-eventbridge-schema-app-java-maven",
@@ -1787,21 +2065,28 @@ n
         user_input = """
 1
 y
+N
+N
+N
 test-project
         """
 
         runner = CliRunner()
         result = runner.invoke(init_cmd, input=user_input)
+        print(result.stdout)
         self.assertFalse(result.exception)
         generate_project_patch.assert_called_once_with(
             ANY,
             ZIP,
-            "python3.9",
+            "python3.15",
             "pip",
             ".",
             "test-project",
             True,
-            {"project_name": "test-project", "runtime": "python3.9", "architectures": {"value": ["x86_64"]}},
+            {"project_name": "test-project", "runtime": "python3.15", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.commands.init.init_templates.InitTemplates.get_preprocessed_manifest")
@@ -1813,7 +2098,7 @@ test-project
     ):
         init_options_from_manifest_mock.return_value = [
             {
-                "directory": "nodejs14.x/cookiecutter-aws-sam-hello-nodejs",
+                "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
                 "displayName": "Hello World Example",
                 "dependencyManager": "npm",
                 "appTemplate": "hello-world",
@@ -1833,10 +2118,10 @@ test-project
 
         get_preprocessed_manifest_mock.return_value = {
             "Hello World Example": {
-                "nodejs14.x": {
+                "nodejs20.x": {
                     "Zip": [
                         {
-                            "directory": "nodejs14.x/cookiecutter-aws-sam-hello-nodejs",
+                            "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
                             "displayName": "Hello World Example",
                             "dependencyManager": "npm",
                             "appTemplate": "hello-world",
@@ -1872,6 +2157,9 @@ test-project
 1
 n
 1
+N
+N
+N
 test-project
         """
 
@@ -1887,32 +2175,53 @@ test-project
             "test-project",
             True,
             {"project_name": "test-project", "runtime": "java11", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     def test_must_return_runtime_from_base_image_name(self):
         base_images = [
-            "amazon/dotnet5.0-base",
-            "amazon/dotnetcore3.1-base",
+            "amazon/dotnet6-base",
             "amazon/go1.x-base",
             "amazon/java11-base",
-            "amazon/nodejs14.x-base",
+            "amazon/nodejs20.x-base",
             "amazon/python3.8-base",
-            "amazon/ruby2.7-base",
+            "amazon/go-provided.al2-base",
+            "amazon/ruby3.2-base",
         ]
 
         expected_runtime = [
-            "dotnet5.0",
-            "dotnetcore3.1",
+            "dotnet6",
             "go1.x",
             "java11",
-            "nodejs14.x",
+            "nodejs20.x",
             "python3.8",
-            "ruby2.7",
+            "go (provided.al2)",
+            "ruby3.2",
         ]
 
         for index, base_image in enumerate(base_images):
             runtime = get_runtime(IMAGE, base_image)
             self.assertEqual(runtime, expected_runtime[index])
+
+    @patch("samcli.commands.init.init_templates.requests")
+    @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
+    def test_must_fallback_for_non_ok_http_response(self, requests_mock):
+        requests_mock.get.return_value = Mock(ok=False)
+        requests_mock.Timeout = requests.Timeout
+        requests_mock.ConnectionError = requests.ConnectionError
+
+        template = InitTemplates()
+        with mock.patch.object(
+            template, "clone_templates_repo", wraps=template.clone_templates_repo
+        ) as mocked_clone_templates_repo:
+            with mock.patch.object(
+                template, "get_manifest_path", wraps=template.get_manifest_path
+            ) as mocked_get_manifest_path:
+                template.get_preprocessed_manifest()
+                mocked_clone_templates_repo.assert_called_once()
+                mocked_get_manifest_path.assert_called_once()
 
     @patch("samcli.commands.init.init_templates.InitTemplates._get_manifest")
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
@@ -1922,10 +2231,10 @@ test-project
         preprocess_manifest = template.get_preprocessed_manifest()
         expected_result = {
             "Hello World Example": {
-                "dotnetcore3.1": {
+                "dotnet6": {
                     "Zip": [
                         {
-                            "directory": "dotnetcore3.1/cookiecutter-aws-sam-hello-dotnet",
+                            "directory": "dotnet6/cookiecutter-aws-sam-hello-dotnet",
                             "displayName": "Hello World Example",
                             "dependencyManager": "cli-package",
                             "appTemplate": "hello-world",
@@ -1946,10 +2255,10 @@ test-project
                         }
                     ]
                 },
-                "nodejs14.x": {
+                "nodejs20.x": {
                     "Image": [
                         {
-                            "directory": "nodejs14.x-image/cookiecutter-aws-sam-hello-nodejs-lambda-image",
+                            "directory": "nodejs20.x-image/cookiecutter-aws-sam-hello-nodejs-lambda-image",
                             "displayName": "Hello World Image Example",
                             "dependencyManager": "npm",
                             "appTemplate": "hello-world-lambda-image",
@@ -2003,15 +2312,15 @@ test-project
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
     def test_must_process_manifest_with_image_as_filter_value(self, _get_manifest_mock):
         template = InitTemplates()
-        filter_value = "amazon/nodejs14.x-base"
+        filter_value = "amazon/nodejs20.x-base"
         _get_manifest_mock.return_value = self.data
         preprocess_manifest = template.get_preprocessed_manifest(filter_value)
         expected_result = {
             "Hello World Example": {
-                "nodejs14.x": {
+                "nodejs20.x": {
                     "Image": [
                         {
-                            "directory": "nodejs14.x-image/cookiecutter-aws-sam-hello-nodejs-lambda-image",
+                            "directory": "nodejs20.x-image/cookiecutter-aws-sam-hello-nodejs-lambda-image",
                             "displayName": "Hello World Image Example",
                             "dependencyManager": "npm",
                             "appTemplate": "hello-world-lambda-image",
@@ -2024,8 +2333,11 @@ test-project
         }
         self.assertEqual(preprocess_manifest, expected_result)
 
+    @patch(
+        "samcli.commands.init.init_templates.InitTemplates._check_upsert_templates",
+    )
     @patch("samcli.lib.utils.git_repo.GitRepo.clone")
-    def test_init_fails_unsupported_dep_mgr_for_runtime(self, git_repo_clone_mock):
+    def test_init_fails_unsupported_dep_mgr_for_runtime(self, git_repo_clone_mock, check_upsert_templates_mock):
         # WHEN the wrong dependency_manager is passed for a runtime
         # THEN an exception should be raised
         with self.assertRaises(InvalidInitTemplateError) as ex:
@@ -2035,7 +2347,7 @@ test-project
                 location=self.location,
                 pt_explicit=self.pt_explicit,
                 package_type=self.package_type,
-                runtime="java8",
+                runtime="java8.al2",
                 base_image=self.base_image,
                 dependency_manager="pip",
                 output_dir=None,
@@ -2043,10 +2355,13 @@ test-project
                 app_template=self.app_template,
                 no_input=self.no_input,
                 extra_context=None,
+                tracing=False,
+                application_insights=False,
                 architecture=X86_64,
+                structured_logging=False,
             )
         expected_error_message = (
-            "Lambda Runtime java8 and dependency manager pip does not have an available initialization template."
+            "Lambda Runtime java8.al2 and dependency manager pip does not have an available initialization template."
         )
         self.assertEqual(str(ex.exception), expected_error_message)
 
@@ -2064,14 +2379,7 @@ test-project
 n
 
         """
-        args = [
-            "--name",
-            "untitled6",
-            "--runtime",
-            "go1.x",
-            "--dependency-manager",
-            "pip",
-        ]
+        args = ["--name", "untitled6", "--runtime", "go1.x", "--dependency-manager", "pip", "--no-structured-logging"]
         runner = CliRunner()
         result = runner.invoke(init_cmd, args=args, input=user_input)
 
@@ -2143,6 +2451,9 @@ n
         user_input = """
 1
 1
+N
+N
+N
 test-project
             """
         runner = CliRunner()
@@ -2157,6 +2468,9 @@ test-project
             "test-project",
             True,
             {"project_name": "test-project", "runtime": "java11", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.commands.init.init_templates.LOG")
@@ -2223,10 +2537,13 @@ test-project
         user_input = """
 2
 1
+N
+N
+N
 test-project
             """
         runner = CliRunner()
-        result = runner.invoke(init_cmd, ["--runtime", "python3.7"], input=user_input)
+        result = runner.invoke(init_cmd, ["--runtime", "python3.12"], input=user_input)
         self.assertTrue(result.exception)
 
     @patch("samcli.commands.init.init_templates.InitTemplates.get_preprocessed_manifest")
@@ -2276,6 +2593,9 @@ test-project
         user_input = """
 2
 1
+N
+N
+N
 test-project
             """
         runner = CliRunner()
@@ -2291,7 +2611,7 @@ test-project
     ):
         init_options_from_manifest_mock.return_value = [
             {
-                "directory": "nodejs14.x/cookiecutter-aws-sam-hello-nodejs",
+                "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
                 "displayName": "Hello World Example",
                 "dependencyManager": "npm",
                 "appTemplate": "hello-world",
@@ -2311,10 +2631,10 @@ test-project
 
         get_preprocessed_manifest_mock.return_value = {
             "Hello World Example": {
-                "nodejs14.x": {
+                "nodejs20.x": {
                     "Zip": [
                         {
-                            "directory": "nodejs14.x/cookiecutter-aws-sam-hello-nodejs",
+                            "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
                             "displayName": "Hello World Example",
                             "dependencyManager": "npm",
                             "appTemplate": "hello-world",
@@ -2346,6 +2666,10 @@ test-project
         # test-project: response to name
         user_input = """
 1
+1
+N
+N
+N
 test-project
         """
 
@@ -2361,13 +2685,16 @@ test-project
             "test-project",
             True,
             {"project_name": "test-project", "runtime": "java11", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
     def test_must_get_manifest_path(self):
         template = InitTemplates()
         manifest_path = template.get_manifest_path()
-        expected_path = Path("tests/unit/commands/init/test_manifest.json")
+        expected_path = Path(os.path.join(os.path.dirname(__file__), "test_manifest.json"))
         self.assertEqual(expected_path, manifest_path)
 
     @patch("samcli.commands.init.init_templates.InitTemplates.get_preprocessed_manifest")
@@ -2379,7 +2706,7 @@ test-project
     ):
         init_options_from_manifest_mock.return_value = [
             {
-                "directory": "nodejs14.x/cookiecutter-aws-sam-hello-nodejs",
+                "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
                 "displayName": "Hello World Example",
                 "dependencyManager": "npm",
                 "appTemplate": "hello-world",
@@ -2399,10 +2726,10 @@ test-project
 
         get_preprocessed_manifest_mock.return_value = {
             "Hello World Example": {
-                "nodejs14.x": {
+                "nodejs20.x": {
                     "Zip": [
                         {
-                            "directory": "nodejs14.x/cookiecutter-aws-sam-hello-nodejs",
+                            "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
                             "displayName": "Hello World Example",
                             "dependencyManager": "npm",
                             "appTemplate": "hello-world",
@@ -2433,6 +2760,9 @@ test-project
         # test-project: response to name
         user_input = """
 1
+N
+N
+N
 test-project
         """
 
@@ -2448,11 +2778,14 @@ test-project
             "test-project",
             True,
             {"project_name": "test-project", "runtime": "java11", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     def does_template_meet_filter_criteria(self):
         template1 = {
-            "directory": "nodejs14.x/cookiecutter-aws-sam-hello-nodejs",
+            "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
             "displayName": "Hello World Example",
             "dependencyManager": "npm",
             "appTemplate": "hello-world",
@@ -2463,7 +2796,7 @@ test-project
         self.assertFalse(template_does_not_meet_filter_criteria(app_template, None, None, template1))
 
         template2 = {
-            "directory": "java8/cookiecutter-aws-sam-hello-nodejs",
+            "directory": "java8.al2/cookiecutter-aws-sam-hello-nodejs",
             "displayName": "Hello World Example",
             "dependencyManager": "Gradle",
             "appTemplate": "hello-world",
@@ -2474,7 +2807,7 @@ test-project
         self.assertTrue(template_does_not_meet_filter_criteria(app_template, package_type, None, template2))
 
         template3 = {
-            "directory": "java8/cookiecutter-aws-sam-hello-nodejs",
+            "directory": "java8.al2/cookiecutter-aws-sam-hello-nodejs",
             "displayName": "Hello World Example",
             "dependencyManager": "Gradle",
             "appTemplate": "hello-world",
@@ -2512,6 +2845,9 @@ test-project
 N
 3
 2
+N
+N
+N
 test-project
         """
 
@@ -2527,15 +2863,34 @@ test-project
             "test-project",
             True,
             {"project_name": "test-project", "runtime": "java11", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.local.common.runtime_template.INIT_RUNTIMES")
     def test_must_remove_unsupported_runtime(self, init_runtime_mock):
-        runtime_option_list = ["python3.7", "ruby2.7", "java11", "unsupported_runtime", "dotnetcore3.1"]
-        init_runtime_mock.return_value = ["dotnetcore3.1", "go1.x", "java11", "python3.7", "ruby2.7"]
-        expect_result = ["dotnetcore3.1", "java11", "python3.7", "ruby2.7"]
+        runtime_option_list = ["python3.12", "ruby3.2", "java11", "unsupported_runtime"]
+        init_runtime_mock.return_value = ["go1.x", "java11", "python3.12", "ruby3.2"]
+        expect_result = ["java11", "python3.12", "ruby3.2"]
         actual_result = get_sorted_runtimes(runtime_option_list)
         self.assertEqual(actual_result, expect_result)
+
+    def test_compare_runtimes_al2023_ordering(self):
+        # Newest OS variant sorts first: al2023 before base
+        self.assertGreater(compare_runtimes("java17", "java17.al2023"), 0)
+        self.assertLess(compare_runtimes("java17.al2023", "java17"), 0)
+
+        # al2023 sorts before al2
+        self.assertLess(compare_runtimes("java8.al2023", "java8.al2"), 0)
+        self.assertGreater(compare_runtimes("java8.al2", "java8.al2023"), 0)
+
+        # Same runtime returns 0
+        self.assertEqual(compare_runtimes("java11.al2023", "java11.al2023"), 0)
+
+        # Cross-language not affected
+        self.assertLess(compare_runtimes("java17", "python3.12"), 0)
+        self.assertGreater(compare_runtimes("python3.12", "java17"), 0)
 
     @patch("samcli.commands.init.init_templates.InitTemplates._get_manifest")
     @patch("samcli.commands.init.init_templates.InitTemplates._init_options_from_manifest")
@@ -2597,6 +2952,9 @@ test-project
 1
 N
 2
+N
+N
+N
 test-project
         """
 
@@ -2612,6 +2970,9 @@ test-project
             "test-project",
             True,
             {"project_name": "test-project", "runtime": "provided.al2", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
 
     @patch("samcli.commands.init.init_templates.InitTemplates._get_manifest")
@@ -2670,6 +3031,9 @@ test-project
         # test-project: response to name
         user_input = """
 1
+N
+N
+N
 test-project
         """
         args = [
@@ -2689,4 +3053,533 @@ test-project
             "test-project",
             True,
             {"project_name": "test-project", "runtime": "provided.al2", "architectures": {"value": ["x86_64"]}},
+            False,
+            False,
+            False,
         )
+
+    @patch("samcli.commands.init.init_templates.InitTemplates.get_preprocessed_manifest")
+    @patch("samcli.commands.init.init_templates.InitTemplates._init_options_from_manifest")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
+    def test_init_cli_generate_app_template_provide_via_tracing_options(
+        self, generate_project_patch, init_options_from_manifest_mock, get_preprocessed_manifest_mock
+    ):
+        init_options_from_manifest_mock.return_value = [
+            {
+                "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
+                "displayName": "Hello World Example",
+                "dependencyManager": "npm",
+                "appTemplate": "hello-world",
+                "packageType": "Zip",
+                "useCaseName": "Hello World Example",
+            },
+            {
+                "directory": "java11/cookiecutter-aws-sam-eventbridge-schema-app-java-maven",
+                "displayName": "EventBridge App from scratch (100+ Event Schemas): Maven",
+                "dependencyManager": "maven",
+                "appTemplate": "eventBridge-schema-app",
+                "isDynamicTemplate": "True",
+                "packageType": "Zip",
+                "useCaseName": "Hello World Example",
+            },
+        ]
+
+        get_preprocessed_manifest_mock.return_value = {
+            "Hello World Example": {
+                "nodejs20.x": {
+                    "Zip": [
+                        {
+                            "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
+                            "displayName": "Hello World Example",
+                            "dependencyManager": "npm",
+                            "appTemplate": "hello-world",
+                            "packageType": "Zip",
+                            "useCaseName": "Hello World Example",
+                        },
+                    ]
+                },
+                "java11": {
+                    "Zip": [
+                        {
+                            "directory": "java11/cookiecutter-aws-sam-eventbridge-schema-app-java-maven",
+                            "displayName": "Hello World Example: Maven",
+                            "dependencyManager": "maven",
+                            "appTemplate": "hello-world",
+                            "isDynamicTemplate": "True",
+                            "packageType": "Zip",
+                            "useCaseName": "Hello World Example",
+                        },
+                    ]
+                },
+            },
+        }
+
+        # WHEN the user follows interactive init prompts
+        # 1: AWS Quick Start Templates
+        # 2: Java 11
+        # test-project: response to name
+        user_input = """
+1
+N
+1
+N
+N
+test-project
+        """
+
+        runner = CliRunner()
+        result = runner.invoke(init_cmd, ["--tracing"], input=user_input)
+        self.assertFalse(result.exception)
+        generate_project_patch.assert_called_once_with(
+            ANY,
+            ZIP,
+            "java11",
+            "maven",
+            ".",
+            "test-project",
+            True,
+            {"project_name": "test-project", "runtime": "java11", "architectures": {"value": ["x86_64"]}},
+            True,
+            False,
+            False,
+        )
+
+    @patch("samcli.commands.init.init_templates.InitTemplates.get_preprocessed_manifest")
+    @patch("samcli.commands.init.init_templates.InitTemplates._init_options_from_manifest")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    @patch.object(InitTemplates, "__init__", MockInitTemplates.__init__)
+    def test_init_cli_generate_app_template_provide_via_application_insights_options(
+        self, generate_project_patch, init_options_from_manifest_mock, get_preprocessed_manifest_mock
+    ):
+        init_options_from_manifest_mock.return_value = [
+            {
+                "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
+                "displayName": "Hello World Example",
+                "dependencyManager": "npm",
+                "appTemplate": "hello-world",
+                "packageType": "Zip",
+                "useCaseName": "Hello World Example",
+            },
+            {
+                "directory": "java11/cookiecutter-aws-sam-eventbridge-schema-app-java-maven",
+                "displayName": "EventBridge App from scratch (100+ Event Schemas): Maven",
+                "dependencyManager": "maven",
+                "appTemplate": "eventBridge-schema-app",
+                "isDynamicTemplate": "True",
+                "packageType": "Zip",
+                "useCaseName": "Hello World Example",
+            },
+        ]
+
+        get_preprocessed_manifest_mock.return_value = {
+            "Hello World Example": {
+                "nodejs20.x": {
+                    "Zip": [
+                        {
+                            "directory": "nodejs20.x/cookiecutter-aws-sam-hello-nodejs",
+                            "displayName": "Hello World Example",
+                            "dependencyManager": "npm",
+                            "appTemplate": "hello-world",
+                            "packageType": "Zip",
+                            "useCaseName": "Hello World Example",
+                        },
+                    ]
+                },
+                "java11": {
+                    "Zip": [
+                        {
+                            "directory": "java11/cookiecutter-aws-sam-eventbridge-schema-app-java-maven",
+                            "displayName": "Hello World Example: Maven",
+                            "dependencyManager": "maven",
+                            "appTemplate": "hello-world",
+                            "isDynamicTemplate": "True",
+                            "packageType": "Zip",
+                            "useCaseName": "Hello World Example",
+                        },
+                    ]
+                },
+            },
+        }
+
+        # WHEN the user follows interactive init prompts
+        # 1: AWS Quick Start Templates
+        # 2: Java 11
+        # test-project: response to name
+        user_input = """
+1
+N
+1
+N
+N
+test-project
+        """
+
+        runner = CliRunner()
+        result = runner.invoke(init_cmd, ["--application-insights"], input=user_input)
+        self.assertFalse(result.exception)
+        generate_project_patch.assert_called_once_with(
+            ANY,
+            ZIP,
+            "java11",
+            "maven",
+            ".",
+            "test-project",
+            True,
+            {"project_name": "test-project", "runtime": "java11", "architectures": {"value": ["x86_64"]}},
+            False,
+            True,
+            False,
+        )
+
+    @parameterized.expand(
+        [
+            ({"python3.2": Any, "python3.100000": Any, "python3.14": Any}, "python3.100000"),
+            ({"python7.8": Any, "python9.1": Any}, "python9.1"),
+            ({"python6.1": Any, "python4.7": Any}, "python6.1"),
+        ]
+    )
+    def test_latest_python_fetcher_correct_latest(self, versions, expected):
+        with mock.patch(
+            "samcli.commands.init.interactive_init_flow.SUPPORTED_RUNTIMES",
+            versions,
+        ):
+            result = _get_latest_python_runtime()
+
+        self.assertEqual(result, expected)
+
+    def test_latest_python_fetcher_has_valid_supported_runtimes(self):
+        """
+        Mainly checks if the SUPPORTED_RUNTIMES constant actually has
+        Python runtime inside of it
+        """
+        result = _get_latest_python_runtime()
+        self.assertTrue(result, "Python was not found in the SUPPORTED_RUNTIMES const")
+
+    def test_latest_python_fetchers_raises_not_found(self):
+        with mock.patch(
+            "samcli.commands.init.interactive_init_flow.SUPPORTED_RUNTIMES",
+            {"invalid": Any},
+        ):
+            with self.assertRaises(PopularRuntimeNotFoundException):
+                _get_latest_python_runtime()
+
+    def _do_cli_with(self, **overrides):
+        # Invoke init with the setUp defaults, overriding only the fields a test cares about.
+        # Defaults to --output json, since every test below but one exercises JSON mode.
+        kwargs = dict(
+            ctx=self.ctx,
+            no_interactive=self.no_interactive,
+            location=self.location,
+            pt_explicit=self.pt_explicit,
+            package_type=self.package_type,
+            runtime=self.runtime,
+            architecture=X86_64,
+            base_image=self.base_image,
+            dependency_manager=self.dependency_manager,
+            output_dir=self.output_dir,
+            name=self.name,
+            app_template=self.app_template,
+            no_input=self.no_input,
+            extra_context=None,
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
+            output="json",
+        )
+        kwargs.update(overrides)
+        init_cli(**kwargs)
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_emits_success_document(
+        self, generate_project_patch, location_from_app_template_mock, echo_mock
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+
+        # WHEN a project is generated with --output json
+        with osutils.mkdir_temp() as temp_dir:
+            # Mirror generate_project's real contract: it returns the directory it created
+            generate_project_patch.return_value = os.path.join(temp_dir, self.name)
+
+            self._do_cli_with(output_dir=temp_dir)
+
+            # THEN exactly one JSON success document is emitted describing what was created
+            echo_mock.assert_called_once()
+            document = json.loads(echo_mock.call_args[0][0])
+
+            self.assertEqual(document["type"], "result")
+            self.assertEqual(document["status"], "success")
+            self.assertEqual(document["project_directory"], os.path.join(os.path.abspath(temp_dir), self.name))
+            # No template.yaml exists because generate_project is mocked out
+            self.assertIsNone(document["template_file"])
+            self.assertEqual(document["runtime"], self.runtime)
+            self.assertEqual(document["package_type"], ZIP)
+            self.assertEqual(document["dependency_manager"], self.dependency_manager)
+            self.assertEqual(document["app_template"], self.app_template)
+            self.assertEqual(document["architectures"], [X86_64])
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_forces_no_input(self, generate_project_patch, echo_mock):
+        generate_project_patch.return_value = None
+
+        # WHEN a project is generated from a location, which does not set no_input itself
+        self._do_cli_with(location="/some/location", app_template=None, no_input=False)
+
+        # THEN cookiecutter is told not to prompt, since a JSON consumer cannot answer prompts
+        self.assertTrue(generate_project_patch.call_args[0][6])
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_emits_failure_document(
+        self, generate_project_patch, location_from_app_template_mock, echo_mock
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+        generate_project_patch.side_effect = GenerateProjectFailedError(project="testing project", provider_error="ex")
+
+        # WHEN generation fails with --output json
+        with self.assertRaises(UserException):
+            self._do_cli_with()
+
+        # THEN the failure document reports the wrapped error type, not the UserException wrapper
+        echo_mock.assert_called_once()
+        document = json.loads(echo_mock.call_args[0][0])
+
+        self.assertEqual(document["type"], "result")
+        self.assertEqual(document["status"], "failure")
+        self.assertEqual(document["error"]["type"], "GenerateProjectFailedError")
+        self.assertIn("testing project", document["error"]["message"])
+
+    @patch("samcli.commands.init.interactive_init_flow.do_interactive")
+    def test_init_cli_output_json_requires_no_interactive(self, do_interactive_mock):
+        # WHEN --output json is used without enough parameters to skip the interactive flow
+        with self.assertRaises(click.UsageError) as ex:
+            # Nothing here identifies a template, so the run would reach the interactive flow
+            self._do_cli_with(
+                no_interactive=False,
+                location=None,
+                pt_explicit=False,
+                package_type=None,
+                runtime=None,
+                architecture=None,
+                base_image=None,
+                dependency_manager=None,
+                name=None,
+                app_template=None,
+                no_input=False,
+            )
+
+        # THEN it is rejected before any prompting happens, and the message lists the parameter
+        # combinations that would make the run non-interactive rather than naming a single flag
+        self.assertIn("--location", str(ex.exception))
+        self.assertIn("--app-template", str(ex.exception))
+        self.assertIn("--base-image", str(ex.exception))
+        self.assertFalse(do_interactive_mock.called)
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_text_output_emits_no_json(
+        self, generate_project_patch, location_from_app_template_mock, echo_mock
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+
+        # WHEN a project is generated without --output json
+        self._do_cli_with(output="text")
+
+        # THEN no structured document is emitted, preserving the existing text behaviour
+        self.assertFalse(echo_mock.called)
+
+    def _init_cli_json_with_generated_files(self, generate_project_patch, echo_mock, temp_dir, file_names):
+        """Run init with --output json, having generate_project create the given files in the project."""
+
+        def create_files(*args, **kwargs):
+            project_directory = Path(temp_dir, self.name)
+            project_directory.mkdir(parents=True, exist_ok=True)
+            for file_name in file_names:
+                Path(project_directory, file_name).write_text("Resources: {}")
+            # generate_project returns the directory it created
+            return str(project_directory)
+
+        generate_project_patch.side_effect = create_files
+
+        self._do_cli_with(output_dir=temp_dir)
+
+        return json.loads(echo_mock.call_args[0][0])
+
+    @parameterized.expand(
+        [
+            # A template may use any recognised name, and .yaml wins when several exist because
+            # that is the one a subsequent build resolves to
+            (["template.yml"], "template.yml"),
+            (["template.yml", "template.yaml"], "template.yaml"),
+            (["README.md"], None),
+        ]
+    )
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_reports_template_file(
+        self,
+        generated_files,
+        expected_template,
+        generate_project_patch,
+        location_from_app_template_mock,
+        echo_mock,
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+
+        with osutils.mkdir_temp() as temp_dir:
+            document = self._init_cli_json_with_generated_files(
+                generate_project_patch, echo_mock, temp_dir, generated_files
+            )
+
+            expected = os.path.join(temp_dir, self.name, expected_template) if expected_template else None
+            self.assertEqual(document["template_file"], expected)
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_reports_generated_directory(self, generate_project_patch, echo_mock):
+        # GIVEN a template that creates a project directory of its own choosing, which is what
+        # happens for a --location template used without --name
+        with osutils.mkdir_temp() as temp_dir:
+            generated_directory = os.path.join(temp_dir, "template-chosen-name")
+            generate_project_patch.return_value = generated_directory
+
+            self._do_cli_with(
+                location="/some/location",
+                runtime=None,
+                architecture=None,
+                dependency_manager=None,
+                output_dir=temp_dir,
+                name=None,
+                app_template=None,
+            )
+
+            document = json.loads(echo_mock.call_args[0][0])
+
+            # THEN the reported directory is the one the generator created, not output_dir
+            self.assertEqual(document["project_directory"], generated_directory)
+            self.assertNotEqual(document["project_directory"], temp_dir)
+            # AND the fields only a managed template can resolve are not invented for a clone
+            self.assertIsNone(document["architectures"])
+            self.assertIsNone(document["package_type"])
+            self.assertIsNone(document["runtime"])
+            self.assertIsNone(document["dependency_manager"])
+            self.assertIsNone(document["app_template"])
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_reports_null_when_directory_unknown(
+        self, generate_project_patch, location_from_app_template_mock, echo_mock
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+        # GIVEN the generator could not determine where the project was created
+        generate_project_patch.return_value = None
+
+        with osutils.mkdir_temp() as temp_dir:
+            self._do_cli_with(output_dir=temp_dir)
+
+            document = json.loads(echo_mock.call_args[0][0])
+
+            # THEN the location is reported as unknown rather than as a fabricated path
+            self.assertIsNone(document["project_directory"])
+            self.assertIsNone(document["template_file"])
+            # AND the command still succeeds, matching what text mode does in this case
+            self.assertEqual(document["status"], "success")
+            # AND architectures is reported, since a managed template resolved a runtime
+            self.assertEqual(document["architectures"], [X86_64])
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_reports_template_output(
+        self, generate_project_patch, location_from_app_template_mock, echo_mock
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+
+        def write_to_stdout(*args, **kwargs):
+            # Templates print from hook subprocesses, so write to the descriptor rather than print()
+            os.write(1, b"hook wrote this\n")
+
+        generate_project_patch.side_effect = write_to_stdout
+
+        self._do_cli_with()
+
+        # THEN the template's output is reported as its own document ahead of the result, so every
+        # line of stdout stays parseable
+        self.assertEqual(echo_mock.call_count, 2)
+
+        info_document = json.loads(echo_mock.call_args_list[0][0][0])
+        self.assertEqual(info_document["type"], "info")
+        self.assertEqual(info_document["source"], "template")
+        self.assertIn("hook wrote this", info_document["message"])
+
+        result_document = json.loads(echo_mock.call_args_list[1][0][0])
+        self.assertEqual(result_document["type"], "result")
+        self.assertEqual(result_document["status"], "success")
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_does_not_report_usage_errors(self, generate_project_patch, echo_mock):
+        # WHEN the command is called incorrectly, here with --extra-context that is not valid JSON
+        with self.assertRaises(click.UsageError):
+            self._do_cli_with(location="/some/location", app_template=None, extra_context="{not valid json")
+
+        # THEN no result document is emitted, since nothing was attempted. Usage errors are
+        # reported by click on stderr, the same way the --output json guard reports them.
+        self.assertFalse(echo_mock.called)
+        self.assertFalse(generate_project_patch.called)
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_reports_template_output_on_failure(
+        self, generate_project_patch, location_from_app_template_mock, echo_mock
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+
+        def write_then_fail(*args, **kwargs):
+            # A failing hook prints its diagnostics before cookiecutter raises
+            os.write(1, b"hook failed because of a missing tool\n")
+            raise GenerateProjectFailedError(project="testing project", provider_error="hook failed")
+
+        generate_project_patch.side_effect = write_then_fail
+
+        with self.assertRaises(UserException):
+            self._do_cli_with()
+
+        # THEN the template output is still reported, since the failure is undiagnosable without it
+        info_document = json.loads(echo_mock.call_args_list[0][0][0])
+        self.assertEqual(info_document["type"], "info")
+        self.assertIn("missing tool", info_document["message"])
+
+        failure_document = json.loads(echo_mock.call_args_list[1][0][0])
+        self.assertEqual(failure_document["status"], "failure")
+        self.assertEqual(failure_document["error"]["type"], "GenerateProjectFailedError")
+        # The shared failure shape carries resources, so a build or deploy consumer can read it
+        self.assertIn("resources", failure_document["error"])
+
+    @patch("samcli.commands.init.command.click.echo")
+    @patch("samcli.commands.init.init_templates.InitTemplates.location_from_app_template")
+    @patch("samcli.commands.init.init_generator.generate_project")
+    def test_init_cli_output_json_survives_undecodable_template_output(
+        self, generate_project_patch, location_from_app_template_mock, echo_mock
+    ):
+        location_from_app_template_mock.return_value = "applocation"
+
+        def write_invalid_bytes(*args, **kwargs):
+            # A hook writes in whatever encoding it likes, which may not decode cleanly
+            os.write(1, b"\xff\xfe invalid bytes\n")
+
+        generate_project_patch.side_effect = write_invalid_bytes
+
+        self._do_cli_with()
+
+        # THEN the run still reports success, rather than a decode error from the capture
+        result_document = json.loads(echo_mock.call_args_list[-1][0][0])
+        self.assertEqual(result_document["status"], "success")

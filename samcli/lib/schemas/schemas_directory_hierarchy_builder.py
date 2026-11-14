@@ -1,7 +1,6 @@
-""" Responsible for building schema code directory hierarchy based on schema name """
+"""Responsible for building schema code directory hierarchy based on schema name"""
 
 import re
-
 
 # To sanitize schema package name and root name. During code generation schema service follows
 # convention to replace all the special character except [a-zA-Z0-9_@] via _.

@@ -4,7 +4,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/todo_list.zip
       Handler: index.restapi
-      Runtime: python3.7
+      Runtime: python3.11
       Events:
         SimpleCase:
           Type: HttpApi
@@ -23,13 +23,13 @@ Resources:
       StageName:
         Ref: Stage
       Auth:
-        DefaultAuthorizer: "LambdaAuthorizer"
+        DefaultAuthorizer: LambdaAuthorizer
         Authorizers:
           LambdaAuthorizer:
-            FunctionPayloadType: "REQUEST"
+            FunctionPayloadType: REQUEST
             Identity:
               Headers:
-                  - "Authorization"
+              - Authorization
       DefinitionBody:
         openapi: '3.0'
         info:

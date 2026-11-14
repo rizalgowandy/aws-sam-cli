@@ -2,7 +2,8 @@ from unittest import TestCase
 from unittest.mock import Mock
 
 from time import time
-from datetime import datetime
+from datetime import datetime, timezone
+from samcli.local.apigw.route import Route
 
 from samcli.local.events.api_event import (
     ContextIdentity,
@@ -244,7 +245,7 @@ class TestRequestContextV2(TestCase):
         http_mock = Mock()
         http_mock.to_dict.return_value = {"method": "POST"}
         request_time_epoch = int(time())
-        request_time = datetime.utcnow().strftime("%d/%b/%Y:%H:%M:%S +0000")
+        request_time = datetime.now(timezone.utc).strftime("%d/%b/%Y:%H:%M:%S +0000")
 
         request_context = RequestContextV2(
             "account_id", "api_id", http_mock, "request_id", "route_key", "stage", request_time_epoch, request_time
@@ -335,7 +336,6 @@ class TestApiGatewayLambdaEvent(TestCase):
         )
 
         expected = {
-            "version": "1.0",
             "httpMethod": "request_method",
             "body": "request_data",
             "resource": "resource",
@@ -354,6 +354,26 @@ class TestApiGatewayLambdaEvent(TestCase):
 
     def test_to_dict_with_defaults(self):
         event = ApiGatewayLambdaEvent()
+
+        expected = {
+            "httpMethod": None,
+            "body": None,
+            "resource": None,
+            "requestContext": {},
+            "queryStringParameters": None,
+            "multiValueQueryStringParameters": None,
+            "headers": None,
+            "multiValueHeaders": None,
+            "pathParameters": None,
+            "stageVariables": None,
+            "path": None,
+            "isBase64Encoded": False,
+        }
+
+        self.assertEqual(event.to_dict(), expected)
+
+    def test_to_dict_with_http_v1(self):
+        event = ApiGatewayLambdaEvent(api_type=Route.HTTP)
 
         expected = {
             "version": "1.0",
@@ -460,7 +480,6 @@ class TestApiGatewayLambdaEvent(TestCase):
 
     def test_init_with_invalid_stage_variables(self):
         with self.assertRaises(TypeError):
-
             ApiGatewayLambdaEvent(
                 "request_method",
                 "request_data",
@@ -516,7 +535,7 @@ class TestApiGatewayV2LambdaEvent(TestCase):
             "raw_query_string",
             ["cookie1=value1"],
             {"header_key": "value"},
-            {"query_string": "some query"},
+            {"query_string": "some query", "multi": ["first", "second"]},
             request_context_mock,
             "body",
             {"param": "some param"},
@@ -531,7 +550,7 @@ class TestApiGatewayV2LambdaEvent(TestCase):
             "rawQueryString": "raw_query_string",
             "cookies": ["cookie1=value1"],
             "headers": {"header_key": "value"},
-            "queryStringParameters": {"query_string": "some query"},
+            "queryStringParameters": {"query_string": "some query", "multi": "first,second"},
             "requestContext": request_context_mock.to_dict(),
             "body": "body",
             "pathParameters": {"param": "some param"},

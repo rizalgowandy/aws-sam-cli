@@ -1,32 +1,75 @@
 """
 Keeps implementation of different build strategies
 """
+
 import hashlib
 import logging
 import os.path
 import pathlib
 import shutil
-from abc import abstractmethod, ABC
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from copy import deepcopy
-from typing import Callable, Dict, List, Any, Optional, cast, Set
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TypeVar, cast
 
-from samcli.commands._utils.experimental import is_experimental_enabled, ExperimentalFlag
-from samcli.lib.utils import osutils
-from samcli.lib.utils.async_utils import AsyncContext
-from samcli.lib.utils.hash import dir_checksum
-from samcli.lib.utils.packagetype import ZIP, IMAGE
-from samcli.lib.build.dependency_hash_generator import DependencyHashGenerator
+from samcli.commands._utils.experimental import ExperimentalFlag, is_experimental_enabled
 from samcli.lib.build.build_graph import (
+    DEFAULT_DEPENDENCIES_DIR,
+    AbstractBuildDefinition,
     BuildGraph,
     FunctionBuildDefinition,
     LayerBuildDefinition,
-    AbstractBuildDefinition,
-    DEFAULT_DEPENDENCIES_DIR,
+    MicrovmImageBuildDefinition,
 )
-from samcli.lib.build.exceptions import MissingBuildMethodException
-
+from samcli.lib.build.dependency_hash_generator import DependencyHashGenerator
+from samcli.lib.build.exceptions import (
+    BuildError,
+    BuildInsideContainerError,
+    MissingBuildMethodException,
+    UnsupportedBuilderLibraryVersionError,
+)
+from samcli.lib.build.utils import warn_on_invalid_architecture
+from samcli.lib.build.workflow_config import UnsupportedBuilderException, UnsupportedRuntimeException
+from samcli.lib.utils import osutils
+from samcli.lib.utils.architecture import X86_64
+from samcli.lib.utils.async_utils import AsyncContext
+from samcli.lib.utils.hash import dir_checksum
+from samcli.lib.utils.packagetype import IMAGE, ZIP
 
 LOG = logging.getLogger(__name__)
+
+# type definition which can be used in generic types for FunctionBuildDefinition, LayerBuildDefinition,
+# and MicrovmImageBuildDefinition
+BuildDefinitionType = TypeVar(
+    "BuildDefinitionType", FunctionBuildDefinition, LayerBuildDefinition, MicrovmImageBuildDefinition
+)
+
+# Build failures that are attributable to specific resources. When one of these escapes a strategy
+# without resource_names already set, we tag it with the in-flight definition's resources so the
+# structured (JSON) failure document can report error.resources.
+_RESOURCE_ATTRIBUTABLE_BUILD_ERRORS = (
+    BuildError,
+    UnsupportedRuntimeException,
+    UnsupportedBuilderException,
+    BuildInsideContainerError,
+    UnsupportedBuilderLibraryVersionError,
+)
+
+
+@contextmanager
+def _attribute_build_failure_to(full_paths: List[str]) -> Iterator[None]:
+    """
+    Tag any resource-attributable build failure raised in the block with ``full_paths`` (unless it
+    already carries resource_names). A collapsed build definition can hold several functions, so the
+    full list keeps every affected resource in the failure document. Used by DefaultBuildStrategy and
+    IncrementalBuildStrategy's pre-delegation work so attribution is consistent across strategies.
+    """
+    try:
+        yield
+    except _RESOURCE_ATTRIBUTABLE_BUILD_ERRORS as ex:
+        if getattr(ex, "resource_names", None) is None:
+            ex.resource_names = full_paths
+        raise
 
 
 def clean_redundant_folders(base_dir: str, uuids: Set[str]) -> None:
@@ -45,15 +88,16 @@ def clean_redundant_folders(base_dir: str, uuids: Set[str]) -> None:
     if not base_dir_path.exists():
         return
 
-    for full_dir_path in pathlib.Path(base_dir).iterdir():
-        if full_dir_path.name not in uuids:
+    for full_dir_path in base_dir_path.iterdir():
+        if full_dir_path.name not in uuids and full_dir_path.is_dir():
+            LOG.debug("Cleaning up redundant folder %s, which is not related to any function or layer", full_dir_path)
             shutil.rmtree(pathlib.Path(base_dir, full_dir_path.name))
 
 
 class BuildStrategy(ABC):
     """
     Base class for BuildStrategy
-    Keeps basic implementation of build, build_functions and build_layers
+    Keeps basic implementation of build, build_functions, build_layers, and build_microvm_images
     """
 
     def __init__(self, build_graph: BuildGraph) -> None:
@@ -67,12 +111,13 @@ class BuildStrategy(ABC):
 
     def build(self) -> Dict[str, str]:
         """
-        Builds all functions and layers in the given build graph
+        Builds all functions, layers, and MicrovmImages in the given build graph
         """
         result = {}
         with self:
             result.update(self._build_layers(self._build_graph))
             result.update(self._build_functions(self._build_graph))
+            result.update(self._build_microvm_images(self._build_graph))
 
         return result
 
@@ -110,36 +155,68 @@ class BuildStrategy(ABC):
         build location as value
         """
 
+    def _build_microvm_images(self, build_graph: BuildGraph) -> Dict[str, str]:
+        """
+        Iterates through build graph and runs each unique build for MicrovmImage resources
+        """
+        microvm_build_results = {}
+        for microvm_definition in build_graph.get_microvm_image_build_definitions():
+            microvm_build_results.update(self.build_single_microvm_image_definition(microvm_definition))
+
+        return microvm_build_results
+
+    @abstractmethod
+    def build_single_microvm_image_definition(self, microvm_definition: MicrovmImageBuildDefinition) -> Dict[str, str]:
+        """
+        Builds single MicrovmImage definition and returns dictionary which contains MicrovmImage full path as key,
+        Docker image tag as value
+        """
+
 
 class DefaultBuildStrategy(BuildStrategy):
     """
-    Default build strategy, loops over given build graph for each function and layer, and builds each of them one by one
+    Default build strategy, loops over given build graph for each function, layer, and MicrovmImage,
+    and builds each of them one by one
     """
 
     def __init__(
         self,
         build_graph: BuildGraph,
         build_dir: str,
-        build_function: Callable[[str, str, str, str, str, Optional[str], str, dict, dict, Optional[str], bool], str],
-        build_layer: Callable[[str, str, str, List[str], str, str, dict, Optional[str], bool], str],
+        build_function: Callable[
+            [str, str, Optional[str], str, str, str, Optional[str], str, dict, dict, Optional[str], bool], str
+        ],
+        build_layer: Callable[[str, str, str, List[str], str, str, dict, Optional[str], bool, Optional[Dict]], str],
+        build_microvm_image: Callable[[str, str, str], str],
+        cached: bool = False,
     ) -> None:
         super().__init__(build_graph)
         self._build_dir = build_dir
         self._build_function = build_function
         self._build_layer = build_layer
+        self._build_microvm_image = build_microvm_image
+        self._cached = cached
 
     def build_single_function_definition(self, build_definition: FunctionBuildDefinition) -> Dict[str, str]:
         """
         Build the unique definition and then copy the artifact to the corresponding function folder
         """
+        # Functions sharing runtime + CodeUri + metadata collapse into one build definition, so one
+        # failure can affect several; report all of them, not just the first.
+        with _attribute_build_failure_to([function.full_path for function in build_definition.functions]):
+            return self._do_build_single_function_definition(build_definition)
+
+    def _do_build_single_function_definition(self, build_definition: FunctionBuildDefinition) -> Dict[str, str]:
+        """
+        Internal implementation of build_single_function_definition
+        """
         function_build_results = {}
         LOG.info(
-            "Building codeuri: %s runtime: %s metadata: %s architecture: %s functions: %s",
+            "Building codeuri: %s runtime: %s architecture: %s functions: %s",
             build_definition.codeuri,
             build_definition.runtime,
-            build_definition.metadata,
             build_definition.architecture,
-            [function.full_path for function in build_definition.functions],
+            build_definition.get_resource_full_paths(),
         )
 
         # build into one of the functions from this build definition
@@ -156,6 +233,7 @@ class DefaultBuildStrategy(BuildStrategy):
         result = self._build_function(
             build_definition.get_function_name(),
             build_definition.codeuri,  # type: ignore
+            build_definition.imageuri,
             build_definition.packagetype,
             build_definition.runtime,  # type: ignore
             build_definition.architecture,
@@ -163,7 +241,7 @@ class DefaultBuildStrategy(BuildStrategy):
             single_build_dir,
             build_definition.metadata,
             container_env_vars,
-            build_definition.dependencies_dir if is_experimental_enabled(ExperimentalFlag.Accelerate) else None,
+            build_definition.dependencies_dir if self._cached else None,
             build_definition.download_dependencies,
         )
         function_build_results[single_full_path] = result
@@ -172,12 +250,20 @@ class DefaultBuildStrategy(BuildStrategy):
         if build_definition.packagetype == ZIP:
             for function in build_definition.functions:
                 if function.full_path != single_full_path:
-                    # for zip function we need to copy over the artifacts
-                    # artifacts directory will be created by the builder
-                    artifacts_dir = function.get_build_dir(self._build_dir)
-                    LOG.debug("Copying artifacts from %s to %s", single_build_dir, artifacts_dir)
-                    osutils.copytree(single_build_dir, artifacts_dir)
-                    function_build_results[function.full_path] = artifacts_dir
+                    # for zip function we need to refer over the result
+                    # artifacts directory which have built as the action above
+                    if is_experimental_enabled(ExperimentalFlag.BuildPerformance):
+                        LOG.debug(
+                            "Using previously build shared location %s for function %s", result, function.full_path
+                        )
+                        function_build_results[function.full_path] = result
+                    else:
+                        # for zip function we need to copy over the artifacts
+                        # artifacts directory will be created by the builder
+                        artifacts_dir = function.get_build_dir(self._build_dir)
+                        LOG.debug("Copying artifacts from %s to %s", single_build_dir, artifacts_dir)
+                        osutils.copytree(single_build_dir, artifacts_dir)
+                        function_build_results[function.full_path] = artifacts_dir
         elif build_definition.packagetype == IMAGE:
             for function in build_definition.functions:
                 if function.full_path != single_full_path:
@@ -190,6 +276,13 @@ class DefaultBuildStrategy(BuildStrategy):
         """
         Build the unique definition and then copy the artifact to the corresponding layer folder
         """
+        with _attribute_build_failure_to([layer_definition.full_path]):
+            return self._do_build_single_layer_definition(layer_definition)
+
+    def _do_build_single_layer_definition(self, layer_definition: LayerBuildDefinition) -> Dict[str, str]:
+        """
+        Internal implementation of build_single_layer_definition
+        """
         layer = layer_definition.layer
         LOG.info("Building layer '%s'", layer.full_path)
         if layer.build_method is None:
@@ -198,6 +291,22 @@ class DefaultBuildStrategy(BuildStrategy):
                 f"Please provide BuildMethod in Metadata."
             )
 
+        if layer.build_method == "makefile":
+            warn_on_invalid_architecture(layer_definition)
+
+        # There are two cases where we'd like to warn the customer
+        # 1. Compatible Architectures is only x86 (or not present) but Build Architecture is arm64
+        # 2. Build Architecture is x86 (or not present) but Compatible Architectures is only arm64
+
+        build_architecture = layer.build_architecture or X86_64
+        compatible_architectures = layer.compatible_architectures or [X86_64]
+
+        if build_architecture not in compatible_architectures:
+            LOG.warning(
+                "WARNING: Layer '%s' has BuildArchitecture %s, which is not listed in CompatibleArchitectures",
+                layer.layer_id,
+                build_architecture,
+            )
         single_build_dir = layer.get_build_dir(self._build_dir)
         # when a layer is passed here, it is ZIP function, codeuri and runtime are not None
         # codeuri and compatible_runtimes are not None
@@ -210,10 +319,34 @@ class DefaultBuildStrategy(BuildStrategy):
                 layer.build_architecture,
                 single_build_dir,
                 layer_definition.env_vars,
-                layer_definition.dependencies_dir if is_experimental_enabled(ExperimentalFlag.Accelerate) else None,
+                layer_definition.dependencies_dir if self._cached else None,
                 layer_definition.download_dependencies,
+                layer.metadata,
             )
         }
+
+    def build_single_microvm_image_definition(self, microvm_definition: MicrovmImageBuildDefinition) -> Dict[str, str]:
+        """
+        Build a single MicrovmImage definition via docker build.
+        """
+        microvm_image = microvm_definition.microvm_image
+        if not microvm_image or not microvm_image.architecture:
+            LOG.warning(
+                "Skipping MicrovmImage build: missing image or architecture for definition %s",
+                microvm_definition.code_uri,
+            )
+            return {}
+        with _attribute_build_failure_to([microvm_image.full_path]):
+            LOG.info(
+                "Building MicrovmImage: %s from %s",
+                microvm_image.full_path,
+                microvm_definition.code_uri,
+            )
+
+            result = self._build_microvm_image(
+                microvm_image.full_path, microvm_definition.code_uri, microvm_image.architecture
+            )
+        return {microvm_image.full_path: result}
 
 
 class CachedBuildStrategy(BuildStrategy):
@@ -259,8 +392,8 @@ class CachedBuildStrategy(BuildStrategy):
 
         if not cache_function_dir.exists() or build_definition.source_hash != source_hash:
             LOG.info(
-                "Cache is invalid, running build and copying resources to function build definition of %s",
-                build_definition.uuid,
+                "Cache is invalid, running build and copying resources for following functions (%s)",
+                build_definition.get_resource_full_paths(),
             )
             build_result = self._delegate_build_strategy.build_single_function_definition(build_definition)
             function_build_results.update(build_result)
@@ -271,19 +404,37 @@ class CachedBuildStrategy(BuildStrategy):
             build_definition.source_hash = source_hash
             # Since all the build contents are same for a build definition, just copy any one of them into the cache
             for _, value in build_result.items():
-                osutils.copytree(value, cache_function_dir)
+                osutils.copytree(value, str(cache_function_dir))
                 break
         else:
             LOG.info(
-                "Valid cache found, copying previously built resources from function build definition of %s",
-                build_definition.uuid,
+                "Valid cache found, copying previously built resources for following functions (%s)",
+                build_definition.get_resource_full_paths(),
             )
-            for function in build_definition.functions:
-                # artifacts directory will be created by the builder
-                artifacts_dir = function.get_build_dir(self._build_dir)
-                LOG.debug("Copying artifacts from %s to %s", cache_function_dir, artifacts_dir)
-                osutils.copytree(cache_function_dir, artifacts_dir)
-                function_build_results[function.full_path] = artifacts_dir
+            if is_experimental_enabled(ExperimentalFlag.BuildPerformance):
+                first_function_artifacts_dir: Optional[str] = None
+                for function in build_definition.functions:
+                    if not first_function_artifacts_dir:
+                        # artifacts directory will be created by the builder
+                        artifacts_dir = build_definition.get_build_dir(self._build_dir)
+                        LOG.debug("Linking artifacts from %s to %s", cache_function_dir, artifacts_dir)
+                        osutils.create_symlink_or_copy(str(cache_function_dir), artifacts_dir)
+                        function_build_results[function.full_path] = artifacts_dir
+                        first_function_artifacts_dir = artifacts_dir
+                    else:
+                        LOG.debug(
+                            "Function (%s) build folder is updated to %s",
+                            function.full_path,
+                            first_function_artifacts_dir,
+                        )
+                        function_build_results[function.full_path] = first_function_artifacts_dir
+            else:
+                for function in build_definition.functions:
+                    # artifacts directory will be created by the builder
+                    artifacts_dir = function.get_build_dir(self._build_dir)
+                    LOG.debug("Copying artifacts from %s to %s", cache_function_dir, artifacts_dir)
+                    osutils.copytree(str(cache_function_dir), artifacts_dir)
+                    function_build_results[function.full_path] = artifacts_dir
 
         return function_build_results
 
@@ -291,6 +442,7 @@ class CachedBuildStrategy(BuildStrategy):
         """
         Builds single layer definition with caching
         """
+
         code_dir = str(pathlib.Path(self._base_dir, cast(str, layer_definition.codeuri)).resolve())
         source_hash = dir_checksum(code_dir, ignore_list=[".aws-sam"], hash_generator=hashlib.sha256())
         cache_function_dir = pathlib.Path(self._cache_dir, layer_definition.uuid)
@@ -298,8 +450,8 @@ class CachedBuildStrategy(BuildStrategy):
 
         if not cache_function_dir.exists() or layer_definition.source_hash != source_hash:
             LOG.info(
-                "Cache is invalid, running build and copying resources to layer build definition of %s",
-                layer_definition.uuid,
+                "Cache is invalid, running build and copying resources for following layers (%s)",
+                layer_definition.get_resource_full_paths(),
             )
             build_result = self._delegate_build_strategy.build_single_layer_definition(layer_definition)
             layer_build_result.update(build_result)
@@ -310,17 +462,22 @@ class CachedBuildStrategy(BuildStrategy):
             layer_definition.source_hash = source_hash
             # Since all the build contents are same for a build definition, just copy any one of them into the cache
             for _, value in build_result.items():
-                osutils.copytree(value, cache_function_dir)
+                osutils.copytree(value, str(cache_function_dir))
                 break
         else:
             LOG.info(
-                "Valid cache found, copying previously built resources from layer build definition of %s",
-                layer_definition.uuid,
+                "Valid cache found, copying previously built resources for following layers (%s)",
+                layer_definition.get_resource_full_paths(),
             )
             # artifacts directory will be created by the builder
-            artifacts_dir = str(pathlib.Path(self._build_dir, layer_definition.layer.full_path))
-            LOG.debug("Copying artifacts from %s to %s", cache_function_dir, artifacts_dir)
-            osutils.copytree(cache_function_dir, artifacts_dir)
+            artifacts_dir = layer_definition.layer.get_build_dir(self._build_dir)
+
+            if is_experimental_enabled(ExperimentalFlag.BuildPerformance):
+                LOG.debug("Linking artifacts folder from %s to %s", cache_function_dir, artifacts_dir)
+                osutils.create_symlink_or_copy(str(cache_function_dir), artifacts_dir)
+            else:
+                LOG.debug("Copying artifacts from %s to %s", cache_function_dir, artifacts_dir)
+                osutils.copytree(str(cache_function_dir), artifacts_dir)
             layer_build_result[layer_definition.layer.full_path] = artifacts_dir
 
         return layer_build_result
@@ -332,6 +489,18 @@ class CachedBuildStrategy(BuildStrategy):
         uuids = {bd.uuid for bd in self._build_graph.get_function_build_definitions()}
         uuids.update({ld.uuid for ld in self._build_graph.get_layer_build_definitions()})
         clean_redundant_folders(self._cache_dir, uuids)
+
+    def build_single_microvm_image_definition(self, microvm_definition: MicrovmImageBuildDefinition) -> Dict[str, str]:
+        """
+        Builds single MicrovmImage definition. Delegates to the underlying build strategy since
+        Docker has its own layer caching.
+        """
+        if microvm_definition.microvm_image:
+            LOG.info(
+                "MicrovmImage %s is not cached by SAM CLI; Docker's layer cache is used",
+                microvm_definition.microvm_image.full_path,
+            )
+        return self._delegate_build_strategy.build_single_microvm_image_definition(microvm_definition)
 
 
 class ParallelBuildStrategy(BuildStrategy):
@@ -345,45 +514,54 @@ class ParallelBuildStrategy(BuildStrategy):
         self,
         build_graph: BuildGraph,
         delegate_build_strategy: BuildStrategy,
-        async_context: Optional[AsyncContext] = None,
     ) -> None:
         super().__init__(build_graph)
         self._delegate_build_strategy = delegate_build_strategy
-        self._async_context = async_context if async_context else AsyncContext()
 
     def build(self) -> Dict[str, str]:
-        """
-        Runs all build and collects results from async context
-        """
-        result = {}
         with self._delegate_build_strategy:
-            # ignore result
-            super().build()
-            # wait for other executions to complete
+            return super().build()
 
-            async_results = self._async_context.run_async()
-            for async_result in async_results:
-                result.update(async_result)
+    def _build_layers(self, build_graph: BuildGraph) -> Dict[str, str]:
+        return self._run_builds_async(self.build_single_layer_definition, build_graph.get_layer_build_definitions())
 
-        return result
-
-    def build_single_function_definition(self, build_definition: FunctionBuildDefinition) -> Dict[str, str]:
-        """
-        Passes single function build into async context, no actual result returned from this function
-        """
-        self._async_context.add_async_task(
-            self._delegate_build_strategy.build_single_function_definition, build_definition
+    def _build_functions(self, build_graph: BuildGraph) -> Dict[str, str]:
+        return self._run_builds_async(
+            self.build_single_function_definition, build_graph.get_function_build_definitions()
         )
-        return {}
+
+    def _build_microvm_images(self, build_graph: BuildGraph) -> Dict[str, str]:
+        return self._run_builds_async(
+            self.build_single_microvm_image_definition, build_graph.get_microvm_image_build_definitions()
+        )
+
+    @staticmethod
+    def _run_builds_async(
+        build_method: Callable[[BuildDefinitionType], Dict[str, str]],
+        build_definitions: Tuple[BuildDefinitionType, ...],
+    ) -> Dict[str, str]:
+        """Builds given list of build definitions in async and return the result"""
+        if not build_definitions:
+            return dict()
+
+        async_context = AsyncContext()
+        for build_definition in build_definitions:
+            async_context.add_async_task(build_method, build_definition)
+        async_results = async_context.run_async()
+
+        build_result: Dict[str, str] = dict()
+        for async_result in async_results:
+            build_result.update(async_result)
+        return build_result
 
     def build_single_layer_definition(self, layer_definition: LayerBuildDefinition) -> Dict[str, str]:
-        """
-        Passes single layer build into async context, no actual result returned from this function
-        """
-        self._async_context.add_async_task(
-            self._delegate_build_strategy.build_single_layer_definition, layer_definition
-        )
-        return {}
+        return self._delegate_build_strategy.build_single_layer_definition(layer_definition)
+
+    def build_single_function_definition(self, build_definition: FunctionBuildDefinition) -> Dict[str, str]:
+        return self._delegate_build_strategy.build_single_function_definition(build_definition)
+
+    def build_single_microvm_image_definition(self, microvm_definition: MicrovmImageBuildDefinition) -> Dict[str, str]:
+        return self._delegate_build_strategy.build_single_microvm_image_definition(microvm_definition)
 
 
 class IncrementalBuildStrategy(BuildStrategy):
@@ -415,14 +593,23 @@ class IncrementalBuildStrategy(BuildStrategy):
         return result
 
     def build_single_function_definition(self, build_definition: FunctionBuildDefinition) -> Dict[str, str]:
-        self._check_whether_manifest_is_changed(build_definition, build_definition.codeuri, build_definition.runtime)
-        return self._delegate_build_strategy.build_single_function_definition(build_definition)
+        # The manifest pre-check runs before delegating and can raise before the delegate's own
+        # attribution, so wrap both to keep error.resources on --cached/--incremental failures.
+        with _attribute_build_failure_to([function.full_path for function in build_definition.functions]):
+            self._check_whether_manifest_is_changed(
+                build_definition, build_definition.codeuri, build_definition.runtime
+            )
+            return self._delegate_build_strategy.build_single_function_definition(build_definition)
 
     def build_single_layer_definition(self, layer_definition: LayerBuildDefinition) -> Dict[str, str]:
-        self._check_whether_manifest_is_changed(
-            layer_definition, layer_definition.codeuri, layer_definition.build_method
-        )
-        return self._delegate_build_strategy.build_single_layer_definition(layer_definition)
+        with _attribute_build_failure_to([layer_definition.full_path]):
+            self._check_whether_manifest_is_changed(
+                layer_definition, layer_definition.codeuri, layer_definition.build_method
+            )
+            return self._delegate_build_strategy.build_single_layer_definition(layer_definition)
+
+    def build_single_microvm_image_definition(self, microvm_definition: MicrovmImageBuildDefinition) -> Dict[str, str]:
+        return self._delegate_build_strategy.build_single_microvm_image_definition(microvm_definition)
 
     def _check_whether_manifest_is_changed(
         self,
@@ -446,14 +633,17 @@ class IncrementalBuildStrategy(BuildStrategy):
             if is_manifest_changed or is_dependencies_dir_missing:
                 build_definition.manifest_hash = manifest_hash
                 LOG.info(
-                    "Manifest file is changed (new hash: %s) or dependency folder (%s) is missing for %s, "
+                    "Manifest file is changed (new hash: %s) or dependency folder (%s) is missing for (%s), "
                     "downloading dependencies and copying/building source",
                     manifest_hash,
                     build_definition.dependencies_dir,
-                    build_definition.uuid,
+                    build_definition.get_resource_full_paths(),
                 )
             else:
-                LOG.info("Manifest is not changed for %s, running incremental build", build_definition.uuid)
+                LOG.info(
+                    "Manifest is not changed for (%s), running incremental build",
+                    build_definition.get_resource_full_paths(),
+                )
 
         build_definition.download_dependencies = is_manifest_changed or is_dependencies_dir_missing
 
@@ -487,6 +677,7 @@ class CachedOrIncrementalBuildStrategyWrapper(BuildStrategy):
         cache_dir: str,
         manifest_path_override: Optional[str],
         is_building_specific_resource: bool,
+        use_container: bool,
     ):
         super().__init__(build_graph)
         self._incremental_build_strategy = IncrementalBuildStrategy(
@@ -503,6 +694,7 @@ class CachedOrIncrementalBuildStrategyWrapper(BuildStrategy):
             cache_dir,
         )
         self._is_building_specific_resource = is_building_specific_resource
+        self._use_container = use_container
 
     def build(self) -> Dict[str, str]:
         result = {}
@@ -513,34 +705,37 @@ class CachedOrIncrementalBuildStrategyWrapper(BuildStrategy):
     def build_single_function_definition(self, build_definition: FunctionBuildDefinition) -> Dict[str, str]:
         if self._is_incremental_build_supported(build_definition.runtime):
             LOG.debug(
-                "Running incremental build for runtime %s for build definition %s",
+                "Running incremental build for runtime %s for following resources (%s)",
                 build_definition.runtime,
-                build_definition.uuid,
+                build_definition.get_resource_full_paths(),
             )
             return self._incremental_build_strategy.build_single_function_definition(build_definition)
 
         LOG.debug(
-            "Running incremental build for runtime %s for build definition %s",
+            "Running incremental build for runtime %s for following resources (%s)",
             build_definition.runtime,
-            build_definition.uuid,
+            build_definition.get_resource_full_paths(),
         )
         return self._cached_build_strategy.build_single_function_definition(build_definition)
 
     def build_single_layer_definition(self, layer_definition: LayerBuildDefinition) -> Dict[str, str]:
         if self._is_incremental_build_supported(layer_definition.build_method):
             LOG.debug(
-                "Running incremental build for runtime %s for build definition %s",
+                "Running incremental build for runtime %s for following resources (%s)",
                 layer_definition.build_method,
-                layer_definition.uuid,
+                layer_definition.get_resource_full_paths(),
             )
             return self._incremental_build_strategy.build_single_layer_definition(layer_definition)
 
         LOG.debug(
-            "Running cached build for runtime %s for build definition %s",
+            "Running cached build for runtime %s for following resources (%s)",
             layer_definition.build_method,
-            layer_definition.uuid,
+            layer_definition.get_resource_full_paths,
         )
         return self._cached_build_strategy.build_single_layer_definition(layer_definition)
+
+    def build_single_microvm_image_definition(self, microvm_definition: MicrovmImageBuildDefinition) -> Dict[str, str]:
+        return self._cached_build_strategy.build_single_microvm_image_definition(microvm_definition)
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """
@@ -557,9 +752,12 @@ class CachedOrIncrementalBuildStrategyWrapper(BuildStrategy):
             self._cached_build_strategy._clean_redundant_cached()
             self._incremental_build_strategy._clean_redundant_dependencies()
 
-    @staticmethod
-    def _is_incremental_build_supported(runtime: Optional[str]) -> bool:
-        if not runtime or not is_experimental_enabled(ExperimentalFlag.Accelerate):
+    def _is_incremental_build_supported(self, runtime: Optional[str]) -> bool:
+        # incremental build doesn't support in container build
+        if self._use_container:
+            return False
+
+        if not runtime:
             return False
 
         for supported_runtime_prefix in CachedOrIncrementalBuildStrategyWrapper.SUPPORTED_RUNTIME_PREFIXES:
@@ -567,3 +765,122 @@ class CachedOrIncrementalBuildStrategyWrapper(BuildStrategy):
                 return True
 
         return False
+
+
+class WorkspaceAwareBuildStrategy(BuildStrategy):
+    """
+    Wraps another build strategy to install nodejs dependencies once per npm workspace root.
+
+    In an npm workspaces monorepo npm keeps ONE dependency tree, hoisted to the workspace root, and
+    every member's install reconciles that whole tree. Building N functions from one monorepo with
+    --build-in-source therefore reconciles the same tree N times. This strategy resolves each nodejs
+    function's npm project root before any function builds, installs each distinct root once through
+    aws-lambda-builders, and marks the grouped functions with download_dependencies=False - the same
+    lever IncrementalBuildStrategy uses - so their builds link the artifacts to the tree that one
+    install wrote.
+
+    A function is grouped only when all of these hold, so anything else keeps today's per-function
+    install:
+
+    - Zip package type, nodejs runtime, npm or esbuild build method
+    - npm resolves the function's project root OUTSIDE its own code directory, which is what
+      distinguishes a workspace member from a standalone package
+    - the shared install itself succeeded; a failed root leaves its functions untouched
+
+    This strategy must wrap OUTSIDE ParallelBuildStrategy, whose _build_functions fires every
+    definition into one AsyncContext: running the install first is the barrier that keeps parallel
+    function builds from racing the shared tree. It is wired only for non-cached builds; --cached
+    supplies dependencies from .aws-sam/deps and manages download_dependencies itself.
+    """
+
+    def __init__(
+        self,
+        build_graph: BuildGraph,
+        delegate_build_strategy: BuildStrategy,
+        base_dir: str,
+        project_root_resolver: Callable[[str], Optional[str]],
+        prepare_shared_project_function: Callable[[str, FunctionBuildDefinition], bool],
+    ) -> None:
+        """
+        Parameters
+        ----------
+        project_root_resolver:
+            Given a function's resolved code directory, returns npm's project root for it, or None
+            when it cannot be resolved (npm missing, too-old aws-lambda-builders, non-npm project).
+        prepare_shared_project_function:
+            Runs the shared install for (project_root, one grouped build definition); returns True
+            on success. Failures must be handled inside and reported with False.
+        """
+        super().__init__(build_graph)
+        self._delegate_build_strategy = delegate_build_strategy
+        self._base_dir = base_dir
+        self._project_root_resolver = project_root_resolver
+        self._prepare_shared_project_function = prepare_shared_project_function
+
+    def build(self) -> Dict[str, str]:
+        with self._delegate_build_strategy:
+            return super().build()
+
+    def _build_layers(self, build_graph: BuildGraph) -> Dict[str, str]:
+        return self._delegate_build_strategy._build_layers(build_graph)
+
+    def _build_functions(self, build_graph: BuildGraph) -> Dict[str, str]:
+        self._prepare_shared_project_for_workspace_groups(build_graph)
+        return self._delegate_build_strategy._build_functions(build_graph)
+
+    def build_single_function_definition(self, build_definition: FunctionBuildDefinition) -> Dict[str, str]:
+        return self._delegate_build_strategy.build_single_function_definition(build_definition)
+
+    def build_single_layer_definition(self, layer_definition: LayerBuildDefinition) -> Dict[str, str]:
+        return self._delegate_build_strategy.build_single_layer_definition(layer_definition)
+
+    def _build_microvm_images(self, build_graph: BuildGraph) -> Dict[str, str]:
+        return self._delegate_build_strategy._build_microvm_images(build_graph)
+
+    def build_single_microvm_image_definition(self, microvm_definition: MicrovmImageBuildDefinition) -> Dict[str, str]:
+        return self._delegate_build_strategy.build_single_microvm_image_definition(microvm_definition)
+
+    def _prepare_shared_project_for_workspace_groups(self, build_graph: BuildGraph) -> None:
+        groups: Dict[str, List[FunctionBuildDefinition]] = {}
+        for build_definition in build_graph.get_function_build_definitions():
+            project_root = self._workspace_root_for(build_definition)
+            if project_root:
+                groups.setdefault(project_root, []).append(build_definition)
+
+        for project_root, build_definitions in groups.items():
+            LOG.info(
+                "Installing dependencies once for workspace root %s, shared by (%s)",
+                project_root,
+                ", ".join(definition.get_resource_full_paths() for definition in build_definitions),
+            )
+            if self._prepare_shared_project_function(project_root, build_definitions[0]):
+                for build_definition in build_definitions:
+                    build_definition.download_dependencies = False
+
+    def _workspace_root_for(self, build_definition: FunctionBuildDefinition) -> Optional[str]:
+        """
+        The npm project root the function's install would write to, or None when the function is not
+        a workspace member covered by this strategy.
+        """
+        if build_definition.packagetype != ZIP or not build_definition.codeuri:
+            return None
+        runtime = build_definition.runtime or ""
+        if not runtime.startswith("nodejs"):
+            return None
+        # only the npm workflows install through the npm project tree; BuildMethod naming the
+        # runtime is the template's way of spelling the default
+        build_method = (build_definition.metadata or {}).get("BuildMethod")
+        if build_method not in (None, "esbuild", runtime):
+            return None
+
+        code_dir = str(pathlib.Path(self._base_dir, build_definition.codeuri).resolve())
+        project_root = self._project_root_resolver(code_dir)
+        if not project_root:
+            return None
+        # npm answers with the directory itself for anything that is not a workspace member. normcase
+        # because npm's stdout and this path are spelled independently, and on Windows two spellings
+        # differing only in case - a drive letter included - name the same directory; reading those as
+        # different roots would group a project that is not a workspace at all. No-op off Windows.
+        if os.path.normcase(os.path.realpath(project_root)) == os.path.normcase(os.path.realpath(code_dir)):
+            return None
+        return project_root

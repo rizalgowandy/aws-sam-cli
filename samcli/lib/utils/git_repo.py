@@ -1,4 +1,4 @@
-""" Manage Git repo """
+"""Manage Git repo"""
 
 import logging
 import os
@@ -12,6 +12,7 @@ from pathlib import Path
 from subprocess import check_output
 from typing import Optional
 
+from samcli.commands.exceptions import UserException
 from samcli.lib.utils import osutils
 from samcli.lib.utils.osutils import rmtree_callback
 
@@ -33,6 +34,12 @@ class CloneRepoUnstableStateException(CloneRepoException):
 class ManifestNotFoundException(Exception):
     """
     Exception class when request Manifest file return 404.
+    """
+
+
+class GitExecutableNotFoundException(UserException):
+    """
+    Used to thrown when git executable not found in the system
     """
 
 
@@ -71,7 +78,7 @@ class GitRepo:
             raise
 
     @staticmethod
-    def _git_executable() -> str:
+    def git_executable() -> str:
         if platform.system().lower() == "windows":
             executables = ["git", "git.cmd", "git.exe", "git.bat"]
         else:
@@ -83,9 +90,12 @@ class GitRepo:
                     # No exception. Let's pick this
                     return executable
             except OSError as ex:
-                LOG.debug("Unable to find executable %s", executable, exc_info=ex)
+                LOG.warning("Unable to find executable %s", executable, exc_info=ex)
 
-        raise OSError("Cannot find git, was looking at executables: {}".format(executables))
+        raise GitExecutableNotFoundException(
+            "This command requires git but we couldn't find the executable, "
+            f"was looking with following names: {executables}"
+        )
 
     def clone(self, clone_dir: Path, clone_name: str, replace_existing: bool = False, commit: str = "") -> Path:
         """
@@ -127,10 +137,17 @@ class GitRepo:
         with osutils.mkdir_temp(ignore_errors=True) as tempdir:
             try:
                 temp_path = os.path.normpath(os.path.join(tempdir, clone_name))
-                git_executable: str = GitRepo._git_executable()
+                git_executable: str = GitRepo.git_executable()
                 LOG.info("\nCloning from %s (process may take a moment)", self.url)
+                command = [git_executable, "clone", self.url, clone_name]
+                if platform.system().lower() == "windows":
+                    LOG.debug(
+                        "Configure core.longpaths=true in git clone. "
+                        "You might also need to enable long paths in Windows registry."
+                    )
+                    command += ["--config", "core.longpaths=true"]
                 check_output(
-                    [git_executable, "clone", self.url, clone_name],
+                    command,
                     cwd=tempdir,
                     stderr=subprocess.STDOUT,
                 )
@@ -165,22 +182,33 @@ class GitRepo:
 
             LOG.debug("Copying from %s to %s", temp_path, dest_path)
             # Todo consider not removing the .git files/directories
-            shutil.copytree(temp_path, dest_path, ignore=shutil.ignore_patterns("*.git"))
+            shutil.copytree(temp_path, dest_path)
             return Path(dest_path)
         except (OSError, shutil.Error) as ex:
             # UNSTABLE STATE
             # it's difficult to see how this scenario could happen except weird permissions, user will need to debug
-            raise CloneRepoUnstableStateException(
+            msg = (
                 "Unstable state when updating repo. "
                 f"Check that you have permissions to create/delete files in {dest_dir} directory "
                 "or file an issue at https://github.com/aws/aws-sam-cli/issues"
-            ) from ex
+            )
+
+            if platform.system().lower() == "windows":
+                msg = (
+                    "Failed to modify a local file when cloning app templates. "
+                    "MAX_PATH should be enabled in the Windows registry."
+                    "\nFor more details on how to enable MAX_PATH for Windows, please visit: "
+                    "https://docs.aws.amazon.com/serverless-application-model/latest/"
+                    "developerguide/install-sam-cli.html"
+                )
+
+            raise CloneRepoUnstableStateException(msg) from ex
 
     @staticmethod
     def _checkout_commit(repo_dir: str, commit: str):
         try:
             # if the checkout commit failed, it will use the latest commit instead
-            git_executable = GitRepo._git_executable()
+            git_executable = GitRepo.git_executable()
             check_output(
                 [git_executable, "checkout", commit],
                 cwd=repo_dir,

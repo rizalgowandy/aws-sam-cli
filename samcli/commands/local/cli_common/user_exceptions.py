@@ -69,3 +69,22 @@ class InvalidFunctionPropertyType(UserException):
     """
     Function property given in the template is Invalid
     """
+
+
+class DockerDistributionAPIError(UserException):
+    """
+    There was an unknown error from the docker daemon.
+
+    This could be either an error from the Docker client (SAM) to the daemon's internal
+    API or it could be an error from the Docker registry.
+    """
+
+
+class SchemaPermissionsError(UserException):
+    """
+    You don't have the neccesary permissions to create shareable test events.
+
+    Update your role to have the necessary permissions or change your event sharing settings to private.
+
+    Learn more: https://docs.aws.amazon.com/lambda/latest/dg/testing-functions.html#creating-shareable-events
+    """

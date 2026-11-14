@@ -1,9 +1,16 @@
-from unittest import TestCase
+import shutil
+import tempfile
+from pathlib import Path
 from enum import Enum, auto
+from typing import Optional
 
 import boto3
 from botocore.config import Config
-from tests.testing_utils import get_sam_command
+
+from samcli.lib.bootstrap.bootstrap import SAM_CLI_STACK_NAME
+from samcli.lib.config.samconfig import SamConfig
+from tests.integration.package.package_integ_base import PackageIntegBase
+from tests.testing_utils import get_sam_command, run_command, run_command_with_input
 
 
 class ResourceType(Enum):
@@ -12,11 +19,7 @@ class ResourceType(Enum):
     IAM_ROLE = auto()
 
 
-class DeployIntegBase(TestCase):
-    @classmethod
-    def setUpClass(cls):
-        pass
-
+class DeployIntegBase(PackageIntegBase):
     def setUp(self):
         super().setUp()
         self.left_over_resources = {
@@ -24,12 +27,40 @@ class DeployIntegBase(TestCase):
             ResourceType.S3_BUCKET: list(),
             ResourceType.IAM_ROLE: list(),
         }
+        # make temp directory and move all test files into there for each test run
+        self.test_data_path = Path(tempfile.mkdtemp())
+
+        # copytree call below fails if root folder present, delete it first
+        shutil.rmtree(self.test_data_path, ignore_errors=True)
+        shutil.copytree(self.original_test_data_path, self.test_data_path)
+
+        self.cfn_client = boto3.client("cloudformation")
+        self.ecr_client = boto3.client("ecr")
+        self.stacks = []
 
     def tearDown(self):
+        for stack in self.stacks:
+            # because of the termination protection, do not delete aws-sam-cli-managed-default stack
+            stack_name = stack["name"]
+            if stack_name != SAM_CLI_STACK_NAME:
+                region = stack.get("region")
+                cfn_client = (
+                    self.cfn_client if not region else boto3.client("cloudformation", config=Config(region_name=region))
+                )
+                ecr_client = self.ecr_client if not region else boto3.client("ecr", config=Config(region_name=region))
+                self._delete_companion_stack(cfn_client, ecr_client, self._stack_name_to_companion_stack(stack_name))
+                cfn_client.delete_stack(StackName=stack_name)
+        shutil.rmtree(self.test_data_path)
         super().tearDown()
         self.delete_s3_buckets()
         self.delete_iam_roles()
         self.delete_lambda_functions()
+
+    def run_command(self, command_list):
+        return run_command(command_list, cwd=self.test_data_path)
+
+    def run_command_with_input(self, command_list, stdin_input):
+        return run_command_with_input(command_list, stdin_input, cwd=self.test_data_path)
 
     def delete_s3_buckets(self):
         config = Config(retries={"max_attempts": 10, "mode": "adaptive"})
@@ -104,9 +135,12 @@ class DeployIntegBase(TestCase):
         signing_profiles=None,
         resolve_image_repos=False,
         disable_rollback=False,
+        on_failure=None,
+        express=None,
     ):
         command_list = [get_sam_command(), "deploy"]
 
+        # Cast all string parameters to preserve behaviour across platforms
         if guided:
             command_list = command_list + ["--guided"]
         if s3_bucket:
@@ -165,11 +199,17 @@ class DeployIntegBase(TestCase):
             command_list = command_list + ["--resolve-image-repos"]
         if disable_rollback:
             command_list = command_list + ["--disable-rollback"]
+        if on_failure:
+            command_list = command_list + ["--on-failure", str(on_failure)]
+        if express is True:
+            command_list = command_list + ["--express"]
+        elif express is False:
+            command_list = command_list + ["--no-express"]
 
         return command_list
 
     @staticmethod
-    def get_minimal_build_command_list(self, template_file=None, build_dir=None):
+    def get_minimal_build_command_list(template_file=None, build_dir=None):
         command_list = [get_sam_command(), "build"]
 
         if template_file:
@@ -178,3 +218,26 @@ class DeployIntegBase(TestCase):
             command_list = command_list + ["--build-dir", str(build_dir)]
 
         return command_list
+
+    def _assert_deploy_samconfig_parameters(
+        self,
+        config: SamConfig,
+        stack_name: str = SAM_CLI_STACK_NAME,
+        resolve_s3: bool = True,
+        region: str = "us-east-1",
+        capabilities: str = "CAPABILITY_IAM",
+        confirm_changeset: Optional[bool] = None,
+        parameter_overrides: Optional[str] = None,
+    ):
+        params = config.document["default"]["deploy"]["parameters"]
+
+        self.assertEqual(params["stack_name"], stack_name)
+        self.assertEqual(params["resolve_s3"], resolve_s3)
+        self.assertEqual(params["region"], region)
+        self.assertEqual(params["capabilities"], capabilities)
+
+        if confirm_changeset is not None:
+            self.assertEqual(params["confirm_changeset"], confirm_changeset)
+
+        if parameter_overrides is not None:
+            self.assertEqual(params["parameter_overrides"], parameter_overrides)

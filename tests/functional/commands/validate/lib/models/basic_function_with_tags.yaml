@@ -17,12 +17,11 @@ Resources:
           Type: AlexaSkill
       Handler: index.handler
       MemorySize: 1024
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Timeout: 3
       Tags:
         TagKey1: TagValue1
-        TagKey2: ""
+        TagKey2: ''
         TagKey3:
           Ref: TagValueParam
-        TagKey4: "123"
-
+        TagKey4: '123'

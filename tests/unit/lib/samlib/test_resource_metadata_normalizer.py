@@ -3,6 +3,7 @@ from parameterized import parameterized
 from unittest import TestCase
 
 from samcli.lib.samlib.resource_metadata_normalizer import ResourceMetadataNormalizer
+from samcli.yamlhelper import yaml_parse
 
 
 class TestResourceMetadataNormalizer(TestCase):
@@ -79,8 +80,49 @@ class TestResourceMetadataNormalizer(TestCase):
 
     def test_replace_all_resources_that_contain_image_metadata(self):
         docker_build_args = {"arg1": "val1", "arg2": "val2"}
+        docker_build_extra_params = ["--param1", "value1"]
         asset_path = pathlib.Path("/path", "to", "asset")
         dockerfile_path = pathlib.Path("path", "to", "Dockerfile")
+        template_data = {
+            "Resources": {
+                "Function1": {
+                    "Properties": {
+                        "Code": {
+                            "ImageUri": {
+                                "Fn::Sub": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/cdk-hnb659fds-container-assets-${AWS::AccountId}-${AWS::Region}:b5d75370ccc2882b90f701c8f98952aae957e85e1928adac8860222960209056"
+                            }
+                        }
+                    },
+                    "Metadata": {
+                        "aws:asset:path": asset_path,
+                        "aws:asset:property": "Code.ImageUri",
+                        "aws:asset:dockerfile-path": dockerfile_path,
+                        "aws:asset:docker-build-args": docker_build_args,
+                        "aws:asset:docker-build-extra-params": docker_build_extra_params,
+                    },
+                },
+            }
+        }
+
+        ResourceMetadataNormalizer.normalize(template_data)
+
+        expected_docker_context_path = str(pathlib.Path("/path", "to", "asset"))
+        self.assertEqual("function1", template_data["Resources"]["Function1"]["Properties"]["Code"]["ImageUri"])
+        self.assertEqual(
+            expected_docker_context_path, template_data["Resources"]["Function1"]["Metadata"]["DockerContext"]
+        )
+        expected_dockerfile_path = str(pathlib.Path("path", "to", "Dockerfile").as_posix())
+        self.assertEqual(expected_dockerfile_path, template_data["Resources"]["Function1"]["Metadata"]["Dockerfile"])
+        self.assertEqual(docker_build_args, template_data["Resources"]["Function1"]["Metadata"]["DockerBuildArgs"])
+        self.assertEqual(
+            docker_build_extra_params, template_data["Resources"]["Function1"]["Metadata"]["DockerBuildExtraParams"]
+        )
+        self.assertEqual("Function1", template_data["Resources"]["Function1"]["Metadata"]["SamResourceId"])
+
+    def test_replace_all_resources_that_contain_image_metadata_dockerfile_extensions(self):
+        docker_build_args = {"arg1": "val1", "arg2": "val2"}
+        asset_path = pathlib.Path("/path", "to", "asset")
+        dockerfile_path = pathlib.Path("path", "to", "Dockerfile.production")
         template_data = {
             "Resources": {
                 "Function1": {
@@ -103,12 +145,15 @@ class TestResourceMetadataNormalizer(TestCase):
 
         ResourceMetadataNormalizer.normalize(template_data)
 
-        expected_docker_context_path = str(pathlib.Path("/path", "to", "asset", "path", "to"))
+        expected_docker_context_path = str(pathlib.Path("/path", "to", "asset"))
         self.assertEqual("function1", template_data["Resources"]["Function1"]["Properties"]["Code"]["ImageUri"])
         self.assertEqual(
             expected_docker_context_path, template_data["Resources"]["Function1"]["Metadata"]["DockerContext"]
         )
-        self.assertEqual("Dockerfile", template_data["Resources"]["Function1"]["Metadata"]["Dockerfile"])
+        self.assertEqual(
+            str(pathlib.Path("path/to/Dockerfile.production").as_posix()),
+            template_data["Resources"]["Function1"]["Metadata"]["Dockerfile"],
+        )
         self.assertEqual(docker_build_args, template_data["Resources"]["Function1"]["Metadata"]["DockerBuildArgs"])
         self.assertEqual("Function1", template_data["Resources"]["Function1"]["Metadata"]["SamResourceId"])
 
@@ -138,12 +183,13 @@ class TestResourceMetadataNormalizer(TestCase):
 
         ResourceMetadataNormalizer.normalize(template_data)
 
-        expected_docker_context_path = str(pathlib.Path("C:\\path\\to\\asset").joinpath(pathlib.Path("rel/path/to")))
+        expected_docker_context_path = str(pathlib.Path("C:\\path\\to\\asset"))
         self.assertEqual("function1", template_data["Resources"]["Function1"]["Properties"]["Code"]["ImageUri"])
         self.assertEqual(
             expected_docker_context_path, template_data["Resources"]["Function1"]["Metadata"]["DockerContext"]
         )
-        self.assertEqual("Dockerfile", template_data["Resources"]["Function1"]["Metadata"]["Dockerfile"])
+        expected_dockerfile_path = str(pathlib.Path("rel/path/to/Dockerfile").as_posix())
+        self.assertEqual(expected_dockerfile_path, template_data["Resources"]["Function1"]["Metadata"]["Dockerfile"])
         self.assertEqual(docker_build_args, template_data["Resources"]["Function1"]["Metadata"]["DockerBuildArgs"])
         self.assertEqual("Function1", template_data["Resources"]["Function1"]["Metadata"]["SamResourceId"])
 
@@ -416,6 +462,50 @@ class TestResourceMetadataNormalizer(TestCase):
         self.assertEqual("new path", template_data["Resources"]["Function1"]["Properties"]["Code"])
         self.assertEqual("Function1", template_data["Resources"]["Function1"]["Metadata"]["SamResourceId"])
 
+    def test_with_referenced_metadata(self):
+        input_template = """
+        Resources:
+          FirstFunction:
+            Type: AWS::Serverless::Function
+            Metadata: &GoFunctionMetadata
+              BuildMethod: go1.x
+              BuildProperties:
+                TrimGoPath: true
+            Properties:
+              CodeUri: dummy
+              Handler: bootstrap
+              Runtime: provided.al2
+          SecondFunction:
+            Type: AWS::Serverless::Function
+            Metadata: *GoFunctionMetadata
+            Properties:
+              CodeUri: dummy
+              Handler: bootstrap
+              Runtime: provided.al2
+          ThirdFunction:
+            Type: AWS::Serverless::Function
+            Metadata: *GoFunctionMetadata
+            Properties:
+              CodeUri: dummy
+              Handler: bootstrap
+              Runtime: provided.al2
+        """
+        template_dict = yaml_parse(input_template)
+        ResourceMetadataNormalizer.normalize(template_dict)
+
+        self.assertEqual(
+            template_dict.get("Resources", {}).get("FirstFunction", {}).get("Metadata", {}).get("SamResourceId"),
+            "FirstFunction",
+        )
+        self.assertEqual(
+            template_dict.get("Resources", {}).get("SecondFunction", {}).get("Metadata", {}).get("SamResourceId"),
+            "SecondFunction",
+        )
+        self.assertEqual(
+            template_dict.get("Resources", {}).get("ThirdFunction", {}).get("Metadata", {}).get("SamResourceId"),
+            "ThirdFunction",
+        )
+
 
 class TestResourceMetadataNormalizerGetResourceId(TestCase):
     @parameterized.expand(
@@ -434,15 +524,25 @@ class TestResourceMetadataNormalizerGetResourceId(TestCase):
             "logical_id",
         )
 
-        self.assertEquals(expected_resource_id, resource_id)
+        self.assertEqual(expected_resource_id, resource_id)
 
-    def test_use_logical_id_as_resource_id_incase_of_invalid_cdk_path(self):
+    @parameterized.expand(
+        [
+            ("func_cdk_id"),
+            ("stack_id/construct_id/lambda/Resource"),
+        ]
+    )
+    def test_use_logical_id_as_resource_id_incase_of_invalid_cdk_path(self, cdk_path):
         resource_id = ResourceMetadataNormalizer.get_resource_id(
-            {"Type": "any:value", "Properties": {"key": "value"}, "Metadata": {"aws:cdk:path": "func_cdk_id"}},
+            {
+                "Type": "any:value",
+                "Properties": {"key": "value"},
+                "Metadata": {"aws:cdk:path": cdk_path},
+            },
             "logical_id",
         )
 
-        self.assertEquals("logical_id", resource_id)
+        self.assertEqual("logical_id", resource_id)
 
     def test_use_cdk_id_as_resource_id_for_nested_stack(self):
         resource_id = ResourceMetadataNormalizer.get_resource_id(
@@ -456,7 +556,7 @@ class TestResourceMetadataNormalizerGetResourceId(TestCase):
             "logical_id",
         )
 
-        self.assertEquals("nested_stack_id", resource_id)
+        self.assertEqual("nested_stack_id", resource_id)
 
     def test_use_provided_customer_defined_id(self):
         resource_id = ResourceMetadataNormalizer.get_resource_id(
@@ -468,7 +568,7 @@ class TestResourceMetadataNormalizerGetResourceId(TestCase):
             "logical_id",
         )
 
-        self.assertEquals("custom_id", resource_id)
+        self.assertEqual("custom_id", resource_id)
 
     def test_use_provided_customer_defined_id_for_nested_stack(self):
         resource_id = ResourceMetadataNormalizer.get_resource_id(
@@ -483,21 +583,21 @@ class TestResourceMetadataNormalizerGetResourceId(TestCase):
             "logical_id",
         )
 
-        self.assertEquals("custom_nested_stack_id", resource_id)
+        self.assertEqual("custom_nested_stack_id", resource_id)
 
     def test_use_logical_id_if_metadata_is_not_therer(self):
         resource_id = ResourceMetadataNormalizer.get_resource_id(
             {"Type": "any:value", "Properties": {"key": "value"}}, "logical_id"
         )
 
-        self.assertEquals("logical_id", resource_id)
+        self.assertEqual("logical_id", resource_id)
 
     def test_use_logical_id_if_cdk_path_not_exist(self):
         resource_id = ResourceMetadataNormalizer.get_resource_id(
             {"Type": "any:value", "Properties": {"key": "value"}, "Metadata": {}}, "logical_id"
         )
 
-        self.assertEquals("logical_id", resource_id)
+        self.assertEqual("logical_id", resource_id)
 
 
 class TestResourceMetadataNormalizerBuildPropertiesNormalizer(TestCase):

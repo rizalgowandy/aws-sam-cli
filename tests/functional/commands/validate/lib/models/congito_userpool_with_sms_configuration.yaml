@@ -4,20 +4,19 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: app.handler
-      Runtime: nodejs14.x
+      Runtime: nodejs18.x
       Events:
         CognitoUserPoolPreSignup:
           Type: Cognito
           Properties:
             UserPool:
               Ref: MyCognitoUserPool
-            Trigger:
-              PreSignUp
+            Trigger: PreSignUp
 
   MyCognitoUserPool:
-      Type: AWS::Cognito::UserPool
-      Properties:
-        UserPoolName: PreSignup
-        SmsConfiguration:
-          SnsCallerArn: !GetAtt UserPoolRole.Arn
-          ExternalId: !Ref ExternalId
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: PreSignup
+      SmsConfiguration:
+        SnsCallerArn: !GetAtt UserPoolRole.Arn
+        ExternalId: !Ref ExternalId

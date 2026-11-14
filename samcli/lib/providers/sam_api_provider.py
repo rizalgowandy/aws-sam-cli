@@ -1,15 +1,18 @@
 """Parses SAM given the template"""
 
 import logging
-from typing import List, Optional, Dict, Tuple, cast, Union
+from typing import Dict, List, Optional, Tuple, Union, cast
 
+from samcli.commands.local.lib.swagger.integration_uri import LambdaUri
+from samcli.commands.validate.lib.exceptions import InvalidSamDocumentException
 from samcli.lib.providers.api_collector import ApiCollector
 from samcli.lib.providers.cfn_base_api_provider import CfnBaseApiProvider
-from samcli.commands.validate.lib.exceptions import InvalidSamDocumentException
 from samcli.lib.providers.provider import Stack
 from samcli.lib.utils.colors import Colored
-from samcli.local.apigw.local_apigw_service import Route
-from samcli.lib.utils.resources import AWS_SERVERLESS_FUNCTION, AWS_SERVERLESS_API, AWS_SERVERLESS_HTTPAPI
+from samcli.lib.utils.resources import AWS_SERVERLESS_API, AWS_SERVERLESS_FUNCTION, AWS_SERVERLESS_HTTPAPI
+from samcli.local.apigw.authorizers.authorizer import Authorizer
+from samcli.local.apigw.authorizers.lambda_authorizer import LambdaAuthorizer
+from samcli.local.apigw.route import Route
 
 LOG = logging.getLogger(__name__)
 
@@ -25,7 +28,31 @@ class SamApiProvider(CfnBaseApiProvider):
     IMPLICIT_API_RESOURCE_ID = "ServerlessRestApi"
     IMPLICIT_HTTP_API_RESOURCE_ID = "ServerlessHttpApi"
 
-    def extract_resources(self, stacks: List[Stack], collector: ApiCollector, cwd: Optional[str] = None) -> None:
+    _AUTH = "Auth"
+    _AUTH_HEADER = "Header"
+    _AUTH_SIMPLE_RESPONSES = "EnableSimpleResponses"
+    _AUTHORIZER = "Authorizer"
+    _AUTHORIZERS = "Authorizers"
+    _DEFAULT_AUTHORIZER = "DefaultAuthorizer"
+    _FUNCTION_TYPE = "FunctionPayloadType"
+    _AUTHORIZER_PAYLOAD = "AuthorizerPayloadFormatVersion"
+    _FUNCTION_ARN = "FunctionArn"
+    _VALIDATION_EXPRESSION = "ValidationExpression"
+    _IDENTITY = "Identity"
+    _IDENTITY_QUERY = "QueryStrings"
+    _IDENTITY_HEADERS = "Headers"
+    _IDENTITY_CONTEXT = "Context"
+    _IDENTITY_STAGE = "StageVariables"
+    _API_IDENTITY_SOURCE_PREFIX = "method."
+    _HTTP_IDENTITY_SOURCE_PREFIX = "$"
+
+    def extract_resources(
+        self,
+        stacks: List[Stack],
+        collector: ApiCollector,
+        cwd: Optional[str] = None,
+        disable_authorizer: Optional[bool] = False,
+    ) -> None:
         """
         Extract the Route Object from a given resource and adds it to the RouteCollector.
 
@@ -37,6 +64,8 @@ class SamApiProvider(CfnBaseApiProvider):
             Instance of the API collector that where we will save the API information
         cwd : str
             Optional working directory with respect to which we will resolve relative path to Swagger file
+        disable_authorzer : bool
+            Optional flag to disable collection of lambda authorizers
         """
         # AWS::Serverless::Function is currently included when parsing of Apis because when SamBaseProvider is run on
         # the template we are creating the implicit apis due to plugins that translate it in the SAM repo,
@@ -46,16 +75,38 @@ class SamApiProvider(CfnBaseApiProvider):
             for logical_id, resource in stack.resources.items():
                 resource_type = resource.get(CfnBaseApiProvider.RESOURCE_TYPE)
                 if resource_type == AWS_SERVERLESS_FUNCTION:
-                    self._extract_routes_from_function(stack.stack_path, logical_id, resource, collector)
+                    self._extract_routes_from_function(
+                        stack.stack_path, logical_id, resource, collector, disable_authorizer=disable_authorizer
+                    )
                 if resource_type == AWS_SERVERLESS_API:
-                    self._extract_from_serverless_api(stack.stack_path, logical_id, resource, collector, cwd=cwd)
+                    self._extract_from_serverless_api(
+                        stack.stack_path,
+                        logical_id,
+                        resource,
+                        collector,
+                        cwd=cwd,
+                        disable_authorizer=disable_authorizer,
+                    )
                 if resource_type == AWS_SERVERLESS_HTTPAPI:
-                    self._extract_from_serverless_http(stack.stack_path, logical_id, resource, collector, cwd=cwd)
+                    self._extract_from_serverless_http(
+                        stack.stack_path,
+                        logical_id,
+                        resource,
+                        collector,
+                        cwd=cwd,
+                        disable_authorizer=disable_authorizer,
+                    )
 
         collector.routes = self.merge_routes(collector)
 
     def _extract_from_serverless_api(
-        self, stack_path: str, logical_id: str, api_resource: Dict, collector: ApiCollector, cwd: Optional[str] = None
+        self,
+        stack_path: str,
+        logical_id: str,
+        api_resource: Dict,
+        collector: ApiCollector,
+        cwd: Optional[str] = None,
+        disable_authorizer: Optional[bool] = False,
     ) -> None:
         """
         Extract APIs from AWS::Serverless::Api resource by reading and parsing Swagger documents. The result is added
@@ -78,6 +129,8 @@ class SamApiProvider(CfnBaseApiProvider):
         cwd : str
             Optional working directory with respect to which we will resolve relative path to Swagger file
 
+        disable_authorizer : bool
+            Optional flag to disable the collection of lambda authorizers
         """
 
         properties = api_resource.get("Properties", {})
@@ -93,13 +146,197 @@ class SamApiProvider(CfnBaseApiProvider):
                 "Skipping resource '%s'. Swagger document not found in DefinitionBody and DefinitionUri", logical_id
             )
             return
-        CfnBaseApiProvider.extract_swagger_route(stack_path, logical_id, body, uri, binary_media, collector, cwd=cwd)
+        CfnBaseApiProvider.extract_swagger_route(
+            stack_path, logical_id, body, uri, binary_media, collector, cwd=cwd, disable_authorizer=disable_authorizer
+        )
         collector.stage_name = stage_name
         collector.stage_variables = stage_variables
         collector.cors = cors
 
+        auth = properties.get(SamApiProvider._AUTH, {})
+        if not auth or disable_authorizer:
+            LOG.debug("Authorizer not found or disabled, returning early")
+            return
+
+        default_authorizer = auth.get(SamApiProvider._DEFAULT_AUTHORIZER)
+        if default_authorizer:
+            collector.set_default_authorizer(logical_id, default_authorizer)
+
+        self._extract_authorizers_from_props(logical_id, auth, collector, Route.API)
+
+    @staticmethod
+    def _extract_request_lambda_authorizer(
+        auth_name: str, function_name: str, prefix: str, properties: dict, event_type: str
+    ) -> LambdaAuthorizer:
+        """
+        Generates a request Lambda Authorizer from the given identity object
+
+        Parameters
+        ----------
+        auth_name: str
+            Name of the authorizer
+        function_name: str
+            Name of the Lambda function this authorizer uses
+        prefix: str
+            The prefix to prepend to identity sources
+        properties: dict
+            The authorizer properties that contains identity sources and authorizer specific properties
+        event_type: str
+            The type of API this is (API or HTTP API)
+
+        Returns
+        -------
+        LambdaAuthorizer
+            The request based Lambda Authorizer object
+        """
+        payload_version = properties.get(SamApiProvider._AUTHORIZER_PAYLOAD)
+
+        if payload_version is not None and not isinstance(payload_version, str):
+            raise InvalidSamDocumentException(
+                f"'{SamApiProvider._AUTHORIZER_PAYLOAD}' must be of type string for Lambda Authorizer '{auth_name}'."
+            )
+
+        if payload_version not in LambdaAuthorizer.PAYLOAD_VERSIONS and event_type == Route.HTTP:
+            raise InvalidSamDocumentException(
+                f"Lambda Authorizer '{auth_name}' must contain a valid "
+                f"'{SamApiProvider._AUTHORIZER_PAYLOAD}' for HTTP APIs."
+            )
+
+        simple_responses = properties.get(SamApiProvider._AUTH_SIMPLE_RESPONSES, False)
+        if simple_responses and payload_version == LambdaAuthorizer.PAYLOAD_V1:
+            raise InvalidSamDocumentException(
+                f"{SamApiProvider._AUTH_SIMPLE_RESPONSES} must be used with the 2.0 "
+                f"payload format version in Lambda Authorizer '{auth_name}'."
+            )
+
+        identity_sources = []
+        identity_object = properties.get(SamApiProvider._IDENTITY, {})
+
+        for query_string in identity_object.get(SamApiProvider._IDENTITY_QUERY, []):
+            identity_sources.append(f"{prefix}request.querystring.{query_string}")
+
+        for header in identity_object.get(SamApiProvider._IDENTITY_HEADERS, []):
+            identity_sources.append(f"{prefix}request.header.{header}")
+
+        # context and stageVariables do not have "method." for V1 APIGW
+        # but the V2 still expects "$"
+        prefix = SamApiProvider._HTTP_IDENTITY_SOURCE_PREFIX if event_type == Route.HTTP else ""
+
+        for context in identity_object.get(SamApiProvider._IDENTITY_CONTEXT, []):
+            identity_sources.append(f"{prefix}context.{context}")
+
+        for stage_variable in identity_object.get(SamApiProvider._IDENTITY_STAGE, []):
+            identity_sources.append(f"{prefix}stageVariables.{stage_variable}")
+
+        return LambdaAuthorizer(
+            payload_version=payload_version if payload_version else "1.0",
+            authorizer_name=auth_name,
+            type=LambdaAuthorizer.REQUEST,
+            lambda_name=function_name,
+            identity_sources=identity_sources,
+            use_simple_response=simple_responses,
+        )
+
+    @staticmethod
+    def _extract_token_lambda_authorizer(
+        auth_name: str, function_name: str, prefix: str, identity_object: dict
+    ) -> LambdaAuthorizer:
+        """
+        Generates a token Lambda Authorizer from the given identity object
+
+        Parameters
+        ----------
+        auth_name: str
+            Name of the authorizer
+        function_name: str
+            Name of the Lambda function this authorizer uses
+        prefix: str
+            The prefix to prepend to identity sources
+        identity_object: dict
+            The identity source object that contains the various identity sources
+
+        Returns
+        -------
+        LambdaAuthorizer
+            The token based Lambda Authorizer object
+        """
+        validation_expression = identity_object.get(SamApiProvider._VALIDATION_EXPRESSION)
+
+        header = identity_object.get(SamApiProvider._AUTH_HEADER, "Authorization")
+        header = f"{prefix}request.header.{header}"
+
+        return LambdaAuthorizer(
+            payload_version=LambdaAuthorizer.PAYLOAD_V1,
+            authorizer_name=auth_name,
+            type=LambdaAuthorizer.TOKEN,
+            lambda_name=function_name,
+            identity_sources=[header],
+            validation_string=validation_expression,
+        )
+
+    @staticmethod
+    def _extract_authorizers_from_props(logical_id: str, auth: dict, collector: ApiCollector, event_type: str) -> None:
+        """
+        Extracts Authorizers from the Auth properties section of Serverless resources
+
+        Parameters
+        ----------
+        logical_id: str
+            The logical ID of the Serverless resource
+        auth: dict
+            The Auth property dictionary
+        collector: ApiCollector
+            The Api Collector to send the Authorizers to
+        event_type: str
+            What kind of API this is (API, HTTP API)
+        """
+        prefix = (
+            SamApiProvider._API_IDENTITY_SOURCE_PREFIX
+            if event_type == Route.API
+            else SamApiProvider._HTTP_IDENTITY_SOURCE_PREFIX
+        )
+
+        authorizers: Dict[str, Authorizer] = {}
+
+        for auth_name, auth_props in auth.get(SamApiProvider._AUTHORIZERS, {}).items():
+            authorizer_type = auth_props.get(SamApiProvider._FUNCTION_TYPE, LambdaAuthorizer.TOKEN.upper())
+            identity_object = auth_props.get(SamApiProvider._IDENTITY, {})
+
+            function_arn = auth_props.get(SamApiProvider._FUNCTION_ARN)
+
+            if not function_arn:
+                LOG.debug("Authorizer '%s' is currently unsupported (must be a Lambda Authorizer), skipping", auth_name)
+                continue
+
+            function_name = LambdaUri.get_function_name(function_arn)
+
+            if not function_name:
+                LOG.warning("Unable to parse the Lambda ARN for Authorizer '%s', skipping", auth_name)
+                continue
+
+            if authorizer_type == LambdaAuthorizer.REQUEST.upper() or event_type == Route.HTTP:
+                authorizers[auth_name] = SamApiProvider._extract_request_lambda_authorizer(
+                    auth_name, function_name, prefix, auth_props, event_type
+                )
+            elif authorizer_type == LambdaAuthorizer.TOKEN.upper():
+                authorizers[auth_name] = SamApiProvider._extract_token_lambda_authorizer(
+                    auth_name, function_name, prefix, identity_object
+                )
+            else:
+                LOG.debug(
+                    "Authorizer '%s' is currently unsupported (not of type TOKEN or REQUEST), skipping", auth_name
+                )
+
+        collector.add_authorizers(logical_id, authorizers)
+
     def _extract_from_serverless_http(
-        self, stack_path: str, logical_id: str, api_resource: Dict, collector: ApiCollector, cwd: Optional[str] = None
+        self,
+        stack_path: str,
+        logical_id: str,
+        api_resource: Dict,
+        collector: ApiCollector,
+        cwd: Optional[str] = None,
+        disable_authorizer: Optional[bool] = False,
     ) -> None:
         """
         Extract APIs from AWS::Serverless::HttpApi resource by reading and parsing Swagger documents.
@@ -122,6 +359,8 @@ class SamApiProvider(CfnBaseApiProvider):
         cwd : str
             Optional working directory with respect to which we will resolve relative path to Swagger file
 
+        disable_authorizer : bool
+            Optional flag to disable the collection of lambda authorizers
         """
 
         properties = api_resource.get("Properties", {})
@@ -136,15 +375,40 @@ class SamApiProvider(CfnBaseApiProvider):
                 "Skipping resource '%s'. Swagger document not found in DefinitionBody and DefinitionUri", logical_id
             )
             return
+
         CfnBaseApiProvider.extract_swagger_route(
-            stack_path, logical_id, body, uri, None, collector, cwd=cwd, event_type=Route.HTTP
+            stack_path,
+            logical_id,
+            body,
+            uri,
+            None,
+            collector,
+            cwd=cwd,
+            event_type=Route.HTTP,
+            disable_authorizer=disable_authorizer,
         )
         collector.stage_name = stage_name
         collector.stage_variables = stage_variables
         collector.cors = cors
 
+        auth = properties.get(SamApiProvider._AUTH, {})
+        if not auth or disable_authorizer:
+            LOG.debug("authorizer not found or disabled, returning early")
+            return
+
+        default_authorizer = auth.get(SamApiProvider._DEFAULT_AUTHORIZER)
+        if default_authorizer:
+            collector.set_default_authorizer(logical_id, default_authorizer)
+
+        self._extract_authorizers_from_props(logical_id, auth, collector, Route.HTTP)
+
     def _extract_routes_from_function(
-        self, stack_path: str, logical_id: str, function_resource: Dict, collector: ApiCollector
+        self,
+        stack_path: str,
+        logical_id: str,
+        function_resource: Dict,
+        collector: ApiCollector,
+        disable_authorizer: Optional[bool] = False,
     ) -> None:
         """
         Fetches a list of routes configured for this SAM Function resource.
@@ -162,14 +426,24 @@ class SamApiProvider(CfnBaseApiProvider):
 
         collector: samcli.lib.providers.api_collector.ApiCollector
             Instance of the API collector that where we will save the API information
+
+        disable_authorizer : bool
+            Optional flag to disable the extraction of authorizers
         """
 
         resource_properties = function_resource.get("Properties", {})
         serverless_function_events = resource_properties.get(self._FUNCTION_EVENT, {})
-        self.extract_routes_from_events(stack_path, logical_id, serverless_function_events, collector)
+        self.extract_routes_from_events(
+            stack_path, logical_id, serverless_function_events, collector, disable_authorizer=disable_authorizer
+        )
 
     def extract_routes_from_events(
-        self, stack_path: str, function_logical_id: str, serverless_function_events: Dict, collector: ApiCollector
+        self,
+        stack_path: str,
+        function_logical_id: str,
+        serverless_function_events: Dict,
+        collector: ApiCollector,
+        disable_authorizer: Optional[bool] = False,
     ) -> None:
         """
         Given an AWS::Serverless::Function Event Dictionary, extract out all 'route' events and store  within the
@@ -188,13 +462,20 @@ class SamApiProvider(CfnBaseApiProvider):
 
         collector: samcli.lib.providers.api_collector.ApiCollector
             Instance of the Route collector that where we will save the route information
+
+        disable_authorizer : bool
+            Optional flag to disable extraction of authorizers
         """
         count = 0
         for _, event in serverless_function_events.items():
             event_type = event.get(self._EVENT_TYPE)
             if event_type in [self._EVENT_TYPE_API, self._EVENT_TYPE_HTTP_API]:
                 route_resource_id, route = self._convert_event_route(
-                    stack_path, function_logical_id, event.get("Properties"), event.get(SamApiProvider._EVENT_TYPE)
+                    stack_path,
+                    function_logical_id,
+                    event.get("Properties"),
+                    event.get(SamApiProvider._EVENT_TYPE),
+                    disable_authorizer=disable_authorizer,
                 )
                 collector.add_routes(route_resource_id, [route])
                 count += 1
@@ -203,7 +484,11 @@ class SamApiProvider(CfnBaseApiProvider):
 
     @staticmethod
     def _convert_event_route(
-        stack_path: str, lambda_logical_id: str, event_properties: Dict, event_type: str
+        stack_path: str,
+        lambda_logical_id: str,
+        event_properties: Dict,
+        event_type: str,
+        disable_authorizer: Optional[bool] = False,
     ) -> Tuple[str, Route]:
         """
         Converts a AWS::Serverless::Function's Event Property to an Route configuration usable by the provider.
@@ -212,6 +497,7 @@ class SamApiProvider(CfnBaseApiProvider):
         :param str lambda_logical_id: Logical Id of the AWS::Serverless::Function
         :param dict event_properties: Dictionary of the Event's Property
         :param event_type: The event type, 'Api' or 'HttpApi', see samcli/local/apigw/local_apigw_service.py:35
+        :param disable_authorizer: Optional flag to disable the extraction of authorizer
         :return tuple: tuple of route resource name and route
         """
         path = cast(str, event_properties.get(SamApiProvider._EVENT_PATH))
@@ -241,6 +527,15 @@ class SamApiProvider(CfnBaseApiProvider):
                 "It should either be a LogicalId string or a Ref of a Logical Id string".format(lambda_logical_id)
             )
 
+        use_default_authorizer = True
+
+        # Find Authorizer
+        authorizer_name = event_properties.get(SamApiProvider._AUTH, {}).get(SamApiProvider._AUTHORIZER, None)
+        if authorizer_name == "NONE" or disable_authorizer:
+            # do not use any authorizers
+            use_default_authorizer = False
+            authorizer_name = None
+
         return (
             api_resource_id,
             Route(
@@ -250,6 +545,8 @@ class SamApiProvider(CfnBaseApiProvider):
                 event_type=event_type,
                 payload_format_version=payload_format_version,
                 stack_path=stack_path,
+                authorizer_name=authorizer_name,
+                use_default_authorizer=use_default_authorizer,
             ),
         )
 
@@ -332,7 +629,7 @@ class SamApiProvider(CfnBaseApiProvider):
     @staticmethod
     def check_implicit_api_resource_ids(stacks: List[Stack]) -> None:
         for stack in stacks:
-            for logical_id in stack.resources:
+            for logical_id in stack.raw_resources:
                 if logical_id in (
                     SamApiProvider.IMPLICIT_API_RESOURCE_ID,
                     SamApiProvider.IMPLICIT_HTTP_API_RESOURCE_ID,

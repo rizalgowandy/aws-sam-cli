@@ -4,7 +4,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/thumbnails.zip
       Handler: index.generate_thumbails
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         ImageBucket:
           Type: S3
@@ -18,8 +18,8 @@ Resources:
   Images:
     Type: AWS::S3::Bucket
     Properties:
-       BucketName: "BucketNameParameter"
-       BucketEncryption:
-         ServerSideEncryptionConfiguration:
-           - ServerSideEncryptionByDefault:
-               SSEAlgorithm: AES256
+      BucketName: BucketNameParameter
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256

@@ -1,31 +1,30 @@
-import os
 from pathlib import Path
-from unittest import TestCase
+
+from tests.integration.deploy.deploy_integ_base import DeployIntegBase
+from tests.testing_utils import get_sam_command
 
 
-class DeleteIntegBase(TestCase):
+class DeleteIntegBase(DeployIntegBase):
     @classmethod
     def setUpClass(cls):
         cls.delete_test_data_path = Path(__file__).resolve().parents[1].joinpath("testdata", "delete")
-
-    def setUp(self):
-        super().setUp()
-
-    def tearDown(self):
-        super().tearDown()
-
-    def base_command(self):
-        command = "sam"
-        if os.getenv("SAM_CLI_DEV"):
-            command = "samdev"
-
-        return command
+        super().setUpClass()
 
     def get_delete_command_list(
-        self, stack_name=None, region=None, config_file=None, config_env=None, profile=None, no_prompts=None
+        self,
+        stack_name=None,
+        region=None,
+        config_file=None,
+        config_env=None,
+        profile=None,
+        no_prompts=None,
+        s3_bucket=None,
+        s3_prefix=None,
+        express=None,
     ):
-        command_list = [self.base_command(), "delete"]
+        command_list = [get_sam_command(), "delete"]
 
+        # Convert all values as string to make behaviour uniform across platforms
         if stack_name:
             command_list += ["--stack-name", str(stack_name)]
         if region:
@@ -38,5 +37,13 @@ class DeleteIntegBase(TestCase):
             command_list += ["--profile", str(profile)]
         if no_prompts:
             command_list += ["--no-prompts"]
+        if s3_bucket:
+            command_list += ["--s3-bucket", str(s3_bucket)]
+        if s3_prefix:
+            command_list += ["--s3-prefix", str(s3_prefix)]
+        if express is True:
+            command_list += ["--express"]
+        elif express is False:
+            command_list += ["--no-express"]
 
         return command_list

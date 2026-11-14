@@ -4,12 +4,27 @@ Represents Lambda Build Containers.
 
 import json
 import logging
+import os
 import pathlib
+from typing import List
+from uuid import uuid4
 
 from samcli.commands._utils.experimental import get_enabled_experimental_flags
+from samcli.commands.exceptions import UserException
+from samcli.lib.build.utils import valid_architecture
+from samcli.lib.utils.architecture import ARM64, X86_64
+from samcli.lib.utils.lambda_builders import patch_runtime
 from samcli.local.docker.container import Container
 
 LOG = logging.getLogger(__name__)
+
+
+class InvalidArchitectureForImage(UserException):
+    """
+    Raised when architecture that is provided for the image is invalid
+    """
+
+    pass
 
 
 class LambdaBuildContainer(Container):
@@ -33,6 +48,7 @@ class LambdaBuildContainer(Container):
         manifest_path,
         runtime,
         architecture,
+        specified_workflow=None,
         optimizations=None,
         options=None,
         executable_search_paths=None,
@@ -41,6 +57,10 @@ class LambdaBuildContainer(Container):
         env_vars=None,
         image=None,
         is_building_layer=False,
+        build_in_source=None,
+        mount_with_write: bool = False,
+        build_dir=None,
+        mount_symlinks=False,
     ):
         abs_manifest_path = pathlib.Path(manifest_path).resolve()
         manifest_file_name = abs_manifest_path.name
@@ -48,7 +68,7 @@ class LambdaBuildContainer(Container):
 
         source_dir = str(pathlib.Path(source_dir).resolve())
 
-        container_dirs = LambdaBuildContainer._get_container_dirs(source_dir, manifest_dir)
+        container_dirs = LambdaBuildContainer.get_container_dirs(source_dir, manifest_dir)
         env_vars = env_vars if env_vars else {}
 
         # `executable_search_paths` are provided as a list of paths on the host file system that needs to passed to
@@ -78,18 +98,28 @@ class LambdaBuildContainer(Container):
             mode,
             architecture,
             is_building_layer,
+            build_in_source,
         )
 
         if image is None:
-            image = LambdaBuildContainer._get_image(runtime, architecture)
+            # use specified_workflow to get image if exists, otherwise use runtime
+            runtime_to_get_image = specified_workflow if specified_workflow else runtime
+            image = LambdaBuildContainer._get_image(runtime_to_get_image, architecture)
         entry = LambdaBuildContainer._get_entrypoint(request_json)
-        cmd = []
+        cmd: List[str] = []
 
+        mount_mode = "rw" if mount_with_write else "ro"
         additional_volumes = {
             # Manifest is mounted separately in order to support the case where manifest
             # is outside of source directory
-            manifest_dir: {"bind": container_dirs["manifest_dir"], "mode": "ro"}
+            manifest_dir: {"bind": container_dirs["manifest_dir"], "mode": mount_mode}
         }
+
+        host_tmp_dir = None
+        if mount_with_write and build_dir:
+            # Mounting tmp dir on the host as ``/tmp/samcli`` on container, which gives current user write permissions
+            host_tmp_dir = os.path.join(build_dir, f"tmp-{uuid4().hex}")
+            additional_volumes.update({host_tmp_dir: {"bind": container_dirs["base_dir"], "mode": mount_mode}})
 
         if log_level:
             env_vars["LAMBDA_BUILDERS_LOG_LEVEL"] = log_level
@@ -102,6 +132,9 @@ class LambdaBuildContainer(Container):
             additional_volumes=additional_volumes,
             entrypoint=entry,
             env_vars=env_vars,
+            mount_with_write=mount_with_write,
+            host_tmp_dir=host_tmp_dir,
+            mount_symlinks=mount_symlinks,
         )
 
     @property
@@ -123,9 +156,9 @@ class LambdaBuildContainer(Container):
         mode,
         architecture,
         is_building_layer,
+        build_in_source,
     ):
-
-        runtime = runtime.replace(".al2", "")
+        runtime = patch_runtime(runtime)
 
         return json.dumps(
             {
@@ -152,6 +185,7 @@ class LambdaBuildContainer(Container):
                     "architecture": architecture,
                     "is_building_layer": is_building_layer,
                     "experimental_flags": get_enabled_experimental_flags(),
+                    "build_in_source": build_in_source,
                 },
             }
         )
@@ -161,7 +195,7 @@ class LambdaBuildContainer(Container):
         return [LambdaBuildContainer._BUILDERS_EXECUTABLE, request_json]
 
     @staticmethod
-    def _get_container_dirs(source_dir, manifest_dir):
+    def get_container_dirs(source_dir, manifest_dir):
         """
         Provides paths to directories within the container that is required by the builder
 
@@ -180,6 +214,7 @@ class LambdaBuildContainer(Container):
         """
         base = "/tmp/samcli"
         result = {
+            "base_dir": base,
             "source_dir": "{}/source".format(base),
             "artifacts_dir": "{}/artifacts".format(base),
             "scratch_dir": "{}/scratch".format(base),
@@ -276,4 +311,8 @@ class LambdaBuildContainer(Container):
         str
             Image tag
         """
+        if not valid_architecture(architecture):
+            raise InvalidArchitectureForImage(
+                f"'{architecture}' is not a valid architecture, it should be either '{X86_64}' or '{ARM64}'"
+            )
         return f"{LambdaBuildContainer._IMAGE_TAG}-{architecture}"

@@ -1,26 +1,36 @@
 """
 Provides methods to generate and send metrics
 """
-from timeit import default_timer
-from functools import wraps, reduce
 
-import uuid
-import platform
 import logging
-from typing import Optional
+import os
+import platform
+import uuid
+from dataclasses import dataclass
+from functools import reduce, wraps
+from pathlib import Path
+from timeit import default_timer
+from typing import Any, Dict, Optional
 
 import click
 
 from samcli import __version__ as samcli_version
 from samcli.cli.context import Context
 from samcli.cli.global_config import GlobalConfig
-from samcli.lib.warnings.sam_cli_warning import TemplateWarningsChecker
-from samcli.commands.exceptions import UserException
-from samcli.lib.telemetry.cicd import CICDDetector, CICDPlatform
 from samcli.commands._utils.experimental import get_all_experimental_statues
-from .telemetry import Telemetry
-from ..iac.cdk.utils import is_cdk_project
-from ..iac.plugins_interfaces import ProjectTypes
+from samcli.commands.exceptions import UnhandledException, UserException
+from samcli.lib.hook.exceptions import InvalidHookPackageConfigException
+from samcli.lib.hook.hook_config import HookPackageConfig
+from samcli.lib.hook.hook_wrapper import INTERNAL_PACKAGES_ROOT
+from samcli.lib.hook.utils import get_hook_metadata
+from samcli.lib.iac.cdk.utils import is_cdk_project
+from samcli.lib.iac.plugins_interfaces import ProjectTypes
+from samcli.lib.telemetry.cicd import CICDDetector, CICDPlatform
+from samcli.lib.telemetry.event import EventTracker
+from samcli.lib.telemetry.project_metadata import get_git_remote_origin_url, get_initial_commit_hash, get_project_name
+from samcli.lib.telemetry.telemetry import Telemetry
+from samcli.lib.telemetry.user_agent import get_user_agent_string
+from samcli.lib.warnings.sam_cli_warning import TemplateWarningsChecker
 
 LOG = logging.getLogger(__name__)
 
@@ -32,7 +42,18 @@ This creates a versatile telemetry tracking no matter where in the code. Somethi
 No side effect will result in this as it is write-only for code outside of telemetry.
 Decorators should be used to minimize logic involving telemetry.
 """
-_METRICS = dict()
+_METRICS: Dict[str, "Metric"] = dict()
+
+# Global container socket and runtime information for telemetry
+# This persists across context boundaries to ensure accurate telemetry reporting
+_CONTAINER_RUNTIME_INFO: Dict[str, Optional[str]] = {"container_socket_path": None, "admin_preference": None}
+
+
+@dataclass
+class ProjectDetails:
+    project_type: str
+    hook_name: Optional[str]
+    hook_package_version: Optional[str]
 
 
 def send_installed_metric():
@@ -108,66 +129,155 @@ def track_command(func):
 
     """
 
+    @wraps(func)
     def wrapped(*args, **kwargs):
-        telemetry = Telemetry()
-
         exception = None
         return_value = None
         exit_reason = "success"
         exit_code = 0
 
         duration_fn = _timer()
-        try:
 
-            # Execute the function and capture return value. This is returned back by the wrapper
+        ctx = None
+        try:
+            # we have get_current_context in it's own try/except to catch the RuntimeError for this and not func()
+            ctx = Context.get_current_context()
+        except RuntimeError:
+            LOG.debug("Unable to find Click Context for getting session_id.")
+
+        try:
+            if ctx and ctx.exception:
+                # re-raise here to handle exception captured in context and not run func()
+                raise ctx.exception
+
+            # Execute the function and capture return value. This is returned by the wrapper
             # First argument of all commands should be the Context
             return_value = func(*args, **kwargs)
-
-        except UserException as ex:
-            # Capture exception information and re-raise it later so we can first send metrics.
+        except (
+            UserException,
+            click.Abort,
+            click.BadOptionUsage,
+            click.BadArgumentUsage,
+            click.BadParameter,
+            click.UsageError,
+        ) as ex:
+            # Capture exception information and re-raise it later,
+            # so metrics can be sent.
             exception = ex
-            exit_code = ex.exit_code
-            if ex.wrapped_from is None:
-                exit_reason = type(ex).__name__
-            else:
+            # NOTE(sriram-mv): Set exit code to 1 if deemed to be user fixable error.
+            exit_code = 1
+            if hasattr(ex, "wrapped_from") and ex.wrapped_from:
                 exit_reason = ex.wrapped_from
-
+            else:
+                exit_reason = type(ex).__name__
         except Exception as ex:
-            exception = ex
+            command = ctx.command_path if ctx else ""
+            exception = UnhandledException(command, ex)
             # Standard Unix practice to return exit code 255 on fatal/unhandled exit.
             exit_code = 255
             exit_reason = type(ex).__name__
 
-        try:
-            ctx = Context.get_current_context()
-            metric_specific_attributes = get_all_experimental_statues() if ctx.experimental else {}
+        if ctx:
+            time = duration_fn()
+
             try:
-                template_dict = ctx.template_dict
-                project_type = ProjectTypes.CDK.value if is_cdk_project(template_dict) else ProjectTypes.CFN.value
-                metric_specific_attributes["projectType"] = project_type
-            except AttributeError:
-                LOG.debug("Template is not provided in context, skip adding project type metric")
-            metric_name = "commandRunExperimental" if ctx.experimental else "commandRun"
-            metric = Metric(metric_name)
-            metric.add_data("awsProfileProvided", bool(ctx.profile))
-            metric.add_data("debugFlagProvided", bool(ctx.debug))
-            metric.add_data("region", ctx.region or "")
-            metric.add_data("commandName", ctx.command_path)  # Full command path. ex: sam local start-api
-            if metric_specific_attributes:
-                metric.add_data("metricSpecificAttributes", metric_specific_attributes)
-            # Metric about command's execution characteristics
-            metric.add_data("duration", duration_fn())
-            metric.add_data("exitReason", exit_reason)
-            metric.add_data("exitCode", exit_code)
-            telemetry.emit(metric)
-        except RuntimeError:
-            LOG.debug("Unable to find Click Context for getting session_id.")
+                # metrics also contain a call to Context.get_current_context, catch RuntimeError
+                _send_command_run_metrics(ctx, time, exit_reason, exit_code, **kwargs)
+            except RuntimeError:
+                LOG.debug("Unable to find Click context when sending metrics to telemetry")
+
         if exception:
             raise exception  # pylint: disable=raising-bad-type
 
         return return_value
 
     return wrapped
+
+
+def _send_command_run_metrics(ctx: Context, duration: int, exit_reason: str, exit_code: int, **kwargs) -> None:
+    """
+    Emits metrics based on the results of a command run
+
+    Parameters
+    ----------
+    ctx: Context
+        The click context containing parameters, options, etc
+    duration: int
+        The total run time of the command in milliseconds
+    exit_reason: str
+        The exit reason from the command, "success" if successful, otherwise name of exception
+    exit_code: int
+        The exit code of command run
+    """
+    telemetry = Telemetry()
+
+    # get_all_experimental_statues() returns Dict[str, bool]
+    # since we append other values here (not just bool), need to explicitly set type
+    metric_specific_attributes: Dict[str, Any] = get_all_experimental_statues() if ctx.experimental else {}
+
+    try:
+        template_dict = ctx.template_dict
+        project_details = _get_project_details(kwargs.get("hook_name", ""), template_dict)
+        if project_details.project_type == ProjectTypes.CDK.value:
+            EventTracker.track_event("UsedFeature", "CDK")
+        metric_specific_attributes["projectType"] = project_details.project_type
+        if project_details.hook_name:
+            metric_specific_attributes["hookPackageId"] = project_details.hook_name
+        if project_details.hook_package_version:
+            metric_specific_attributes["hookPackageVersion"] = project_details.hook_package_version
+    except AttributeError:
+        LOG.debug("Template is not provided in context, skip adding project type metric")
+
+    metric_name = "commandRunExperimental" if ctx.experimental else "commandRun"
+    metric = Metric(metric_name)
+    metric.add_data("awsProfileProvided", bool(ctx.profile))
+    metric.add_data("debugFlagProvided", bool(ctx.debug))
+    metric.add_data("region", ctx.region or "")
+    metric.add_data("commandName", ctx.command_path)  # Full command path. ex: sam local start-api
+
+    if not ctx.command_path.endswith("init") or ctx.command_path.endswith("pipeline init"):
+        # Project metadata
+        # We don't capture below usage attributes for sam init as the command is not run inside a project
+        metric_specific_attributes["gitOrigin"] = get_git_remote_origin_url()
+        metric_specific_attributes["projectName"] = get_project_name()
+        metric_specific_attributes["initialCommit"] = get_initial_commit_hash()
+
+    # Add container engine information for all command runs
+    metric_specific_attributes["containerEngine"] = metric._get_container_host()
+
+    # Add admin container preference from global storage (set by container client factory)
+    metric_specific_attributes["adminContainerPreference"] = metric._get_container_admin_preference()
+
+    # Add function fields usage if available in context
+    if hasattr(ctx, "function_fields_used"):
+        metric_specific_attributes["functionFieldsUsed"] = ctx.function_fields_used
+
+    metric.add_data("metricSpecificAttributes", metric_specific_attributes)
+    # Metric about command's execution characteristics
+    metric.add_data("duration", duration)
+    metric.add_data("exitReason", exit_reason)
+    metric.add_data("exitCode", exit_code)
+    EventTracker.send_events()  # Sends Event metrics to Telemetry before commandRun metrics
+    telemetry.emit(metric)
+
+
+def _get_project_details(hook_name: str, template_dict: Dict) -> ProjectDetails:
+    if not hook_name:
+        hook_metadata = get_hook_metadata(template_dict)
+        if not hook_metadata:
+            project_type = ProjectTypes.CDK.value if is_cdk_project(template_dict) else ProjectTypes.CFN.value
+            return ProjectDetails(project_type=project_type, hook_name=None, hook_package_version=None)
+        hook_name = str(hook_metadata.get("HookName"))
+    hook_location = Path(INTERNAL_PACKAGES_ROOT, hook_name)
+    try:
+        hook_package_config = HookPackageConfig(package_dir=hook_location)
+    except InvalidHookPackageConfigException:
+        return ProjectDetails(project_type=hook_name, hook_name=hook_name, hook_package_version=None)
+    return ProjectDetails(
+        project_type=hook_package_config.iac_framework,
+        hook_name=hook_package_config.name,
+        hook_package_version=hook_package_config.version,
+    )
 
 
 def _timer():
@@ -301,6 +411,37 @@ def emit_all_metrics():
         emit_metric(key)
 
 
+def set_container_socket_host_telemetry(
+    container_socket_path: Optional[str] = None, admin_preference: Optional[str] = None
+):
+    """
+    Set container socket path and admin preference for telemetry collection.
+
+    This function stores container socket information globally to ensure it persists
+    across context boundaries and is available during telemetry collection.
+
+    Args:
+        container_socket_path: The socket path being used (e.g., "unix:///var/run/docker.sock", "unix://~/.finch/finch.sock")
+        admin_preference: The administrator's container preference (e.g., "finch", "docker", None)
+    """
+    if container_socket_path is not None:
+        _CONTAINER_RUNTIME_INFO["container_socket_path"] = container_socket_path
+        LOG.debug(f"Set global container socket path: container_socket_path={container_socket_path}")
+    if admin_preference is not None:
+        _CONTAINER_RUNTIME_INFO["admin_preference"] = admin_preference
+        LOG.debug(f"Set global container runtime info: admin_preference={admin_preference}")
+
+
+def get_container_runtime_telemetry_info() -> Dict[str, Optional[str]]:
+    """
+    Get container socket path and runtime information for telemetry collection.
+
+    Returns:
+        Dict containing container_socket_path and admin_preference
+    """
+    return _CONTAINER_RUNTIME_INFO
+
+
 class Metric:
     """
     Metric class to store metric data and adding common attributes
@@ -344,6 +485,11 @@ class Metric:
         self._data["ci"] = bool(self._cicd_detector.platform())
         self._data["pyversion"] = platform.python_version()
         self._data["samcliVersion"] = samcli_version
+        self._data["osPlatform"] = platform.system()
+
+        user_agent = get_user_agent_string()
+        if user_agent:
+            self._data["userAgent"] = user_agent
 
     @staticmethod
     def _default_session_id() -> Optional[str]:
@@ -376,6 +522,92 @@ class Metric:
         if cicd_platform:
             return cicd_platform.name
         return "CLI"
+
+    def _get_container_host(self) -> str:
+        """
+        Returns the container engine being used with socket path detection:
+        1. Check global container socket path (set by container client factory)
+        2. Otherwise, fall back to DOCKER_HOST environment variable detection (for custom configurations)
+        """
+        # First, check global container socket path (set by container client factory)
+        global_runtime_info = get_container_runtime_telemetry_info()
+        if global_runtime_info["container_socket_path"]:
+            LOG.debug(f"Using global container socket path: {global_runtime_info['container_socket_path']}")
+            return self._get_container_engine_from_socket_path(global_runtime_info["container_socket_path"])
+
+        # Fall back to environment variable detection for custom DOCKER_HOST configurations
+        docker_host = os.environ.get("DOCKER_HOST", "")
+        LOG.debug(f"No container socket path in global storage, falling back to DOCKER_HOST detection: {docker_host}")
+        return self._get_container_engine_from_socket_path(docker_host)
+
+    def _get_container_engine_from_socket_path(self, socket_path: str) -> str:
+        """
+        Detect container engine from socket path.
+        This handles detection for any socket path, whether from stored telemetry or environment.
+
+        Translation:
+            Value                                          Final Value
+
+            # Case 1: Empty/None
+            - ""                                        -> docker-default
+
+            # Case 2: Check Path-specific
+            - unix://~/.colima/default/docker.sock	    -> colima
+            - unix://~/.lima/default/sock/docker.sock   -> lima
+            - unix://~/.rd/docker.sock                  -> rancher-desktop
+            - unix://~/.orbstack/run/docker.sock        -> orbstack
+
+            # Case 3: Check Socket value
+            - unix://~/.finch/finch.sock	            -> finch
+            - unix:///var/run/docker.sock	            -> docker
+            - unix:///run/user/1000/podman/podman.sock  -> podman
+
+            # Case 4: Check TCP
+            - tcp://localhost:2375	                    -> tcp-local
+            - tcp://localhost:2376	                    -> tcp-local
+            - tcp://host.docker.internal:*	            -> tcp-remote
+
+            # Case 5: Other
+            - other value	                            -> unknown
+        """
+        if not socket_path:
+            return "docker-default"
+
+        socket_path_lower = socket_path.lower()
+
+        # Path-specific mappings (checked first for specificity)
+        path_map = {".colima/": "colima", ".lima/": "lima", ".orbstack/": "orbstack", ".rd/": "rancher-desktop"}
+
+        # Check path-specific patterns first
+        for path, engine in path_map.items():
+            if path in socket_path_lower and socket_path_lower.endswith("docker.sock"):
+                return engine
+
+        # Socket mappings
+        socket_map = {"docker.sock": "docker", "finch.sock": "finch", "podman.sock": "podman"}
+
+        # Check socket patterns
+        for sock, engine in socket_map.items():
+            if socket_path_lower.endswith(sock):
+                return engine
+
+        # TCP patterns
+        if socket_path_lower.startswith("tcp://"):
+            local_hosts = ["localhost:", "127.0.0.1:"]
+            is_local = any(host in socket_path_lower for host in local_hosts)
+            return "tcp-local" if is_local else "tcp-remote"
+
+        return "unknown"
+
+    def _get_container_admin_preference(self) -> Optional[str]:
+        """
+        Get the administrator's container preference from global storage.
+
+        Returns:
+            Optional[str]: Admin preference value ("finch", "docker", "other", or None)
+        """
+        global_runtime_info = get_container_runtime_telemetry_info()
+        return global_runtime_info["admin_preference"]
 
 
 class MetricDataNotList(Exception):

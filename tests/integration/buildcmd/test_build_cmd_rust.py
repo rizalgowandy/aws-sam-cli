@@ -1,0 +1,68 @@
+"""
+Integration test cases for `sam build` for Rust (cargo-lambda)
+"""
+
+import logging
+from unittest import skipIf
+
+import pytest
+from parameterized import parameterized
+
+from tests.testing_utils import (
+    IS_WINDOWS,
+    RUNNING_ON_CI,
+    CI_OVERRIDE,
+    SKIP_DOCKER_TESTS,
+    SKIP_DOCKER_BUILD,
+    SKIP_DOCKER_MESSAGE,
+)
+from tests.integration.buildcmd.build_integ_base import (
+    BuildIntegRustBase,
+    rust_parameterized_class,
+    show_container_in_test_name,
+)
+
+LOG = logging.getLogger(__name__)
+
+
+@skipIf(
+    ((IS_WINDOWS and RUNNING_ON_CI) and not CI_OVERRIDE),
+    "Skip build tests on windows when running in CI unless overridden",
+)
+@rust_parameterized_class
+class TestBuildCommand_Rust(BuildIntegRustBase):
+    @parameterized.expand(
+        [
+            ("provided.al2", "x86_64", None, False),
+            ("provided.al2", "x86_64", "debug", False),
+            ("provided.al2023", "x86_64", None, False),
+            ("provided.al2023", "x86_64", "debug", False),
+        ],
+        name_func=show_container_in_test_name,
+    )
+    def test_build(self, runtime, architecture, build_mode, use_container):
+        self._test_with_rust_cargo_lambda(
+            runtime=runtime,
+            code_uri=self.code_uri,
+            binary=self.binary,
+            architecture=architecture,
+            build_mode=build_mode,
+            expected_invoke_result=self.expected_invoke_result,
+            use_container=use_container,
+        )
+
+    @pytest.mark.tier1_extra
+    def test_tier1_rust_build(self):
+        """Single Rust build test for cross-platform validation.
+        Note: Rust/cargo-lambda does not support --use-container builds
+        (the build container doesn't have cargo installed).
+        """
+        self._test_with_rust_cargo_lambda(
+            runtime="provided.al2023",
+            code_uri=self.code_uri,
+            binary=self.binary,
+            architecture="x86_64",
+            build_mode=None,
+            expected_invoke_result=self.expected_invoke_result,
+            use_container=False,
+        )

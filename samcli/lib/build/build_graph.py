@@ -6,22 +6,25 @@ import copy
 import logging
 import os
 import threading
-from pathlib import Path
-from typing import Sequence, Tuple, List, Any, Optional, Dict, cast, NamedTuple
+from abc import abstractmethod
 from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
 from uuid import uuid4
 
 import tomlkit
+from tomlkit.toml_document import TOMLDocument
 
+from samcli.commands._utils.experimental import ExperimentalFlag, is_experimental_enabled
 from samcli.lib.build.exceptions import InvalidBuildGraphException
-from samcli.lib.providers.provider import Function, LayerVersion
+from samcli.lib.providers.provider import BuildableFunction, LayerVersion, MicrovmImage, get_build_entry_point
 from samcli.lib.samlib.resource_metadata_normalizer import (
-    SAM_RESOURCE_ID_KEY,
     SAM_IS_NORMALIZED,
+    SAM_RESOURCE_ID_KEY,
 )
-from samcli.lib.utils.packagetype import ZIP
 from samcli.lib.utils.architecture import X86_64
-
+from samcli.lib.utils.packagetype import ZIP
+from samcli.lib.utils.resources import AWS_SERVERLESS_FUNCTION
 
 LOG = logging.getLogger(__name__)
 
@@ -44,6 +47,11 @@ COMPATIBLE_RUNTIMES_FIELD = "compatible_runtimes"
 LAYER_FIELD = "layer"
 ARCHITECTURE_FIELD = "architecture"
 HANDLER_FIELD = "handler"
+RESOURCE_TYPE_FIELD = "resource_type"
+SHARED_CODEURI_SUFFIX = "Shared"
+
+# Compiled runtimes that we need to compare handlers for
+COMPILED_RUNTIMES = ["go1.x"]
 
 
 def _function_build_definition_to_toml_table(
@@ -78,6 +86,9 @@ def _function_build_definition_to_toml_table(
         toml_table[METADATA_FIELD] = function_build_definition.metadata
     if function_build_definition.env_vars:
         toml_table[ENV_VARS_FIELD] = function_build_definition.env_vars
+    # Only written for Web Functions, so existing build.toml files don't change
+    if function_build_definition.resource_type != AWS_SERVERLESS_FUNCTION:
+        toml_table[RESOURCE_TYPE_FIELD] = function_build_definition.resource_type
 
     return toml_table
 
@@ -101,6 +112,7 @@ def _toml_table_to_function_build_definition(uuid: str, toml_table: tomlkit.api.
     function_build_definition = FunctionBuildDefinition(
         toml_table.get(RUNTIME_FIELD),
         toml_table.get(CODE_URI_FIELD),
+        None,
         toml_table.get(PACKAGETYPE_FIELD, ZIP),
         toml_table.get(ARCHITECTURE_FIELD, X86_64),
         dict(toml_table.get(METADATA_FIELD, {})),
@@ -108,6 +120,7 @@ def _toml_table_to_function_build_definition(uuid: str, toml_table: tomlkit.api.
         toml_table.get(SOURCE_HASH_FIELD, ""),
         toml_table.get(MANIFEST_HASH_FIELD, ""),
         dict(toml_table.get(ENV_VARS_FIELD, {})),
+        toml_table.get(RESOURCE_TYPE_FIELD, AWS_SERVERLESS_FUNCTION),
     )
     function_build_definition.uuid = uuid
     return function_build_definition
@@ -160,7 +173,7 @@ def _toml_table_to_layer_build_definition(uuid: str, toml_table: tomlkit.api.Tab
         LayerBuildDefinition of given toml table
     """
     layer_build_definition = LayerBuildDefinition(
-        toml_table.get(LAYER_NAME_FIELD),
+        toml_table.get(LAYER_NAME_FIELD, ""),
         toml_table.get(CODE_URI_FIELD),
         toml_table.get(BUILD_METHOD_FIELD),
         toml_table.get(COMPATIBLE_RUNTIMES_FIELD),
@@ -199,6 +212,7 @@ class BuildGraph:
         self._filepath = Path(build_dir).parent.joinpath(DEFAULT_BUILD_GRAPH_FILE_NAME)
         self._function_build_definitions: List["FunctionBuildDefinition"] = []
         self._layer_build_definitions: List["LayerBuildDefinition"] = []
+        self._microvm_image_build_definitions: List["MicrovmImageBuildDefinition"] = []
         self._atomic_read()
 
     def get_function_build_definitions(self) -> Tuple["FunctionBuildDefinition", ...]:
@@ -206,6 +220,9 @@ class BuildGraph:
 
     def get_layer_build_definitions(self) -> Tuple["LayerBuildDefinition", ...]:
         return tuple(self._layer_build_definitions)
+
+    def get_microvm_image_build_definitions(self) -> Tuple["MicrovmImageBuildDefinition", ...]:
+        return tuple(self._microvm_image_build_definitions)
 
     def get_function_build_definition_with_full_path(
         self, function_full_path: str
@@ -231,7 +248,7 @@ class BuildGraph:
         return None
 
     def put_function_build_definition(
-        self, function_build_definition: "FunctionBuildDefinition", function: Function
+        self, function_build_definition: "FunctionBuildDefinition", function: BuildableFunction
     ) -> None:
         """
         Puts the newly read function build definition into existing build graph.
@@ -244,7 +261,7 @@ class BuildGraph:
         ----------
         function_build_definition: FunctionBuildDefinition
             function build definition which is newly read from template.yaml file
-        function: Function
+        function: BuildableFunction
             function details for this function build definition
         """
         if function_build_definition in self._function_build_definitions:
@@ -302,10 +319,33 @@ class BuildGraph:
             layer_build_definition.layer = layer
             self._layer_build_definitions.append(layer_build_definition)
 
+    def put_microvm_image_build_definition(
+        self, microvm_image_build_definition: "MicrovmImageBuildDefinition", microvm_image: MicrovmImage
+    ) -> None:
+        """
+        Puts the newly read MicroVM image build definition into existing build graph.
+
+        Unlike Function/Layer, MicrovmImage definitions are not persisted to build.toml (Docker has its own
+        layer cache), so there are no pre-existing definitions to match against. Each definition is always new.
+
+        Parameters
+        ----------
+        microvm_image_build_definition: MicrovmImageBuildDefinition
+            MicroVM image build definition which is newly read from template.yaml file
+        microvm_image: MicrovmImage
+            MicroVM image details for this build definition
+        """
+        microvm_image_build_definition.add_microvm_image(microvm_image)
+        self._microvm_image_build_definitions.append(microvm_image_build_definition)
+
     def clean_redundant_definitions_and_update(self, persist: bool) -> None:
         """
         Removes build definitions which doesn't have any function in it, which means these build definitions
         are no longer used, and they can be deleted
+
+        Note: MicrovmImage build definitions are intentionally not cleaned up here. Unlike Function/Layer,
+        they are never read from build.toml, so every put_microvm_image_build_definition() call always
+        sets microvm_image before appending -- there is no code path that produces an empty definition.
 
         If persist parameter is given True, build graph is written to .aws-sam/build.toml file
         """
@@ -368,7 +408,6 @@ class BuildGraph:
         """
         Helper to write source_hash values to build.toml file
         """
-        document = {}
         if not self._filepath.exists():
             open(self._filepath, "a+").close()  # pylint: disable=consider-using-with
 
@@ -376,7 +415,7 @@ class BuildGraph:
         # .loads() returns a TOMLDocument,
         # and it behaves like a standard dictionary according to https://github.com/sdispater/tomlkit.
         # in tomlkit 0.7.2, the types are broken (tomlkit#128, #130, #134) so here we convert it to Dict.
-        document = cast(Dict, tomlkit.loads(txt))
+        document = cast(Dict[str, Dict[str, Any]], tomlkit.loads(txt))
 
         for function_uuid, hashing_info in function_content.items():
             if function_uuid in document.get(BuildGraph.FUNCTION_BUILD_DEFINITIONS, {}):
@@ -394,7 +433,7 @@ class BuildGraph:
                 layer_build_definition[MANIFEST_HASH_FIELD] = hashing_info.manifest_hash
                 LOG.info("Updated source_hash and manifest_hash field in build.toml for layer with UUID %s", layer_uuid)
 
-        self._filepath.write_text(tomlkit.dumps(document))  # type: ignore
+        self._filepath.write_text(tomlkit.dumps(cast(TOMLDocument, document)))
 
     def _read(self) -> None:
         """
@@ -501,6 +540,10 @@ class AbstractBuildDefinition:
     def env_vars(self) -> Dict:
         return deepcopy(self._env_vars)
 
+    @abstractmethod
+    def get_resource_full_paths(self) -> str:
+        """Returns string representation of resources' full path information for this build definition"""
+
 
 class LayerBuildDefinition(AbstractBuildDefinition):
     """
@@ -526,6 +569,12 @@ class LayerBuildDefinition(AbstractBuildDefinition):
         # Note(xinhol): In our code, we assume "layer" is never None. We should refactor
         # this and move "layer" out of LayerBuildDefinition to take advantage of type check.
         self.layer: LayerVersion = None  # type: ignore
+
+    def get_resource_full_paths(self) -> str:
+        if not self.layer:
+            LOG.debug("LayerBuildDefinition with uuid (%s) doesn't have a layer assigned to it", self.uuid)
+            return ""
+        return self.layer.full_path
 
     def __str__(self) -> str:
         return (
@@ -562,13 +611,14 @@ class LayerBuildDefinition(AbstractBuildDefinition):
 
 class FunctionBuildDefinition(AbstractBuildDefinition):
     """
-    LayerBuildDefinition holds information about each unique function build
+    FunctionBuildDefinition holds information about each unique function build
     """
 
     def __init__(
         self,
         runtime: Optional[str],
         codeuri: Optional[str],
+        imageuri: Optional[str],
         packagetype: str,
         architecture: str,
         metadata: Optional[Dict],
@@ -576,12 +626,16 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
         source_hash: str = "",
         manifest_hash: str = "",
         env_vars: Optional[Dict] = None,
+        resource_type: str = AWS_SERVERLESS_FUNCTION,
     ) -> None:
         super().__init__(source_hash, manifest_hash, env_vars, architecture)
         self.runtime = runtime
         self.codeuri = codeuri
+        self.imageuri = imageuri
         self.packagetype = packagetype
         self.handler = handler
+        # Web Functions keep their dependencies (no layers), so they never share a build with Lambda functions
+        self.resource_type = resource_type
 
         # Skip SAM Added metadata properties
         metadata_copied = deepcopy(metadata) if metadata else {}
@@ -589,9 +643,9 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
         metadata_copied.pop(SAM_IS_NORMALIZED, "")
         self.metadata = metadata_copied
 
-        self.functions: List[Function] = []
+        self.functions: List[BuildableFunction] = []
 
-    def add_function(self, function: Function) -> None:
+    def add_function(self, function: BuildableFunction) -> None:
         self.functions.append(function)
 
     def get_function_name(self) -> str:
@@ -600,7 +654,7 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
 
     def get_handler_name(self) -> Optional[str]:
         self._validate_functions()
-        return self.functions[0].handler
+        return get_build_entry_point(self.functions[0])
 
     def get_full_path(self) -> str:
         """
@@ -614,17 +668,30 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
         Return the directory path relative to root build directory
         """
         self._validate_functions()
-        return self.functions[0].get_build_dir(artifact_root_dir)
+        build_dir = self.functions[0].get_build_dir(artifact_root_dir)
+        if is_experimental_enabled(ExperimentalFlag.BuildPerformance) and len(self.functions) > 1:
+            # If there are multiple functions with the same build definition,
+            # just put them into one single shared artifacts directory.
+            build_dir = f"{build_dir}-{SHARED_CODEURI_SUFFIX}"
+        return build_dir
+
+    def get_resource_full_paths(self) -> str:
+        """Returns list of functions' full path information as a list of str"""
+        return ", ".join([function.full_path for function in self.functions])
 
     def _validate_functions(self) -> None:
         if not self.functions:
             raise InvalidBuildGraphException("Build definition doesn't have any function definition to build")
 
     def __str__(self) -> str:
+        metadata = self.metadata.copy()
+        if "DockerBuildArgs" in metadata:
+            del metadata["DockerBuildArgs"]
+
         return (
             "BuildDefinition("
             f"{self.runtime}, {self.codeuri}, {self.packagetype}, {self.source_hash}, "
-            f"{self.uuid}, {self.metadata}, {self.env_vars}, {self.architecture}, "
+            f"{self.uuid}, {metadata}, {self.env_vars}, {self.architecture}, "
             f"{[f.functionname for f in self.functions]})"
         )
 
@@ -655,11 +722,64 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
             if self.handler != other.handler:
                 return False
 
+        if self.runtime in COMPILED_RUNTIMES:
+            # For compiled languages, we need to check if handlers within the same CodeUri are the same
+            # if they are different, it should create a separate build definition
+            if self.handler != other.handler:
+                return False
+
         return (
             self.runtime == other.runtime
             and self.codeuri == other.codeuri
+            and self.imageuri == other.imageuri
             and self.packagetype == other.packagetype
             and self.metadata == other.metadata
             and self.env_vars == other.env_vars
             and self.architecture == other.architecture
+            and self.resource_type == other.resource_type
         )
+
+
+class MicrovmImageBuildDefinition(AbstractBuildDefinition):
+    """
+    MicrovmImageBuildDefinition holds information about each unique MicroVM image build.
+    Each MicrovmImage is built via docker build from its CodeUri directory.
+    """
+
+    def __init__(
+        self,
+        full_path: str,
+        code_uri: str,
+        architecture: str,
+        source_hash: str = "",
+        manifest_hash: str = "",
+        env_vars: Optional[Dict] = None,
+    ) -> None:
+        super().__init__(source_hash, manifest_hash, env_vars, architecture)
+        self.full_path = full_path
+        self.code_uri = code_uri
+        self.microvm_image: Optional["MicrovmImage"] = None
+
+    def add_microvm_image(self, microvm_image: "MicrovmImage") -> None:
+        self.microvm_image = microvm_image
+
+    def get_resource_full_paths(self) -> str:
+        """Returns the MicroVM image's full path"""
+        if not self.microvm_image:
+            return ""
+        return self.microvm_image.full_path
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, MicrovmImageBuildDefinition):
+            return False
+        return (
+            self.full_path == other.full_path
+            and self.code_uri == other.code_uri
+            and self.architecture == other.architecture
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.full_path, self.code_uri, self.architecture))
+
+    def __str__(self) -> str:
+        return f"MicrovmImageBuildDefinition({self.full_path}, {self.code_uri}, {self.architecture})"

@@ -1,18 +1,19 @@
 """
 Provides global configuration helpers.
 """
+
 import json
 import logging
-import uuid
 import os
 import threading
-
-from pathlib import Path
-from typing import List, Optional, Dict, Any, Type, TypeVar, cast, overload
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Type, TypeVar, cast, overload
 
 import click
 
+from samcli.lib.utils.hash import str_checksum
 
 LOG = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class DefaultEntry:
     INSTALLATION_ID = ConfigEntry("installationId", None)
     LAST_VERSION_CHECK = ConfigEntry("lastVersionCheck", None)
     TELEMETRY = ConfigEntry("telemetryEnabled", "SAM_CLI_TELEMETRY")
+    ACCELERATE_OPT_IN_STACKS = ConfigEntry("accelerateOptInStacks", None)
 
 
 class Singleton(type):
@@ -60,6 +62,12 @@ class GlobalConfig(metaclass=Singleton):
     # Env var for injecting dir in integration tests
     _DIR_INJECTION_ENV_VAR: str = "__SAM_CLI_APP_DIR"
 
+    # Env var used by docker client to specify which socket to use
+    DOCKER_HOST_ENV_VAR: str = "DOCKER_HOST"
+
+    # Env var used to override docker API version to use
+    DOCKER_API_ENV_VAR: str = "SAM_DOCKER_API_VERSION"
+
     # Static singleton instance
 
     _access_lock: threading.RLock
@@ -69,6 +77,7 @@ class GlobalConfig(metaclass=Singleton):
     _config_data: Optional[Dict[str, Any]]
     # config_keys that should be flushed to file
     _persistent_fields: List[str]
+    docker_host: str
 
     def __init__(self):
         """__init__ should only be called once due to Singleton metaclass"""
@@ -77,6 +86,7 @@ class GlobalConfig(metaclass=Singleton):
         self._config_filename = None
         self._config_data = None
         self._persistent_fields = list()
+        self.docker_host = os.environ.get(GlobalConfig.DOCKER_HOST_ENV_VAR, "")
 
     @property
     def config_dir(self) -> Path:
@@ -142,6 +152,7 @@ class GlobalConfig(metaclass=Singleton):
         return Path(self.config_dir, self.config_filename)
 
     T = TypeVar("T")
+
     # Overloads are only used for type hinting.
     # Overload for case where is_flag is set
     @overload
@@ -152,8 +163,7 @@ class GlobalConfig(metaclass=Singleton):
         value_type: Type[bool],
         is_flag: bool,
         reload_config: bool = False,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     # Overload for case where type is specified
     @overload
@@ -161,11 +171,10 @@ class GlobalConfig(metaclass=Singleton):
         self,
         config_entry: ConfigEntry,
         default: Optional[T] = None,
-        value_type: Type[T] = T,
+        value_type: Type[T] = T,  # type: ignore
         is_flag: bool = False,
         reload_config: bool = False,
-    ) -> Optional[T]:
-        ...
+    ) -> Optional[T]: ...
 
     # Overload for case where type is not specified and default to object
     @overload
@@ -176,8 +185,7 @@ class GlobalConfig(metaclass=Singleton):
         value_type: object = object,
         is_flag: bool = False,
         reload_config: bool = False,
-    ) -> Any:
-        ...
+    ) -> Any: ...
 
     def get_value(
         self,
@@ -250,7 +258,7 @@ class GlobalConfig(metaclass=Singleton):
             )
             return default
 
-        return value
+        return value  # type: ignore
 
     def set_value(self, config_entry: ConfigEntry, value: Any, is_flag: bool = False, flush: bool = True) -> None:
         """Set the value of a configuration. The associated env var will be updated as well.
@@ -307,7 +315,7 @@ class GlobalConfig(metaclass=Singleton):
             for key in json_body:
                 self._persistent_fields.append(key)
         except (OSError, ValueError) as ex:
-            LOG.debug(
+            LOG.warning(
                 "Error when loading global config file: %s",
                 self.config_path,
                 exc_info=ex,
@@ -319,10 +327,17 @@ class GlobalConfig(metaclass=Singleton):
         if not self._config_data:
             return
         config_data = {key: value for (key, value) in self._config_data.items() if key in self._persistent_fields}
-        json_str = json.dumps(config_data, indent=4)
-        if not self.config_dir.exists():
-            self.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.config_path.write_text(json_str)
+        try:
+            json_str = json.dumps(config_data, indent=4)
+            if not self.config_dir.exists():
+                self.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.config_path.write_text(json_str)
+        except (OSError, ValueError) as ex:
+            LOG.warning(
+                "Error when writing global config file: %s",
+                self.config_path,
+                exc_info=ex,
+            )
 
     @property
     def installation_id(self):
@@ -406,3 +421,24 @@ class GlobalConfig(metaclass=Singleton):
     @last_version_check.setter
     def last_version_check(self, value: float):
         self.set_value(DefaultEntry.LAST_VERSION_CHECK, value)
+
+    def is_accelerate_opt_in_stack(self, template_file: str, stack_name: str) -> bool:
+        """
+        Returns True, if current folder with stack name is been accepted to use sam sync before.
+        Returns False, if this is first time that user runs sam sync with current folder and given stack name.
+        """
+        accelerate_opt_in_stacks = (
+            self.get_value(DefaultEntry.ACCELERATE_OPT_IN_STACKS, value_type=list, default=[]) or []
+        )
+        return str_checksum(template_file + stack_name) in accelerate_opt_in_stacks
+
+    def set_accelerate_opt_in_stack(self, template_file: str, stack_name: str) -> None:
+        """
+        Stores current folder and stack name into config, so that next time that user runs sam sync, they don't need
+        to accept warning message again.
+        """
+        accelerate_opt_in_stacks = (
+            self.get_value(DefaultEntry.ACCELERATE_OPT_IN_STACKS, value_type=list, default=[]) or []
+        )
+        accelerate_opt_in_stacks.append(str_checksum(template_file + stack_name))
+        self.set_value(DefaultEntry.ACCELERATE_OPT_IN_STACKS, accelerate_opt_in_stacks)

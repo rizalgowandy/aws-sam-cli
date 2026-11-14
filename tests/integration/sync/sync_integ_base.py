@@ -3,32 +3,45 @@ import os
 import logging
 import json
 import shutil
+import tempfile
 import time
 import uuid
+import zipfile
 from pathlib import Path
+from typing import Callable
 
 import boto3
+import requests
 from botocore.exceptions import ClientError
 from botocore.config import Config
 
 from samcli.lib.bootstrap.bootstrap import SAM_CLI_STACK_NAME
 from tests.integration.buildcmd.build_integ_base import BuildIntegBase
 from tests.integration.package.package_integ_base import PackageIntegBase
+from tests.testing_utils import get_sam_command
 
-CFN_SLEEP = 3
-CFN_PYTHON_VERSION_SUFFIX = os.environ.get("PYTHON_VERSION", "0.0.0").replace(".", "-")
 RETRY_ATTEMPTS = 20
 RETRY_WAIT = 1
+ZIP_FILE = "layer_zip.zip"
 
 LOG = logging.getLogger(__name__)
 
 
 class SyncIntegBase(BuildIntegBase, PackageIntegBase):
+    test_data_path = None
+
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         PackageIntegBase.setUpClass()
 
-        cls.test_data_path = Path(__file__).resolve().parents[1].joinpath("testdata", "sync")
+        original_test_data_path = Path(__file__).resolve().parents[1].joinpath("testdata", "sync")
+        cls.test_data_path = Path(tempfile.mkdtemp())
+        shutil.copytree(original_test_data_path, cls.test_data_path, dirs_exist_ok=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.test_data_path:
+            shutil.rmtree(cls.test_data_path, ignore_errors=True)
 
     def setUp(self):
         self.cfn_client = boto3.client("cloudformation")
@@ -39,6 +52,7 @@ class SyncIntegBase(BuildIntegBase, PackageIntegBase):
         self.sns_arn = os.environ.get("AWS_SNS")
         self.stacks = []
         self.s3_prefix = uuid.uuid4().hex
+        self.dependency_layer = True if self.dependency_layer is None else self.dependency_layer
         super().setUp()
 
     def tearDown(self):
@@ -83,8 +97,43 @@ class SyncIntegBase(BuildIntegBase, PackageIntegBase):
                 lambda_response = self.lambda_client.invoke(
                     FunctionName=lambda_function, InvocationType="RequestResponse"
                 )
-                payload = json.loads(lambda_response.get("Payload").read().decode("utf-8"))
+                lambda_response_payload = lambda_response.get("Payload").read().decode("utf-8")
+                LOG.info("Lambda Response Payload: %s", lambda_response_payload)
+                payload = json.loads(lambda_response_payload)
                 return payload.get("body")
+            except Exception:
+                if count == RETRY_ATTEMPTS:
+                    raise
+            count += 1
+        return ""
+
+    def _confirm_lambda_response(self, lambda_function: str, verification_function: Callable) -> None:
+        count = 0
+        while count < RETRY_ATTEMPTS:
+            try:
+                time.sleep(RETRY_WAIT)
+                lambda_response = self.lambda_client.invoke(
+                    FunctionName=lambda_function, InvocationType="RequestResponse"
+                )
+                lambda_response_payload = lambda_response.get("Payload").read().decode("utf-8")
+                LOG.info("Lambda Response Payload: %s", lambda_response_payload)
+                payload = json.loads(lambda_response_payload)
+                verification_function(payload)
+            except Exception:
+                if count == RETRY_ATTEMPTS:
+                    raise
+            count += 1
+
+    def _confirm_lambda_error(self, lambda_function):
+        count = 0
+        while count < RETRY_ATTEMPTS:
+            try:
+                time.sleep(RETRY_WAIT)
+                lambda_response = self.lambda_client.invoke(
+                    FunctionName=lambda_function, InvocationType="RequestResponse"
+                )
+                if lambda_response.get("FunctionError"):
+                    return
             except Exception:
                 if count == RETRY_ATTEMPTS:
                     raise
@@ -136,20 +185,43 @@ class SyncIntegBase(BuildIntegBase, PackageIntegBase):
             count += 1
         return ""
 
-    def base_command(self):
-        command = "sam"
-        if os.getenv("SAM_CLI_DEV"):
-            command = "samdev"
+    @staticmethod
+    def update_file(source, destination):
+        with open(source, "rb") as source_file:
+            with open(destination, "wb") as destination_file:
+                destination_file.write(source_file.read())
 
-        return command
+    @staticmethod
+    def _extract_contents_from_layer_zip(dep_dir, zipped_layer):
+        with tempfile.TemporaryDirectory() as extract_path:
+            zipped_path = Path(extract_path, ZIP_FILE)
+            with open(zipped_path, "wb") as file:
+                file.write(zipped_layer.content)
+            with zipfile.ZipFile(zipped_path) as zip_ref:
+                zip_ref.extractall(extract_path)
+            return os.listdir(Path(extract_path, dep_dir))
+
+    def get_layer_contents(self, arn, dep_dir):
+        layer = self.lambda_client.get_layer_version_by_arn(Arn=arn)
+        layer_location = layer.get("Content", {}).get("Location", "")
+        zipped_layer = requests.get(layer_location)
+        return SyncIntegBase._extract_contents_from_layer_zip(dep_dir, zipped_layer)
+
+    def get_dependency_layer_contents_from_arn(self, stack_resources, dep_dir, version):
+        layers = stack_resources["AWS::Lambda::LayerVersion"]
+        for layer in layers:
+            if "DepLayer" in layer:
+                layer_version = layer[:-1] + str(version)
+                return self.get_layer_contents(layer_version, dep_dir)
+        return None
 
     def get_sync_command_list(
         self,
         template_file=None,
         code=None,
         watch=None,
-        resource_id=None,
-        resource=None,
+        resource_id_list=None,
+        resource_list=None,
         dependency_layer=None,
         stack_name=None,
         region=None,
@@ -158,6 +230,7 @@ class SyncIntegBase(BuildIntegBase, PackageIntegBase):
         base_dir=None,
         image_repository=None,
         image_repositories=None,
+        s3_bucket=None,
         s3_prefix=None,
         kms_key_id=None,
         capabilities=None,
@@ -166,18 +239,25 @@ class SyncIntegBase(BuildIntegBase, PackageIntegBase):
         notification_arns=None,
         tags=None,
         metadata=None,
+        debug=None,
+        use_container=False,
+        build_in_source=None,
+        watch_exclude=None,
+        express=None,
     ):
-        command_list = [self.base_command(), "sync"]
+        command_list = [get_sam_command(), "sync"]
 
         command_list += ["-t", str(template_file)]
         if code:
             command_list += ["--code"]
         if watch:
             command_list += ["--watch"]
-        if resource_id:
-            command_list += ["--resource-id", str(resource_id)]
-        if resource:
-            command_list += ["--resource", str(resource)]
+        if resource_id_list:
+            for resource_id in resource_id_list:
+                command_list += ["--resource-id", str(resource_id)]
+        if resource_list:
+            for resource in resource_list:
+                command_list += ["--resource", str(resource)]
         if dependency_layer:
             command_list += ["--dependency-layer"]
         if not dependency_layer:
@@ -189,13 +269,18 @@ class SyncIntegBase(BuildIntegBase, PackageIntegBase):
         if profile:
             command_list += ["--profile", str(profile)]
         if parameter_overrides:
-            command_list += ["--parameter-overrides", str(parameter_overrides)]
+            arg_value = " ".join(
+                ["ParameterKey={},ParameterValue={}".format(key, value) for key, value in parameter_overrides.items()]
+            )
+            command_list = command_list + ["--parameter-overrides", arg_value]
         if base_dir:
             command_list += ["-s", str(base_dir)]
         if image_repository:
             command_list += ["--image-repository", str(image_repository)]
         if image_repositories:
             command_list += ["--image-repositories", str(image_repositories)]
+        if s3_bucket:
+            command_list += ["--s3-bucket", str(s3_bucket)]
         if s3_prefix:
             command_list += ["--s3-prefix", str(s3_prefix)]
         if kms_key_id:
@@ -214,5 +299,18 @@ class SyncIntegBase(BuildIntegBase, PackageIntegBase):
             command_list += ["--tags", str(tags)]
         if metadata:
             command_list += ["--metadata", json.dumps(metadata)]
+        if debug:
+            command_list += ["--debug"]
+        if use_container:
+            command_list += ["--use-container"]
+        if build_in_source is not None:
+            command_list += ["--build-in-source"] if build_in_source else ["--no-build-in-source"]
+        if watch_exclude:
+            for exclude in watch_exclude:
+                command_list += ["--watch-exclude", exclude]
+        if express is True:
+            command_list += ["--express"]
+        elif express is False:
+            command_list += ["--no-express"]
 
         return command_list

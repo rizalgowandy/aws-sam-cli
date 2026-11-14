@@ -1,6 +1,7 @@
 """
 Custom exceptions raised by this local library
 """
+
 from samcli.commands.exceptions import UserException
 
 
@@ -32,4 +33,23 @@ class InvalidIntermediateImageError(Exception):
 class UnsupportedRuntimeArchitectureError(UserException):
     """
     Raised when runtime does not support architecture
+    """
+
+
+class UnsupportedInlineCodeError(UserException):
+    """
+    Raised when inline code is used for sam local commands
+    """
+
+
+class InvalidHandlerPathError(UserException):
+    """
+    Raises when the handler is in an unexpected format and can't be parsed
+    """
+
+
+class TenantIdValidationError(UserException):
+    """
+    Raised when there's a tenant-id validation error (missing tenant-id for multi-tenant functions
+    or providing tenant-id for non-multi-tenant functions)
     """

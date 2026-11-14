@@ -5,15 +5,16 @@ Generates the services and commands for selection in SAM CLI generate-event
 import functools
 
 import click
+from click import Group
 
-from samcli.lib.generated_sample_events import events
-from samcli.cli.cli_config_file import TomlProvider, configuration_option
+from samcli.cli.cli_config_file import ConfigProvider, configuration_option
 from samcli.cli.options import debug_option
+from samcli.lib.generated_sample_events import events
 from samcli.lib.telemetry.metric import track_command
 from samcli.lib.utils.version_checker import check_newer_version
 
 
-class ServiceCommand(click.MultiCommand):
+class ServiceCommand(Group):
     """
     Top level command that defines the service provided
 
@@ -83,7 +84,7 @@ class ServiceCommand(click.MultiCommand):
         return sorted(self.all_cmds.keys())
 
 
-class EventTypeSubCommand(click.MultiCommand):
+class EventTypeSubCommand(Group):
     """
     Class that describes the commands underneath a given service type
 
@@ -121,7 +122,6 @@ class EventTypeSubCommand(click.MultiCommand):
         self.events_lib = events_lib
 
     def get_command(self, ctx, cmd_name):
-
         """
         gets the Click Commands underneath a service name
 
@@ -161,7 +161,7 @@ class EventTypeSubCommand(click.MultiCommand):
             callback=command_callback,
         )
 
-        cmd = configuration_option(provider=TomlProvider(section="parameters"))(debug_option(cmd))
+        cmd = configuration_option(provider=ConfigProvider(section="parameters"))(debug_option(cmd))
         return cmd
 
     def list_commands(self, ctx):

@@ -9,27 +9,31 @@ rich public interface.
 
 import copy
 import functools
-from typing import Dict
+import logging
+from typing import Any, Dict, List
 
 from samtranslator.model import ResourceTypeResolver, sam_resources
-
-# SAM Translator Library Internal module imports #
 from samtranslator.model.exceptions import (
     InvalidDocumentException,
-    InvalidTemplateException,
-    InvalidResourceException,
     InvalidEventException,
+    InvalidResourceException,
+    InvalidTemplateException,
 )
 from samtranslator.plugins import LifeCycleEvents
 from samtranslator.translator.translator import prepare_plugins
 from samtranslator.validator.validator import SamTemplateValidator
 
 from samcli.commands.validate.lib.exceptions import InvalidSamDocumentException
-from .local_uri_plugin import SupportLocalUriPlugin
+from samcli.lib.cfn_language_extensions.models import (
+    DynamicArtifactProperty,
+)
+from samcli.lib.samlib.local_uri_plugin import SupportLocalUriPlugin
+
+LOG = logging.getLogger(__name__)
 
 
 class SamTranslatorWrapper:
-    def __init__(self, sam_template, parameter_values=None, offline_fallback=True):
+    def __init__(self, sam_template, parameter_values=None, offline_fallback=True, language_extension_result=None):
         """
 
         Parameters
@@ -40,6 +44,10 @@ class SamTranslatorWrapper:
             SAM Template parameters (must contain psuedo and default parameters)
         offline_fallback bool:
             Set it to True to make the translator work entirely offline, if internet is not available
+        language_extension_result : LanguageExtensionResult, optional
+            Pre-computed result from expand_language_extensions(). When provided,
+            original_template and dynamic_artifact_properties are taken from this
+            result instead of being computed internally.
         """
         self.local_uri_plugin = SupportLocalUriPlugin()
         self.parameter_values = parameter_values
@@ -50,8 +58,30 @@ class SamTranslatorWrapper:
 
         self._sam_template = sam_template
         self._offline_fallback = offline_fallback
+        self._language_extension_result = language_extension_result
+
+        if language_extension_result is not None:
+            # Use pre-computed Phase 1 results
+            self._original_template = language_extension_result.original_template
+            self._dynamic_artifact_properties: List[DynamicArtifactProperty] = list(
+                language_extension_result.dynamic_artifact_properties
+            )
+        else:
+            # Preserve the original template with a deep copy for CloudFormation deployment
+            # This ensures Fn::ForEach and other language extensions remain intact
+            self._original_template = copy.deepcopy(sam_template)
+            # Dynamic artifact properties detected in Fn::ForEach blocks
+            # These will be handled via Mappings transformation during sam package
+            self._dynamic_artifact_properties: List[DynamicArtifactProperty] = []
 
     def run_plugins(self, convert_local_uris=True):
+        """
+        Run SAM Translator plugins on the template (Phase 2 only).
+
+        This method assumes it receives an already-expanded template — language
+        extension expansion (Phase 1) should have been performed by the caller
+        via expand_language_extensions() before constructing this wrapper.
+        """
         template_copy = self.template
 
         additional_plugins = []
@@ -76,6 +106,44 @@ class SamTranslatorWrapper:
     @property
     def template(self):
         return copy.deepcopy(self._sam_template)
+
+    # TODO: get_original_template and get_dynamic_artifact_properties are only
+    # called in tests. Callers now consume LanguageExtensionResult directly.
+    # Consider removing these methods and their backing fields
+    # (_original_template, _dynamic_artifact_properties) in a follow-up.
+    def get_original_template(self) -> Dict[str, Any]:
+        """
+        Get the original unexpanded template for CloudFormation deployment.
+
+        This method returns a deep copy of the original template that was passed
+        to the constructor, preserving Fn::ForEach and other language extension
+        constructs intact. This is used when the template needs to be sent to
+        CloudFormation, which will process the AWS::LanguageExtensions transform
+        server-side.
+
+        Returns
+        -------
+        dict
+            A deep copy of the original template with language extensions preserved
+        """
+        result: Dict[str, Any] = copy.deepcopy(self._original_template)
+        return result
+
+    def get_dynamic_artifact_properties(self) -> List[DynamicArtifactProperty]:
+        """
+        Get the list of dynamic artifact properties detected in Fn::ForEach blocks.
+
+        This method returns the dynamic artifact properties that were detected
+        during template processing. These properties use loop variables in their
+        values (e.g., CodeUri: ./services/${Name}) and need to be handled via
+        Mappings transformation during sam package.
+
+        Returns
+        -------
+        List[DynamicArtifactProperty]
+            List of dynamic artifact property locations
+        """
+        return self._dynamic_artifact_properties
 
 
 class _SamParserReimplemented:

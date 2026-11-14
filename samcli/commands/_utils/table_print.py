@@ -1,17 +1,23 @@
 """
 Utilities for table pretty printing using click
 """
-from itertools import count, zip_longest
+
+import shutil
 import textwrap
 from functools import wraps
+from itertools import count, zip_longest
 from typing import Sized
 
 import click
 
+from samcli.lib.observability.util import OutputOption
+
 MIN_OFFSET = 20
 
 
-def pprint_column_names(format_string, format_kwargs, margin=None, table_header=None, color="yellow"):
+def pprint_column_names(
+    format_string, format_kwargs, margin=None, table_header=None, color="yellow", display_sleep=False
+):
     """
 
     :param format_string: format string to be used that has the strings, minimum width to be replaced
@@ -19,6 +25,7 @@ def pprint_column_names(format_string, format_kwargs, margin=None, table_header=
     :param margin: margin that is to be reduced from column width for columnar text.
     :param table_header: Supplied table header
     :param color: color supplied for table headers and column names.
+    :param display_sleep: flag to format table_header to include deployer's client_sleep
     :return: boilerplate table string
     """
 
@@ -27,7 +34,7 @@ def pprint_column_names(format_string, format_kwargs, margin=None, table_header=
 
     def pprint_wrap(func):
         # Calculate terminal width, number of columns in the table
-        width, _ = click.get_terminal_size()
+        width, _ = shutil.get_terminal_size()
         # For UX purposes, set a minimum width for the table to be usable
         # and usable_width keeps margins in mind.
         width = max(width, min_width)
@@ -57,9 +64,22 @@ def pprint_column_names(format_string, format_kwargs, margin=None, table_header=
 
         @wraps(func)
         def wrap(*args, **kwargs):
+            output_mode = kwargs.pop("output_mode", OutputOption.text.value)
+            # Validate loudly: an unrecognized value (e.g. a typo) must raise rather than silently
+            # fall through to table output, which would corrupt a caller's stdout JSON stream.
+            if output_mode not in (OutputOption.text.value, OutputOption.json.value):
+                raise ValueError(f"Unsupported output_mode: {output_mode!r}")
+            if output_mode == OutputOption.json.value:
+                # In JSON mode the wrapped function emits its own structured output; skip the table
+                # chrome. The function is responsible for not referencing the width/margin/format_args
+                # kwargs injected below (today both JSON-capable callers branch on output_mode first).
+                kwargs["output_mode"] = output_mode
+                return func(*args, **kwargs)
             # The table is setup with the column names, format_string contains the column names.
             if table_header:
-                click.secho("\n" + table_header)
+                click.secho(
+                    "\n" + table_header.format(args[0].client_sleep) if display_sleep else table_header, bold=True
+                )
             click.secho("-" * usable_width, fg=color)
             click.secho(format_string.format(*format_args, **format_kwargs), fg=color)
             click.secho("-" * usable_width, fg=color)
@@ -70,7 +90,7 @@ def pprint_column_names(format_string, format_kwargs, margin=None, table_header=
             kwargs["margin"] = margin if margin else min_margin
             result = func(*args, **kwargs)
             # Complete the table
-            click.secho("-" * usable_width, fg=color)
+            click.secho("-" * usable_width + "\n", fg=color)
             return result
 
         return wrap

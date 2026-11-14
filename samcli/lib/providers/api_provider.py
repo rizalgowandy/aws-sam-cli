@@ -1,19 +1,19 @@
 """Class that provides the Api with a list of routes from a Template"""
 
 import logging
-from typing import List, Optional, Iterator
+from typing import Iterator, List, Optional
 
 from samcli.lib.providers.api_collector import ApiCollector
 from samcli.lib.providers.cfn_api_provider import CfnApiProvider
 from samcli.lib.providers.cfn_base_api_provider import CfnBaseApiProvider
-from samcli.lib.providers.provider import AbstractApiProvider, Stack, Api
+from samcli.lib.providers.provider import AbstractApiProvider, Api, Stack
 from samcli.lib.providers.sam_api_provider import SamApiProvider
 
 LOG = logging.getLogger(__name__)
 
 
 class ApiProvider(AbstractApiProvider):
-    def __init__(self, stacks: List[Stack], cwd: Optional[str] = None):
+    def __init__(self, stacks: List[Stack], cwd: Optional[str] = None, disable_authorizer: Optional[bool] = False):
         """
         Initialize the class with template data. The template_dict is assumed
         to be valid, normalized and a dictionary. template_dict should be normalized by running any and all
@@ -29,11 +29,14 @@ class ApiProvider(AbstractApiProvider):
             List of stacks apis are extracted from
         cwd : str
             Optional working directory with respect to which we will resolve relative path to Swagger file
+        disable_authorizer : Optional[bool]
+            Optional flag to disable the collection of lambda authorizers
         """
         self.stacks = stacks
 
         # Store a set of apis
         self.cwd = cwd
+        self.disable_authorizer = disable_authorizer
         self.api = self._extract_api()
         self.routes = self.api.routes
         LOG.debug("%d APIs found in the template", len(self.routes))
@@ -61,7 +64,7 @@ class ApiProvider(AbstractApiProvider):
 
         collector = ApiCollector()
         provider = ApiProvider.find_api_provider(self.stacks)
-        provider.extract_resources(self.stacks, collector, cwd=self.cwd)
+        provider.extract_resources(self.stacks, collector, cwd=self.cwd, disable_authorizer=self.disable_authorizer)
         return collector.get_api()
 
     @staticmethod

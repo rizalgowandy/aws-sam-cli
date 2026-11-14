@@ -1,12 +1,12 @@
 from unittest import TestCase
 from unittest.mock import patch, Mock
 
-from samcli.commands.package.command import do_cli
+from samcli.commands.package.command import do_cli, resources_and_properties_help_string
+from samcli.commands.package.exceptions import PackageResolveS3AndS3NotSetError
 
 
 class TestPackageCliCommand(TestCase):
     def setUp(self):
-
         self.template_file = "input-template-file"
         self.s3_bucket = "s3-bucket"
         self.image_repository = "image-repo"
@@ -21,12 +21,12 @@ class TestPackageCliCommand(TestCase):
         self.region = None
         self.profile = None
         self.resolve_s3 = False
+        self.resolve_image_repos = False
         self.signing_profiles = {"MyFunction": {"profile_name": "ProfileName", "profile_owner": "Profile Owner"}}
 
     @patch("samcli.commands.package.command.click")
     @patch("samcli.commands.package.package_context.PackageContext")
     def test_all_args(self, package_command_context, click_mock):
-
         context_mock = Mock()
         package_command_context.return_value.__enter__.return_value = context_mock
 
@@ -45,6 +45,8 @@ class TestPackageCliCommand(TestCase):
             region=self.region,
             profile=self.profile,
             resolve_s3=self.resolve_s3,
+            resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
             signing_profiles=self.signing_profiles,
         )
 
@@ -63,6 +65,8 @@ class TestPackageCliCommand(TestCase):
             region=self.region,
             profile=self.profile,
             signing_profiles=self.signing_profiles,
+            resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
         )
 
         context_mock.run.assert_called_with()
@@ -91,6 +95,8 @@ class TestPackageCliCommand(TestCase):
             region=self.region,
             profile=self.profile,
             resolve_s3=True,
+            resolve_image_repos=False,
+            language_extensions=None,
             signing_profiles=self.signing_profiles,
         )
 
@@ -109,7 +115,169 @@ class TestPackageCliCommand(TestCase):
             region=self.region,
             profile=self.profile,
             signing_profiles=self.signing_profiles,
+            resolve_image_repos=False,
+            language_extensions=None,
         )
 
         context_mock.run.assert_called_with()
         self.assertEqual(context_mock.run.call_count, 1)
+
+    @patch("samcli.commands.package.command.click")
+    @patch("samcli.commands.package.package_context.PackageContext")
+    def test_resolve_image_repos_without_s3_bucket_raises_error(self, package_command_context, click_mock):
+        with self.assertRaises(PackageResolveS3AndS3NotSetError):
+            do_cli(
+                template_file=self.template_file,
+                s3_bucket=None,
+                s3_prefix=self.s3_prefix,
+                image_repository=None,
+                image_repositories=None,
+                kms_key_id=self.kms_key_id,
+                output_template_file=self.output_template_file,
+                use_json=self.use_json,
+                force_upload=self.force_upload,
+                no_progressbar=self.no_progressbar,
+                metadata=self.metadata,
+                region=self.region,
+                profile=self.profile,
+                resolve_s3=False,
+                resolve_image_repos=True,
+                language_extensions=None,
+                signing_profiles=self.signing_profiles,
+            )
+
+    @patch("samcli.commands.package.command.click")
+    @patch("samcli.commands.package.package_context.PackageContext")
+    def test_all_args_with_resolve_image_repos(self, package_command_context, click_mock):
+        context_mock = Mock()
+        package_command_context.return_value.__enter__.return_value = context_mock
+
+        do_cli(
+            template_file=self.template_file,
+            s3_bucket=self.s3_bucket,
+            s3_prefix=self.s3_prefix,
+            image_repository=None,
+            image_repositories=None,
+            kms_key_id=self.kms_key_id,
+            output_template_file=self.output_template_file,
+            use_json=self.use_json,
+            force_upload=self.force_upload,
+            no_progressbar=self.no_progressbar,
+            metadata=self.metadata,
+            region=self.region,
+            profile=self.profile,
+            resolve_s3=False,
+            resolve_image_repos=True,
+            language_extensions=None,
+            signing_profiles=self.signing_profiles,
+        )
+
+        package_command_context.assert_called_with(
+            template_file=self.template_file,
+            s3_bucket=self.s3_bucket,
+            s3_prefix=self.s3_prefix,
+            image_repository=None,
+            image_repositories=None,
+            kms_key_id=self.kms_key_id,
+            output_template_file=self.output_template_file,
+            use_json=self.use_json,
+            force_upload=self.force_upload,
+            no_progressbar=self.no_progressbar,
+            metadata=self.metadata,
+            region=self.region,
+            profile=self.profile,
+            signing_profiles=self.signing_profiles,
+            resolve_image_repos=True,
+            language_extensions=None,
+        )
+
+        context_mock.run.assert_called_with()
+        self.assertEqual(context_mock.run.call_count, 1)
+
+    def test_resources_and_properties_help_string(self):
+        # Test that the help string generator works
+        help_string = resources_and_properties_help_string()
+        self.assertIsInstance(help_string, str)
+        # Should contain resource and location information
+        self.assertTrue(len(help_string) > 0)
+
+
+class TestPackageResolveS3WebFunctions(TestCase):
+    def _do_cli(self, resolve_s3=True, s3_bucket=None):
+        do_cli(
+            template_file="template.yaml",
+            s3_bucket=s3_bucket,
+            s3_prefix=None,
+            image_repository=None,
+            image_repositories=None,
+            kms_key_id=None,
+            output_template_file=None,
+            use_json=False,
+            force_upload=False,
+            no_progressbar=True,
+            metadata={},
+            region="us-east-1",
+            profile=None,
+            resolve_s3=resolve_s3,
+            resolve_image_repos=False,
+            language_extensions=None,
+            signing_profiles=None,
+        )
+
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.package.command.manage_stack")
+    @patch("samcli.lib.providers.sam_web_function_provider.template_file_has_local_web_functions", return_value=True)
+    def test_resolve_s3_with_local_web_function_code_fails(self, _, manage_stack_mock, package_context_mock):
+        from samcli.commands.package.exceptions import PackageResolveS3WebFunctionError
+
+        with self.assertRaises(PackageResolveS3WebFunctionError) as ctx:
+            self._do_cli()
+        self.assertIn("sam deploy", ctx.exception.message)
+        self.assertIn("--s3-bucket", ctx.exception.message)
+        manage_stack_mock.assert_not_called()
+        package_context_mock.assert_not_called()
+
+    @patch("samcli.commands.package.command.click")
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.package.command.manage_stack", return_value="managed-bucket")
+    @patch("samcli.lib.providers.sam_web_function_provider.template_file_has_local_web_functions", return_value=False)
+    def test_resolve_s3_without_web_functions_still_works(self, _, manage_stack_mock, package_context_mock, __):
+        self._do_cli()
+        manage_stack_mock.assert_called_once()
+        package_context_mock.assert_called_once()
+
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.lib.providers.sam_web_function_provider.template_file_has_local_web_functions")
+    def test_s3_bucket_with_web_functions_is_allowed(self, has_mock, package_context_mock):
+        self._do_cli(resolve_s3=False, s3_bucket="my-bucket")
+        has_mock.assert_not_called()
+        package_context_mock.assert_called_once()
+
+
+class TestPackageContextLanguageExtensions:
+    def _ctx(self, **kwargs):
+        from samcli.commands.package.package_context import PackageContext
+
+        defaults = dict(
+            template_file="template.yaml",
+            s3_bucket="b",
+            image_repository=None,
+            image_repositories=None,
+            s3_prefix="",
+            kms_key_id=None,
+            output_template_file=None,
+            use_json=False,
+            force_upload=False,
+            no_progressbar=False,
+            metadata={},
+            region=None,
+            profile=None,
+        )
+        defaults.update(kwargs)
+        return PackageContext(**defaults)
+
+    def test_default_is_false(self):
+        assert self._ctx().language_extensions_enabled is False
+
+    def test_explicit_true(self):
+        assert self._ctx(language_extensions=True).language_extensions_enabled is True

@@ -1,16 +1,17 @@
 """
 CloudWatch log event puller implementation
 """
+
 import logging
 import time
 from datetime import datetime
-from typing import Optional, Any, List
+from typing import Any, Dict, List, Optional, Union
 
 from botocore.exceptions import ClientError
 
 from samcli.lib.observability.cw_logs.cw_log_event import CWLogEvent
-from samcli.lib.observability.observability_info_puller import ObservabilityPuller, ObservabilityEventConsumer
-from samcli.lib.utils.time import to_timestamp, to_datetime
+from samcli.lib.observability.observability_info_puller import ObservabilityEventConsumer, ObservabilityPuller
+from samcli.lib.utils.time import to_datetime, to_timestamp
 
 LOG = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ class CWLogPuller(ObservabilityPuller):
                         self._poll_interval **= 2
                     LOG.warning(
                         "Throttled by CloudWatch Logs API, consider pulling logs for certain resources. "
-                        "Increasing the poll interval time for resource %s to %s seconds",
+                        "Next poll for resource %s in %s seconds",
                         self.cw_log_group,
                         self._poll_interval,
                     )
@@ -132,8 +133,7 @@ class CWLogPuller(ObservabilityPuller):
                 self.had_data = True
                 cw_event = CWLogEvent(self.cw_log_group, dict(event), self.resource_name)
 
-                if cw_event.timestamp > self.latest_event_time:
-                    self.latest_event_time = cw_event.timestamp
+                self.latest_event_time = max(cw_event.timestamp, self.latest_event_time)
 
                 self.consumer.consume(cw_event)
 
@@ -143,5 +143,5 @@ class CWLogPuller(ObservabilityPuller):
             if not next_token:
                 break
 
-    def load_events(self, event_ids: List[Any]):
+    def load_events(self, event_ids: Union[List[Any], Dict]):
         LOG.debug("Loading specific events are not supported via CloudWatch Log Group")

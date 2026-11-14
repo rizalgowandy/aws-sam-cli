@@ -1,8 +1,8 @@
 Conditions:
   C1:
     Fn::Equals:
-      - true
-      - true
+    - true
+    - true
 Resources:
   ExplicitApi:
     Type: AWS::Serverless::Api
@@ -10,24 +10,16 @@ Resources:
       StageName: Prod
       Auth:
         ResourcePolicy:
-          CustomStatements: 
-            Fn::If: [
-              C1,
-              {
-                Action: 'execute-api:Invoke', 
-                Resource: ['execute-api:/*/*/*']
-              },
-              {
-                Ref: 'AWS::NoValue'
-              },
-            ]
+          CustomStatements:
+            Fn::If: [C1, {Action: execute-api:Invoke, Resource: [execute-api:/*/*/*]},
+              Ref: AWS::NoValue]
 
   ExplicitApiFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: s3://sam-demo-bucket/member_portal.zip
       Handler: index.gethtml
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         GetHtml:
           Type: Api
@@ -57,5 +49,3 @@ Resources:
               Ref: ExplicitApi
             Path: /any
             Method: any
-
-      

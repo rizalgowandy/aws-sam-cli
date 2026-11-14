@@ -1,29 +1,38 @@
 """
 Wraps watchdog to observe file system for any change.
 """
+
 import logging
+import platform
 import threading
 import uuid
 from abc import ABC, abstractmethod
-
 from pathlib import Path
-from threading import Thread, Lock
-from typing import Callable, List, Dict, Optional
+from threading import Lock, Thread
+from typing import Callable, Dict, List, Optional
 
-import docker
 from docker import DockerClient
 from docker.errors import ImageNotFound
 from docker.types import CancellableStream
+from watchdog.events import (
+    EVENT_TYPE_DELETED,
+    EVENT_TYPE_OPENED,
+    FileSystemEvent,
+    FileSystemEventHandler,
+    PatternMatchingEventHandler,
+)
 from watchdog.observers import Observer
-from watchdog.events import PatternMatchingEventHandler, FileSystemEvent, FileSystemEventHandler
-from watchdog.observers.api import ObservedWatch, BaseObserver
+from watchdog.observers.api import BaseObserver, ObservedWatch
 
 from samcli.cli.global_config import Singleton
 from samcli.lib.utils.hash import dir_checksum, file_checksum
-from samcli.lib.utils.packagetype import ZIP, IMAGE
+from samcli.lib.utils.packagetype import IMAGE, ZIP
+from samcli.local.docker.utils import get_validated_container_client
 from samcli.local.lambdafn.config import FunctionConfig
 
 LOG = logging.getLogger(__name__)
+# Windows API error returned when attempting to perform I/O on closed pipe
+BROKEN_PIPE_ERROR = 109
 
 
 class ResourceObserver(ABC):
@@ -110,7 +119,7 @@ class LambdaFunctionObserver:
             list[str]
                 List of lambda functions' source code paths to be observed
             """
-            code_paths = [function_config.code_abs_path]
+            code_paths = [function_config.code_real_path]
             if function_config.layers:
                 # Non-local layers will not have a codeuri property and don't need to be observed
                 code_paths += [layer.codeuri for layer in function_config.layers if layer.codeuri]
@@ -173,11 +182,22 @@ class LambdaFunctionObserver:
         package_type: str
             determine if the changed resource is a source code path or an image name
         """
+        LOG.debug(
+            "Acquiring lock for _on_change to process %s %s resource changes: %s",
+            len(resources),
+            package_type,
+            resources,
+        )
         with self._watch_lock:
             changed_functions: List[FunctionConfig] = []
             for resource in resources:
                 if self._observed_functions[package_type].get(resource, None):
                     changed_functions += self._observed_functions[package_type][resource]
+            LOG.debug(
+                "Acquired lock and processing %s changed functions from %s resources",
+                len(changed_functions),
+                len(resources),
+            )
             self._input_on_change(changed_functions)
 
     def watch(self, function_config: FunctionConfig) -> None:
@@ -194,9 +214,18 @@ class LambdaFunctionObserver:
         ObserverException:
             if not able to observe the input function source path/image
         """
+        LOG.debug(
+            "Acquiring lock for watch to observe %s function: %s", function_config.packagetype, function_config.name
+        )
         with self._watch_lock:
             if self.get_resources.get(function_config.packagetype, None):
                 resources = self.get_resources[function_config.packagetype](function_config)
+                LOG.debug(
+                    "Acquired lock for watch, observing %s resources for function %s: %s",
+                    len(resources),
+                    function_config.name,
+                    resources,
+                )
                 for resource in resources:
                     functions = self._observed_functions[function_config.packagetype].get(resource, [])
                     functions += [function_config]
@@ -243,6 +272,44 @@ class ImageObserverException(ObserverException):
     """
 
 
+def broken_pipe_handler(func: Callable) -> Callable:
+    """
+    Decorator to handle the Windows API BROKEN_PIPE_ERROR error.
+
+    Parameters
+    ----------
+    func: Callable
+        The method to wrap around
+    """
+
+    # NOTE: As of right now, this checks for the Windows API error 109
+    # specifically. This could be abstracted to potentially utilize a
+    # callback method to further customize this.
+
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exception:
+            # handle a pywintypes exception that gets thrown when trying to exit
+            # from a command that utilizes ImageObserver(s) in
+            # EAGER container mode (start-api, start-lambda)
+
+            # all containers would have been stopped, and deleted, however
+            # the pipes to those containers are still loaded somewhere
+
+            if not platform.system() == "Windows":
+                raise
+
+            win_error = getattr(exception, "winerror", None)
+
+            if not win_error == BROKEN_PIPE_ERROR:
+                raise
+
+            LOG.debug("Handling BROKEN_PIPE_ERROR pywintypes, exception ignored gracefully")
+
+    return wrapper
+
+
 class ImageObserver(ResourceObserver):
     """
     A class that will observe some docker images for any change.
@@ -258,11 +325,13 @@ class ImageObserver(ResourceObserver):
         """
         self._observed_images: Dict[str, str] = {}
         self._input_on_change: Callable = on_change
-        self.docker_client: DockerClient = docker.from_env()
+        # Use the validated container client to ensure proper Finch/Docker client setup
+        self.docker_client: DockerClient = get_validated_container_client()
         self.events: CancellableStream = self.docker_client.events(filters={"type": "image"}, decode=True)
         self._images_observer_thread: Optional[Thread] = None
         self._lock: Lock = threading.Lock()
 
+    @broken_pipe_handler
     def _watch_images_events(self):
         for event in self.events:
             if event.get("Action", None) != "tag":
@@ -383,8 +452,8 @@ class SingletonFileObserver(metaclass=Singleton):
             patterns=["*"], ignore_patterns=[], ignore_directories=False
         )
 
-        self._code_modification_handler.on_modified = self.on_change
-        self._code_deletion_handler.on_deleted = self.on_change
+        self._code_modification_handler.on_modified = self.on_change  # type: ignore
+        self._code_deletion_handler.on_deleted = self.on_change  # type: ignore
         self._watch_lock = threading.Lock()
         self._lock: Lock = threading.Lock()
 
@@ -400,16 +469,21 @@ class SingletonFileObserver(metaclass=Singleton):
             Determines that there is a change happened to some file/dir in the observed paths
         """
         with self._watch_lock:
+            if event.event_type == EVENT_TYPE_OPENED:
+                LOG.debug("Ignoring file system OPENED event")
+                return
+
             LOG.debug("a %s change got detected in path %s", event.event_type, event.src_path)
             for group, _observed_paths in self._observed_paths_per_group.items():
-                if event.event_type == "deleted":
+                observed_paths = None
+                if event.event_type == EVENT_TYPE_DELETED:
                     observed_paths = [
                         path
                         for path in _observed_paths
                         if path == event.src_path
-                        or path in self._watch_dog_observed_paths.get(f"{event.src_path}_False", [])
+                        or path in self._watch_dog_observed_paths.get(f"{event.src_path!r}_False", [])
                     ]
-                else:
+                elif isinstance(event.src_path, str):
                     observed_paths = [path for path in _observed_paths if event.src_path.startswith(path)]
 
                 if not observed_paths:

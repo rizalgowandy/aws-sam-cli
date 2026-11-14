@@ -2,12 +2,14 @@
 
 import json
 from collections import OrderedDict
+from typing import Any, Dict
+
+from flask import Response
 
 from samcli.local.services.base_local_service import BaseLocalService
 
 
 class LambdaErrorResponses:
-
     # The content type of the Invoke request body is not JSON.
     UnsupportedMediaTypeException = ("UnsupportedMediaType", 415)
 
@@ -20,7 +22,12 @@ class LambdaErrorResponses:
     # The request body could not be parsed as JSON.
     InvalidRequestContentException = ("InvalidRequestContent", 400)
 
+    # One or more parameters values were invalid.
+    ValidationException = ("ValidationException", 400)
+
     NotImplementedException = ("NotImplemented", 501)
+
+    ContainerCreationFailed = ("ContainerCreationFailed", 501)
 
     PathNotFoundException = ("PathNotFoundLocally", 404)
 
@@ -36,7 +43,7 @@ class LambdaErrorResponses:
     CONTENT_TYPE_HEADER_KEY = "Content-Type"
 
     @staticmethod
-    def resource_not_found(function_name):
+    def resource_not_found(function_name: str) -> Response:
         """
         Creates a Lambda Service ResourceNotFound Response
 
@@ -62,7 +69,7 @@ class LambdaErrorResponses:
         )
 
     @staticmethod
-    def invalid_request_content(message):
+    def invalid_request_content(message: str) -> Response:
         """
         Creates a Lambda Service InvalidRequestContent Response
 
@@ -85,7 +92,30 @@ class LambdaErrorResponses:
         )
 
     @staticmethod
-    def unsupported_media_type(content_type):
+    def validation_exception(message: str) -> Response:
+        """
+        Creates a Lambda Service ValidationException Response
+
+        Parameters
+        ----------
+        message str
+            Message to be added to the body of the response
+
+        Returns
+        -------
+        Flask.Response
+            A response object representing the ValidationException Error
+        """
+        exception_tuple = LambdaErrorResponses.ValidationException
+
+        return BaseLocalService.service_response(
+            LambdaErrorResponses._construct_error_response_body(LambdaErrorResponses.USER_ERROR, message),
+            LambdaErrorResponses._construct_headers(exception_tuple[0]),
+            exception_tuple[1],
+        )
+
+    @staticmethod
+    def unsupported_media_type(content_type: str) -> Response:
         """
         Creates a Lambda Service UnsupportedMediaType Response
 
@@ -110,7 +140,7 @@ class LambdaErrorResponses:
         )
 
     @staticmethod
-    def generic_service_exception(*args):
+    def generic_service_exception(*args: Any) -> Response:
         """
         Creates a Lambda Service Generic ServiceException Response
 
@@ -133,7 +163,7 @@ class LambdaErrorResponses:
         )
 
     @staticmethod
-    def not_implemented_locally(message):
+    def not_implemented_locally(message: str) -> Response:
         """
         Creates a Lambda Service NotImplementedLocally Response
 
@@ -156,7 +186,7 @@ class LambdaErrorResponses:
         )
 
     @staticmethod
-    def generic_path_not_found(*args):
+    def generic_path_not_found(*args: Any) -> Response:
         """
         Creates a Lambda Service Generic PathNotFound Response
 
@@ -181,7 +211,7 @@ class LambdaErrorResponses:
         )
 
     @staticmethod
-    def generic_method_not_allowed(*args):
+    def generic_method_not_allowed(*args: Any) -> Response:
         """
         Creates a Lambda Service Generic MethodNotAllowed Response
 
@@ -206,7 +236,30 @@ class LambdaErrorResponses:
         )
 
     @staticmethod
-    def _construct_error_response_body(error_type, error_message):
+    def container_creation_failed(message: str) -> Response:
+        """
+        Creates a Container Creation Failed response
+        Parameters
+        ----------
+        message str
+            Message to be added to the body of the response
+        Returns
+        -------
+        Flask.Response
+            A response object representing the ContainerCreationFailed Error
+        """
+        error_type, status_code = LambdaErrorResponses.ContainerCreationFailed
+        return BaseLocalService.service_response(
+            LambdaErrorResponses._construct_error_response_body(
+                LambdaErrorResponses.LOCAL_SERVICE_ERROR,
+                message,
+            ),
+            LambdaErrorResponses._construct_headers(error_type),
+            status_code,
+        )
+
+    @staticmethod
+    def _construct_error_response_body(error_type: str, error_message: str) -> str:
         """
         Constructs a string to be used in the body of the Response that conforms
         to the structure of the Lambda Service Responses
@@ -226,8 +279,21 @@ class LambdaErrorResponses:
         # OrderedDict is used to make testing in Py2 and Py3 consistent
         return json.dumps(OrderedDict([("Type", error_type), ("Message", error_message)]))
 
+    # Durable Functions Error Responses
     @staticmethod
-    def _construct_headers(error_type):
+    def durable_execution_not_found(execution_arn: str) -> Response:
+        """Creates a ResourceNotFound response for durable executions"""
+        exception_tuple = LambdaErrorResponses.ResourceNotFoundException
+        return BaseLocalService.service_response(
+            LambdaErrorResponses._construct_error_response_body(
+                LambdaErrorResponses.USER_ERROR, f"Durable execution not found: {execution_arn}"
+            ),
+            LambdaErrorResponses._construct_headers(exception_tuple[0]),
+            exception_tuple[1],
+        )
+
+    @staticmethod
+    def _construct_headers(error_type: str) -> Dict[str, str]:
         """
         Constructs Headers for the Local Lambda Error Response
 

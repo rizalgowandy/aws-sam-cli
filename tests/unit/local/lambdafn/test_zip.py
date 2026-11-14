@@ -7,10 +7,10 @@ from contextlib import contextmanager
 from tempfile import NamedTemporaryFile, mkdtemp
 from unittest import TestCase
 from unittest import skipIf
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from parameterized import parameterized, param
 
-from samcli.local.lambdafn.zip import unzip, unzip_from_uri, _override_permissions
+from samcli.local.lambdafn.zip import unzip, _override_permissions
 
 # On Windows, permissions do not match 1:1 with permissions on Unix systems.
 SKIP_UNZIP_PERMISSION_TESTS = platform.system() == "Windows"
@@ -65,6 +65,90 @@ class TestUnzipWithPermissions(TestCase):
 
         self._verify_file_count(verify_external_attributes)
 
+    def test_must_block_absolute_symlink_by_default(self):
+        """Test that absolute symlinks are blocked when mount_symlinks=False"""
+        files_with_absolute_symlink = {
+            "1.txt": {"file_type": 0o10, "contents": b"foo", "permissions": 0o644},
+            "absolute_link": {"file_type": 0o12, "contents": b"/tmp/external", "permissions": 0o644},
+        }
+
+        with self._create_zip(files_with_absolute_symlink) as zip_file_name:
+            with self._temp_dir() as extract_dir:
+                with self.assertRaises(ValueError) as context:
+                    unzip(zip_file_name, extract_dir, mount_symlinks=False)
+
+                self.assertIn("absolute target", str(context.exception).lower())
+
+    def test_must_block_relative_escape_symlink_by_default(self):
+        """Test that relative symlinks escaping the directory are blocked when mount_symlinks=False"""
+        files_with_escape_symlink = {
+            "1.txt": {"file_type": 0o10, "contents": b"foo", "permissions": 0o644},
+            "escape_link": {"file_type": 0o12, "contents": b"../../external", "permissions": 0o644},
+        }
+
+        with self._create_zip(files_with_escape_symlink) as zip_file_name:
+            with self._temp_dir() as extract_dir:
+                with self.assertRaises(ValueError) as context:
+                    unzip(zip_file_name, extract_dir, mount_symlinks=False)
+
+                self.assertIn("outside", str(context.exception).lower())
+
+    def test_must_allow_regular_symlink_by_default(self):
+        """Test that symlinks within the extraction directory are allowed by default"""
+        with self._create_zip(self.files_with_external_attr) as zip_file_name:
+            with self._temp_dir() as extract_dir:
+                unzip(zip_file_name, extract_dir, mount_symlinks=False)
+
+                # Verify that symlink was created
+                regular_path = os.path.join(extract_dir, "symlinkToF2")
+                self.assertTrue(os.path.islink(regular_path))
+                self.assertEqual(os.readlink(regular_path), "1.txt")
+
+    def test_must_block_subdirectory_symlink_escaping_extraction_dir(self):
+        """Test that a symlink nested in a subdirectory escaping via relative path is blocked"""
+        files_with_nested_escape = {
+            "1.txt": {"file_type": 0o10, "contents": b"foo", "permissions": 0o644},
+            "subdir/link": {"file_type": 0o12, "contents": b"../../../external", "permissions": 0o644},
+        }
+
+        with self._create_zip(files_with_nested_escape) as zip_file_name:
+            with self._temp_dir() as extract_dir:
+                with self.assertRaises(ValueError) as context:
+                    unzip(zip_file_name, extract_dir, mount_symlinks=False)
+
+                self.assertIn("outside", str(context.exception).lower())
+
+    def test_must_allow_relative_escape_symlink_with_mount_symlinks(self):
+        """Test that relative symlinks escaping the directory are allowed when mount_symlinks=True"""
+        files_with_escape_symlink = {
+            "1.txt": {"file_type": 0o10, "contents": b"foo", "permissions": 0o644},
+            "escape_link": {"file_type": 0o12, "contents": b"../../external", "permissions": 0o644},
+        }
+
+        with self._create_zip(files_with_escape_symlink) as zip_file_name:
+            with self._temp_dir() as extract_dir:
+                unzip(zip_file_name, extract_dir, mount_symlinks=True)
+
+                link_path = os.path.join(extract_dir, "escape_link")
+                self.assertTrue(os.path.islink(link_path))
+                self.assertEqual(os.readlink(link_path), "../../external")
+
+    def test_must_allow_absolute_symlink_with_mount_symlinks(self):
+        """Test that absolute symlinks are allowed when mount_symlinks=True"""
+        files_with_absolute_symlink = {
+            "1.txt": {"file_type": 0o10, "contents": b"foo", "permissions": 0o644},
+            "external_link": {"file_type": 0o12, "contents": b"/tmp/external", "permissions": 0o644},
+        }
+
+        with self._create_zip(files_with_absolute_symlink) as zip_file_name:
+            with self._temp_dir() as extract_dir:
+                unzip(zip_file_name, extract_dir, mount_symlinks=True)
+
+                # Verify the symlink was created
+                link_path = os.path.join(extract_dir, "external_link")
+                self.assertTrue(os.path.islink(link_path))
+                self.assertEqual(os.readlink(link_path), "/tmp/external")
+
     @contextmanager
     def _reset(self, verify_external_attributes):
         self.expected_files = 0
@@ -80,14 +164,12 @@ class TestUnzipWithPermissions(TestCase):
 
     @contextmanager
     def _create_zip(self, file_dict, add_attributes=True):
-
         zipfilename = None
         try:
             zipfilename = NamedTemporaryFile(mode="w+b").name
 
             zf = zipfile.ZipFile(zipfilename, "w", zipfile.ZIP_DEFLATED)
             for filename, data in file_dict.items():
-
                 fileinfo = zipfile.ZipInfo(filename)
 
                 if add_attributes:
@@ -154,122 +236,6 @@ class TestUnzipWithPermissions(TestCase):
         finally:
             if name:
                 shutil.rmtree(name)
-
-
-class TestUnzipFromUri(TestCase):
-    @patch("samcli.local.lambdafn.zip.unzip")
-    @patch("samcli.local.lambdafn.zip.Path")
-    @patch("samcli.local.lambdafn.zip.progressbar")
-    @patch("samcli.local.lambdafn.zip.requests")
-    @patch("samcli.local.lambdafn.zip.open")
-    @patch("samcli.local.lambdafn.zip.os")
-    def test_successfully_unzip_from_uri(
-        self, os_patch, open_patch, requests_patch, progressbar_patch, path_patch, unzip_patch
-    ):
-        get_request_mock = Mock()
-        get_request_mock.headers = {"Content-length": "200"}
-        get_request_mock.iter_content.return_value = [b"data1"]
-        requests_patch.get.return_value = get_request_mock
-
-        file_mock = Mock()
-        open_patch.return_value.__enter__.return_value = file_mock
-
-        progressbar_mock = Mock()
-        progressbar_patch.return_value.__enter__.return_value = progressbar_mock
-
-        path_mock = Mock()
-        path_mock.exists.return_value = True
-        path_patch.return_value = path_mock
-
-        os_patch.environ.get.return_value = True
-
-        unzip_from_uri("uri", "layer_zip_path", "output_zip_dir", "layer_arn")
-
-        requests_patch.get.assert_called_with("uri", stream=True, verify=True)
-        get_request_mock.iter_content.assert_called_with(chunk_size=None)
-        open_patch.assert_called_with("layer_zip_path", "wb")
-        file_mock.write.assert_called_with(b"data1")
-        progressbar_mock.update.assert_called_with(5)
-        path_patch.assert_called_with("layer_zip_path")
-        path_mock.unlink.assert_called()
-        unzip_patch.assert_called_with("layer_zip_path", "output_zip_dir", permission=0o700)
-        os_patch.environ.get.assert_called_with("AWS_CA_BUNDLE", True)
-
-    @patch("samcli.local.lambdafn.zip.unzip")
-    @patch("samcli.local.lambdafn.zip.Path")
-    @patch("samcli.local.lambdafn.zip.progressbar")
-    @patch("samcli.local.lambdafn.zip.requests")
-    @patch("samcli.local.lambdafn.zip.open")
-    @patch("samcli.local.lambdafn.zip.os")
-    def test_not_unlink_file_when_file_doesnt_exist(
-        self, os_patch, open_patch, requests_patch, progressbar_patch, path_patch, unzip_patch
-    ):
-        get_request_mock = Mock()
-        get_request_mock.headers = {"Content-length": "200"}
-        get_request_mock.iter_content.return_value = [b"data1"]
-        requests_patch.get.return_value = get_request_mock
-
-        file_mock = Mock()
-        open_patch.return_value.__enter__.return_value = file_mock
-
-        progressbar_mock = Mock()
-        progressbar_patch.return_value.__enter__.return_value = progressbar_mock
-
-        path_mock = Mock()
-        path_mock.exists.return_value = False
-        path_patch.return_value = path_mock
-
-        os_patch.environ.get.return_value = True
-
-        unzip_from_uri("uri", "layer_zip_path", "output_zip_dir", "layer_arn")
-
-        requests_patch.get.assert_called_with("uri", stream=True, verify=True)
-        get_request_mock.iter_content.assert_called_with(chunk_size=None)
-        open_patch.assert_called_with("layer_zip_path", "wb")
-        file_mock.write.assert_called_with(b"data1")
-        progressbar_mock.update.assert_called_with(5)
-        path_patch.assert_called_with("layer_zip_path")
-        path_mock.unlink.assert_not_called()
-        unzip_patch.assert_called_with("layer_zip_path", "output_zip_dir", permission=0o700)
-        os_patch.environ.get.assert_called_with("AWS_CA_BUNDLE", True)
-
-    @patch("samcli.local.lambdafn.zip.unzip")
-    @patch("samcli.local.lambdafn.zip.Path")
-    @patch("samcli.local.lambdafn.zip.progressbar")
-    @patch("samcli.local.lambdafn.zip.requests")
-    @patch("samcli.local.lambdafn.zip.open")
-    @patch("samcli.local.lambdafn.zip.os")
-    def test_unzip_from_uri_reads_AWS_CA_BUNDLE_env_var(
-        self, os_patch, open_patch, requests_patch, progressbar_patch, path_patch, unzip_patch
-    ):
-        get_request_mock = Mock()
-        get_request_mock.headers = {"Content-length": "200"}
-        get_request_mock.iter_content.return_value = [b"data1"]
-        requests_patch.get.return_value = get_request_mock
-
-        file_mock = Mock()
-        open_patch.return_value.__enter__.return_value = file_mock
-
-        progressbar_mock = Mock()
-        progressbar_patch.return_value.__enter__.return_value = progressbar_mock
-
-        path_mock = Mock()
-        path_mock.exists.return_value = True
-        path_patch.return_value = path_mock
-
-        os_patch.environ.get.return_value = "/some/path/on/the/system"
-
-        unzip_from_uri("uri", "layer_zip_path", "output_zip_dir", "layer_arn")
-
-        requests_patch.get.assert_called_with("uri", stream=True, verify="/some/path/on/the/system")
-        get_request_mock.iter_content.assert_called_with(chunk_size=None)
-        open_patch.assert_called_with("layer_zip_path", "wb")
-        file_mock.write.assert_called_with(b"data1")
-        progressbar_mock.update.assert_called_with(5)
-        path_patch.assert_called_with("layer_zip_path")
-        path_mock.unlink.assert_called()
-        unzip_patch.assert_called_with("layer_zip_path", "output_zip_dir", permission=0o700)
-        os_patch.environ.get.assert_called_with("AWS_CA_BUNDLE", True)
 
 
 class TestOverridePermissions(TestCase):

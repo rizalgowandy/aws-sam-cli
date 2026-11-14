@@ -2,7 +2,7 @@ Globals:
   Api:
     Auth:
       ResourcePolicy:
-        SourceVpcBlacklist: ['vpce-3456']
+        SourceVpcBlacklist: [vpce-3456]
 Resources:
   MyFunction:
     Type: AWS::Serverless::Function
@@ -16,7 +16,7 @@ Resources:
           return response;
         };
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         Api:
           Type: Api
@@ -28,4 +28,3 @@ Resources:
           Properties:
             Method: any
             Path: /any/get
-        

@@ -1,6 +1,6 @@
 Resources:
   MyApiWithCognitoAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -10,7 +10,7 @@ Resources:
             UserPoolArn: !GetAtt MyUserPool.Arn
 
   MyApiWithLambdaTokenAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -20,7 +20,7 @@ Resources:
             FunctionArn: !GetAtt MyAuthFn.Arn
 
   MyApiWithLambdaRequestAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -31,10 +31,10 @@ Resources:
             FunctionArn: !GetAtt MyAuthFn.Arn
             Identity:
               Headers:
-                - Authorization1
+              - Authorization1
 
   MyApiWithNotCachedLambdaRequestAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -51,13 +51,13 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
   MyFn:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         Cognito:
           Type: Api
@@ -110,8 +110,8 @@ Resources:
         PasswordPolicy:
           MinimumLength: 8
       UsernameAttributes:
-        - email
+      - email
       Schema:
-        - AttributeDataType: String
-          Name: email
-          Required: false
+      - AttributeDataType: String
+        Name: email
+        Required: false

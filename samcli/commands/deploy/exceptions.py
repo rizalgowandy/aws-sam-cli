@@ -1,7 +1,46 @@
 """
 Exceptions that are raised by sam deploy
 """
+
+import re
+from typing import Optional, Tuple
+
 from samcli.commands.exceptions import UserException
+
+# Pattern to match CloudFormation's Fn::FindInMap error message
+# Example: "Fn::FindInMap - Key 'Products' not found in Mapping 'SAMCodeUriServices'"
+# The pattern handles:
+# - Single quotes: Key 'Products'
+# - Double quotes: Key "Products"
+# - No quotes: Key Products
+FINDMAP_KEY_NOT_FOUND_PATTERN = re.compile(
+    r"Fn::FindInMap.*Key\s+"
+    r"(?:'([^']+)'|\"([^\"]+)\"|(\S+))"
+    r"\s+not found in Mapping\s+"
+    r"(?:'([^']+)'|\"([^\"]+)\"|(\S+))"
+)
+
+
+def parse_findmap_error(error_message: str) -> Optional[Tuple[str, str]]:
+    """
+    Parse a CloudFormation error message to extract missing Mapping key information.
+
+    Args:
+        error_message: The error message from CloudFormation
+
+    Returns:
+        A tuple of (missing_key, mapping_name) if the error is a FindInMap key not found error,
+        None otherwise.
+    """
+    match = FINDMAP_KEY_NOT_FOUND_PATTERN.search(error_message)
+    if match:
+        # Groups 1, 2, 3 are for the key (single-quoted, double-quoted, unquoted)
+        # Groups 4, 5, 6 are for the mapping name (single-quoted, double-quoted, unquoted)
+        key = match.group(1) or match.group(2) or match.group(3)
+        mapping = match.group(4) or match.group(5) or match.group(6)
+        if key and mapping:
+            return (key, mapping)
+    return None
 
 
 class ChangeEmptyError(UserException):
@@ -56,7 +95,6 @@ class DeployBucketInDifferentRegionError(UserException):
 
 class DeployBucketRequiredError(UserException):
     def __init__(self):
-
         message_fmt = (
             "Templates with a size greater than 51,200 bytes must be deployed "
             "via an S3 Bucket. Please add the --s3-bucket parameter to your "
@@ -75,3 +113,51 @@ class DeployResolveS3AndS3SetError(UserException):
         )
 
         super().__init__(message=message_fmt)
+
+
+class DeployStackStatusMissingError(UserException):
+    def __init__(self, stack_name):
+        message_fmt = "Was not able to find a stack with the name: {msg}, please check your parameters and try again."
+        super().__init__(message=message_fmt.format(msg=stack_name))
+
+
+class MissingMappingKeyError(DeployFailedError):
+    """
+    Error raised when CloudFormation deployment fails due to a missing key in a Mapping.
+
+    This typically occurs when a template was packaged with certain parameter values
+    (e.g., ServiceNames="Users,Orders") but deployed with different values
+    (e.g., ServiceNames="Users,Orders,Products"). The Mappings generated during
+    packaging only contain entries for the values known at package time.
+    """
+
+    def __init__(self, stack_name: str, missing_key: str, mapping_name: str, original_error: str):
+        self.stack_name = stack_name
+        self.missing_key = missing_key
+        self.mapping_name = mapping_name
+        self.original_error = original_error
+
+        message = f"""Failed to create/update the stack: {stack_name}
+
+Error: Fn::FindInMap - Key '{missing_key}' not found in Mapping '{mapping_name}'
+
+This error typically occurs when:
+  - The template was packaged with certain parameter values
+  - You are deploying with different parameter values that include '{missing_key}'
+  - The Mappings generated during packaging don't include an entry for '{missing_key}'
+
+To fix this issue:
+  1. Re-run 'sam package' with the same parameter values you want to use for deployment
+  2. Then run 'sam deploy' with those same parameter values
+
+Example:
+  sam package --parameter-overrides YourParamName="value1,value2,{missing_key}" ...
+  sam deploy --parameter-overrides YourParamName="value1,value2,{missing_key}" ...
+
+Note: When using Fn::ForEach with dynamic artifact properties (like CodeUri: ./services/${{Name}}),
+the collection values are fixed at package time. Any new values added at deploy time
+will not have corresponding artifacts in S3.
+
+Original CloudFormation error: {original_error}"""
+
+        super().__init__(stack_name=stack_name, msg=message)

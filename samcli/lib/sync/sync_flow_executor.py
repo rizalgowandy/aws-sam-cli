@@ -1,29 +1,30 @@
 """Executor for SyncFlows"""
+
 import logging
 import time
-
-from queue import Queue
-from typing import Callable, List, Optional, Set
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-
+from datetime import datetime
+from queue import Queue
 from threading import RLock
-from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Callable, List, Optional, Set
+from uuid import uuid4
 
 from botocore.exceptions import ClientError
 
-from samcli.lib.utils.colors import Colored
 from samcli.lib.providers.exceptions import MissingLocalDefinition
 from samcli.lib.sync.exceptions import (
     InfraSyncRequiredError,
+    InvalidRuntimeDefinitionForFunction,
+    MissingFunctionBuildDefinition,
     MissingPhysicalResourceError,
     NoLayerVersionsFoundError,
     SyncFlowException,
-    MissingFunctionBuildDefinition,
-    InvalidRuntimeDefinitionForFunction,
 )
-
-from samcli.lib.utils.lock_distributor import LockDistributor, LockDistributorType
 from samcli.lib.sync.sync_flow import SyncFlow
+from samcli.lib.telemetry.event import EventName, EventTracker, EventType
+from samcli.lib.utils.colors import Colored
+from samcli.lib.utils.lock_distributor import LockDistributor, LockDistributorType
 
 LOG = logging.getLogger(__name__)
 
@@ -83,10 +84,10 @@ def default_exception_handler(sync_flow_exception: SyncFlowException) -> None:
         )
     elif (
         isinstance(exception, ClientError)
-        and exception.response.get("Error", dict()).get("Code", "") == "ResourceNotFoundException"
+        and exception.response.get("Error", {}).get("Code", "") == "ResourceNotFoundException"
     ):
         LOG.error("Cannot find resource in remote.%s", HELP_TEXT_FOR_SYNC_INFRA)
-        LOG.error(exception.response.get("Error", dict()).get("Message", ""))
+        LOG.error(exception.response.get("Error", {}).get("Message", ""))
     elif isinstance(exception, NoLayerVersionsFoundError):
         LOG.error("Cannot find any versions for layer %s.%s", exception.layer_name_arn, HELP_TEXT_FOR_SYNC_INFRA)
     elif isinstance(exception, MissingFunctionBuildDefinition):
@@ -191,7 +192,6 @@ class SyncFlowExecutor:
         with ThreadPoolExecutor() as executor:
             self._running_futures.clear()
             while True:
-
                 self._execute_step(executor, exception_handler)
 
                 # Exit execution if there are no running and pending sync flows
@@ -233,7 +233,10 @@ class SyncFlowExecutor:
                 # Put it into deferred_tasks and add all of them at the end to avoid endless loop
                 if sync_flow_future:
                     self._running_futures.add(sync_flow_future)
-                    LOG.info(self._color.cyan(f"Syncing {sync_flow_future.sync_flow.log_name}..."))
+                    LOG.info(
+                        self._color.color_log(msg=f"Syncing {sync_flow_future.sync_flow.log_name}...", color="cyan"),
+                        extra=dict(markup=True),
+                    )
                 else:
                     deferred_tasks.append(sync_flow_task)
 
@@ -309,7 +312,14 @@ class SyncFlowExecutor:
             sync_flow_result: SyncFlowResult = future.result()
             for dependent_sync_flow in sync_flow_result.dependent_sync_flows:
                 self.add_sync_flow(dependent_sync_flow)
-            LOG.info(self._color.green(f"Finished syncing {sync_flow_result.sync_flow.log_name}."))
+            message = (
+                f"{datetime.now().strftime('%d/%b/%Y:%H:%M:%S')}: "
+                f"Finished syncing {sync_flow_result.sync_flow.log_name}."
+            )
+            LOG.info(
+                self._color.color_log(msg=message, color="green"),
+                extra=dict(markup=True),
+            )
         return True
 
     @staticmethod
@@ -331,12 +341,22 @@ class SyncFlowExecutor:
         SyncFlowException
         """
         dependent_sync_flows = []
+        sync_types = EventType.get_accepted_values(EventName.SYNC_FLOW_START)
+        sync_type: Optional[str] = type(sync_flow).__name__
+        thread_id = uuid4()
+        if sync_type not in sync_types:
+            sync_type = None
         try:
+            if sync_type:
+                EventTracker.track_event("SyncFlowStart", sync_type, thread_id=thread_id)
             dependent_sync_flows = sync_flow.execute()
         except ClientError as e:
-            if e.response.get("Error", dict()).get("Code", "") == "ResourceNotFoundException":
+            if e.response.get("Error", {}).get("Code", "") == "ResourceNotFoundException":
                 raise SyncFlowException(sync_flow, MissingPhysicalResourceError()) from e
             raise SyncFlowException(sync_flow, e) from e
         except Exception as e:
             raise SyncFlowException(sync_flow, e) from e
+        finally:
+            if sync_type:
+                EventTracker.track_event("SyncFlowEnd", sync_type, thread_id=thread_id)
         return SyncFlowResult(sync_flow=sync_flow, dependent_sync_flows=dependent_sync_flows)

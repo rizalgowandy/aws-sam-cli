@@ -1,73 +1,73 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: 'AWS::Serverless-2016-10-31'
+Transform: AWS::Serverless-2016-10-31
 Description: A template to test for implicit HttpApi condition handling.
 Conditions:
   MyCondition:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond1:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond2:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond3:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond4:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond5:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond6:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond7:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond8:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   Cond9:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
 Globals:
   HttpApi:
     RouteSettings:
-      "GET /sub":
+      GET /sub:
         ThrottlingBurstLimit: 100
     Auth:
       Authorizers:
         oauth2:
           AuthorizationScopes:
-            - scope4
+          - scope4
           JwtConfiguration:
-            issuer: "https://www.example.com/v1/connect/oidc"
+            issuer: https://www.example.com/v1/connect/oidc
             audience:
-              - MyApi
-          IdentitySource: "$request.querystring.param"
+            - MyApi
+          IdentitySource: $request.querystring.param
 Resources:
   hello:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: MyCondition
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -81,11 +81,11 @@ Resources:
             Path: /sub
             Method: get
   helloworld1099:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -104,11 +104,11 @@ Resources:
             Path: /hello/again
             Method: get
   helloworld1:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond1
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -118,13 +118,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub1
-            Method: post 
+            Method: post
   helloworld2:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond2
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -134,13 +134,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub2
-            Method: post 
+            Method: post
   helloworld3:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond3
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -150,13 +150,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub3
-            Method: post 
+            Method: post
   helloworld4:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond4
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -166,13 +166,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub4
-            Method: post 
+            Method: post
   helloworld5:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond5
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -182,13 +182,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub5
-            Method: post 
+            Method: post
   helloworld6:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond6
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -198,13 +198,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub6
-            Method: post 
+            Method: post
   helloworld7:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond7
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -214,13 +214,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub7
-            Method: post 
+            Method: post
   helloworld8:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond8
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -230,13 +230,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub8
-            Method: post 
+            Method: post
   helloworld9:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: Cond9
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -246,4 +246,4 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /sub9
-            Method: post 
+            Method: post

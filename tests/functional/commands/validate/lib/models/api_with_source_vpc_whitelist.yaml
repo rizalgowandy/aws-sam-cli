@@ -7,9 +7,9 @@ Globals:
   Api:
     Auth:
       ResourcePolicy:
-        SourceVpcWhitelist: 
-          - !Ref Vpc1
-          - vpc-5678
+        SourceVpcWhitelist:
+        - !Ref Vpc1
+        - vpc-5678
 
 Resources:
   MyFunction:
@@ -24,7 +24,7 @@ Resources:
           return response;
         };
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         Api:
           Type: Api
@@ -51,4 +51,3 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
-

@@ -1,7 +1,11 @@
 """Holds Classes for API Gateway to Lambda Events"""
-from time import time
-from datetime import datetime
+
 import uuid
+from datetime import datetime, timezone
+from time import time_ns
+from typing import Any, Dict
+
+from samcli.local.apigw.route import Route
 
 
 class ContextIdentity:
@@ -80,8 +84,8 @@ class RequestContext:
         path=None,
         protocol=None,
         domain_name=None,
-        request_time_epoch=int(time()),
-        request_time=datetime.utcnow().strftime("%d/%b/%Y:%H:%M:%S +0000"),
+        request_time_epoch=int(time_ns() // 1_000_000),
+        request_time=datetime.now(timezone.utc).strftime("%d/%b/%Y:%H:%M:%S +0000"),
         operation_name=None,
     ):
         """
@@ -120,7 +124,7 @@ class RequestContext:
         self.request_time = request_time
         self.operation_name = operation_name
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         """
         Constructs an dictionary representation of the RequestContext Object to be used in serializing to JSON
 
@@ -168,6 +172,7 @@ class ApiGatewayLambdaEvent:
         stage_variables=None,
         path=None,
         is_base_64_encoded=False,
+        api_type=Route.API,
     ):
         """
         Constructs an ApiGatewayLambdaEvent
@@ -184,6 +189,7 @@ class ApiGatewayLambdaEvent:
         :param dict stage_variables: API Gateway Stage Variables
         :param str path: Path of the request
         :param bool is_base_64_encoded: True if the data is base64 encoded.
+        :param str api_type: The type of API the event is being generated for
         """
 
         if not isinstance(query_string_params, dict) and query_string_params is not None:
@@ -204,7 +210,6 @@ class ApiGatewayLambdaEvent:
         if not isinstance(stage_variables, dict) and stage_variables is not None:
             raise TypeError("'stage_variables' must be of type dict or None")
 
-        self.version = "1.0"
         self.http_method = http_method
         self.body = body
         self.resource = resource
@@ -217,27 +222,30 @@ class ApiGatewayLambdaEvent:
         self.stage_variables = stage_variables
         self.path = path
         self.is_base_64_encoded = is_base_64_encoded
+        self.api_type = api_type
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         """
         Constructs an dictionary representation of the ApiGatewayLambdaEvent Object to be used in serializing to JSON
 
-        :return: dict representing the object
+        Returns
+        -------
+        Dict[str, Any]
+            Dict representing the object
         """
         request_context_dict = {}
         if self.request_context:
             request_context_dict = self.request_context.to_dict()
 
         json_dict = {
-            "version": self.version,
             "httpMethod": self.http_method,
             "body": self.body if self.body else None,
             "resource": self.resource,
             "requestContext": request_context_dict,
             "queryStringParameters": dict(self.query_string_params) if self.query_string_params else None,
-            "multiValueQueryStringParameters": dict(self.multi_value_query_string_params)
-            if self.multi_value_query_string_params
-            else None,
+            "multiValueQueryStringParameters": (
+                dict(self.multi_value_query_string_params) if self.multi_value_query_string_params else None
+            ),
             "headers": dict(self.headers) if self.headers else None,
             "multiValueHeaders": dict(self.multi_value_headers) if self.multi_value_headers else None,
             "pathParameters": dict(self.path_parameters) if self.path_parameters else None,
@@ -245,6 +253,10 @@ class ApiGatewayLambdaEvent:
             "path": self.path,
             "isBase64Encoded": self.is_base_64_encoded,
         }
+
+        # v1 payloads and rest api payloads are identical save for the version field
+        if self.api_type == Route.HTTP:
+            json_dict["version"] = "1.0"
 
         return json_dict
 
@@ -326,7 +338,7 @@ class RequestContextV2:
         self.domain_name = domain_name
         self.domain_prefix = domain_prefix
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         """
         Constructs an dictionary representation of the RequestContext Version 2
         Object to be used in serializing to JSON
@@ -404,25 +416,38 @@ class ApiGatewayV2LambdaEvent:
         if not isinstance(stage_variables, dict) and stage_variables is not None:
             raise TypeError("'stage_variables' must be of type dict or None")
 
+        # convert mutlivalue queries into a comma separated list per API GW documentation for format v2
+        converted_query_string_params = None
+        if query_string_params is not None:
+            converted_query_string_params = {}
+            for k, v in query_string_params.items():
+                if isinstance(v, str):
+                    converted_query_string_params[k] = v
+                else:
+                    converted_query_string_params[k] = ",".join(v)
+
         self.version = "2.0"
         self.route_key = route_key
         self.raw_path = raw_path
         self.raw_query_string = raw_query_string
         self.cookies = cookies
         self.headers = headers
-        self.query_string_params = query_string_params
+        self.query_string_params = converted_query_string_params
         self.request_context = request_context
         self.body = body
         self.path_parameters = path_parameters
         self.is_base_64_encoded = is_base_64_encoded
         self.stage_variables = stage_variables
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         """
         Constructs an dictionary representation of the ApiGatewayLambdaEvent
         Version 2 Object to be used in serializing to JSON
 
-        :return: dict representing the object
+        Returns
+        -------
+        Dict[str, Any]
+            Dict representing the object
         """
         request_context_dict = {}
         if self.request_context:

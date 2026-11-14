@@ -3,8 +3,8 @@ Transform: AWS::Serverless-2016-10-31
 Conditions:
   MyCondition:
     Fn::Equals:
-      - true
-      - true
+    - true
+    - true
 Globals:
   Api:
     # If we skip AllowMethods, then SAM will auto generate a list of methods scoped to each path
@@ -17,7 +17,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/member_portal.zip
       Handler: index.gethtml
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         DeleteHtml:
           Type: Api
@@ -32,7 +32,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/member_portal.zip
       Handler: index.gethtml
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         GetHtml:
           Type: Api

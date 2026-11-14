@@ -58,8 +58,11 @@ class TestInteractiveFlow(TestCase):
             name=None,
             app_template=None,
             no_input=False,
+            tracing=False,
+            application_insights=False,
+            structured_logging=False,
         )
         output_files = list(self.output_dir.rglob("*"))
-        self.assertEqual(len(output_files), 8)
+        self.assertEqual(len(output_files), 9)
         unique_test_file_path = self.output_dir / "unknown_runtime_app" / "unique_test_file.txt"
         self.assertIn(unique_test_file_path, output_files)

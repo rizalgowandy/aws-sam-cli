@@ -9,6 +9,7 @@ from samcli.lib.utils.architecture import X86_64, ARM64
 
 from samcli.lib.providers.provider import (
     LayerVersion,
+    MicrovmImage,
     ResourceIdentifier,
     Stack,
     _get_build_dir,
@@ -18,6 +19,7 @@ from samcli.lib.providers.provider import (
     get_unique_resource_ids,
     Function,
     get_resource_full_path_by_id,
+    FunctionBuildInfo,
 )
 from samcli.commands.local.cli_common.user_exceptions import (
     InvalidLayerVersionArn,
@@ -122,6 +124,153 @@ class TestStack(TestCase):
         self.assertEqual(self.expected_stack_path, self.stack.stack_path)
 
 
+class TestStackEqual(TestCase):
+    def test_stacks_are_equal(self):
+        stack1 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        stack2 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        self.assertTrue(stack1 == stack2)
+
+    def test_stacks_are_not_equal_different_types(self):
+        stack1 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        not_stack = Mock()
+        self.assertFalse(stack1 == not_stack)
+
+    def test_stacks_are_not_equal_different_parent_stack_path(self):
+        stack1 = Stack(
+            "stack1",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        stack2 = Stack(
+            "stack2",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        self.assertFalse(stack1 == stack2)
+
+    def test_stacks_are_not_equal_different_stack_name(self):
+        stack1 = Stack(
+            "stack",
+            "stackLogicalId1",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        stack2 = Stack(
+            "stack",
+            "stackLogicalId2",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        self.assertFalse(stack1 == stack2)
+
+    def test_stacks_are_not_equal_different_template_path(self):
+        stack1 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack1",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        stack2 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack2",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        self.assertFalse(stack1 == stack2)
+
+    def test_stacks_are_not_equal_different_parameters(self):
+        stack1 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key1": "value1"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        stack2 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key2": "value2"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        self.assertFalse(stack1 == stack2)
+
+    def test_stacks_are_not_equal_different_templates(self):
+        stack1 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        stack2 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func2": {"Runtime": "Java"}}},
+            {"SamResourceId": "stackCustomId"},
+        )
+        self.assertFalse(stack1 == stack2)
+
+    def test_stacks_are_not_equal_different_metadata(self):
+        stack1 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId1": "stackCustomId1"},
+        )
+        stack2 = Stack(
+            "stack",
+            "stackLogicalId",
+            "/stack",
+            {"key": "value"},
+            {"Resources": {"func1": {"Runtime": "Python"}}},
+            {"SamResourceId2": "stackCustomId2"},
+        )
+        self.assertFalse(stack1 == stack2)
+
+
 class TestFunction(TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -146,7 +295,12 @@ class TestFunction(TestCase):
             None,
             [ARM64],
             None,
+            FunctionBuildInfo.BuildableZip,
             "stackpath",
+            None,
+            None,
+            None,
+            None,
         )
 
     @parameterized.expand(
@@ -180,6 +334,53 @@ class TestFunction(TestCase):
     def test_skip_build_is_false_if_skip_build_metadata_flag_is_true(self):
         self.function = self.function._replace(metadata={"SkipBuild": True})
         self.assertTrue(self.function.skip_build)
+
+    def test_capacity_provider_configuration_is_none_if_capacity_provider_config_is_none(self):
+        self.function = self.function._replace(capacity_provider_config=None)
+        self.assertIsNone(self.function.capacity_provider_configuration)
+
+    def test_capacity_provider_configuration_returns_config_object(self):
+        capacity_provider_config = {
+            "Arn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider:my-capacity-provider-name",
+            "PerExecutionEnvironmentMaxConcurrency": 8,
+            "ExecutionEnvironmentMemoryToVCpuRatio": 2.0,
+        }
+        self.function = self.function._replace(capacity_provider_config=capacity_provider_config)
+        config = self.function.capacity_provider_configuration
+        self.assertIsNotNone(config)
+        self.assertEqual(
+            config.arn, "arn:aws:lambda:us-east-1:123456789012:capacity-provider:my-capacity-provider-name"
+        )
+        self.assertEqual(config.execution_environment_max_concurrency, 8)
+        self.assertEqual(config.execution_environment_memory_to_vcpu_ratio, 2.0)
+
+    def test_capacity_provider_configuration_handles_cdk_structure(self):
+        # CDK synthesizes nested structure
+        capacity_provider_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider:my-capacity-provider-name",
+                "PerExecutionEnvironmentMaxConcurrency": 6,
+                "ExecutionEnvironmentMemoryGiBPerVCpu": 4.0,
+            }
+        }
+        self.function = self.function._replace(capacity_provider_config=capacity_provider_config)
+        config = self.function.capacity_provider_configuration
+        self.assertIsNotNone(config)
+        self.assertEqual(
+            config.arn, "arn:aws:lambda:us-east-1:123456789012:capacity-provider:my-capacity-provider-name"
+        )
+        self.assertEqual(config.execution_environment_max_concurrency, 6)
+        self.assertEqual(config.execution_environment_memory_to_vcpu_ratio, 4.0)
+
+    def test_publish_to_latest_published_default_is_none(self):
+        self.assertIsNone(self.function.publish_to_latest_published)
+
+    def test_publish_to_latest_published_can_be_set(self):
+        self.function = self.function._replace(publish_to_latest_published=True)
+        self.assertTrue(self.function.publish_to_latest_published)
+
+        self.function = self.function._replace(publish_to_latest_published=False)
+        self.assertFalse(self.function.publish_to_latest_published)
 
 
 class TestLayerVersion(TestCase):
@@ -363,7 +564,6 @@ class TestGetResourceByID(TestCase):
     def test_get_resource_by_id_explicit_root(
         self,
     ):
-
         resource_identifier = MagicMock()
         resource_identifier.stack_path = ""
         resource_identifier.resource_iac_id = f"{'CDK' if self.is_cdk else ''}Function1"
@@ -384,7 +584,6 @@ class TestGetResourceByID(TestCase):
     def test_get_resource_by_id_explicit_nested(
         self,
     ):
-
         resource_identifier = MagicMock()
         resource_identifier.stack_path = "NestedStack1"
         resource_identifier.resource_iac_id = f"{'CDK' if self.is_cdk else ''}Function1"
@@ -397,7 +596,6 @@ class TestGetResourceByID(TestCase):
     def test_get_resource_by_id_explicit_nested_nested(
         self,
     ):
-
         resource_identifier = MagicMock()
         resource_identifier.stack_path = "NestedStack1/NestedNestedStack1"
         resource_identifier.resource_iac_id = f"{'CDK' if self.is_cdk else ''}Function2"
@@ -410,7 +608,6 @@ class TestGetResourceByID(TestCase):
     def test_get_resource_by_id_implicit_root(
         self,
     ):
-
         resource_identifier = MagicMock()
         resource_identifier.stack_path = ""
         resource_identifier.resource_iac_id = f"{'CDK' if self.is_cdk else ''}Function1"
@@ -423,7 +620,6 @@ class TestGetResourceByID(TestCase):
     def test_get_resource_by_id_implicit_nested(
         self,
     ):
-
         resource_identifier = MagicMock()
         resource_identifier.stack_path = ""
         resource_identifier.resource_iac_id = f"{'CDK' if self.is_cdk else ''}Function2"
@@ -436,7 +632,6 @@ class TestGetResourceByID(TestCase):
     def test_get_resource_by_id_implicit_with_stack_path(
         self,
     ):
-
         resource_identifier = MagicMock()
         resource_identifier.stack_path = "NestedStack1"
         resource_identifier.resource_iac_id = f"{'CDK' if self.is_cdk else ''}Function1"
@@ -449,7 +644,6 @@ class TestGetResourceByID(TestCase):
     def test_get_resource_by_id_not_found(
         self,
     ):
-
         resource_identifier = MagicMock()
         resource_identifier.resource_iac_id = f"{'CDK' if self.is_cdk else ''}Function3"
 
@@ -605,6 +799,12 @@ class TestGetResourceFullPathByID(TestCase):
                                 "aws:cdk:path": "Stack/CDKResource1-x/Resource",
                             },
                         },
+                        "CDKResource2": {
+                            "Properties": {"Body"},
+                            "Metadata": {
+                                "aws:cdk:path": "CDKResource2-x",
+                            },
+                        },
                         "CFNResource1": {
                             "Properties": {"Body"},
                         },
@@ -624,6 +824,11 @@ class TestGetResourceFullPathByID(TestCase):
                                 "aws:cdk:path": "Stack/CDKResourceInChild1-x/Resource",
                             },
                         },
+                        "CDKResourceInChild2": {
+                            "Metadata": {
+                                "aws:cdk:path": "Stack/CDKResourceInChild2-x/Lambda/Resource",
+                            },
+                        },
                         "CFNResourceInChild1": {
                             "Properties": {"Body"},
                         },
@@ -637,18 +842,102 @@ class TestGetResourceFullPathByID(TestCase):
             (ResourceIdentifier("CFNResource1"), "CFNResource1"),
             (ResourceIdentifier("CDKResource1"), "CDKResource1-x"),
             (ResourceIdentifier("CDKResource1-x"), "CDKResource1-x"),
+            (ResourceIdentifier("CDKResource2"), "CDKResource2"),
             (ResourceIdentifier("CFNResourceInChild1"), "childStack/CFNResourceInChild1"),
             (ResourceIdentifier("childStack/CFNResourceInChild1"), "childStack/CFNResourceInChild1"),
             (ResourceIdentifier("CDKResourceInChild1"), "childStack/CDKResourceInChild1-x"),
             (ResourceIdentifier("CDKResourceInChild1-x"), "childStack/CDKResourceInChild1-x"),
+            (ResourceIdentifier("CDKResourceInChild2"), "childStack/CDKResourceInChild2"),
             (ResourceIdentifier("childStack/CDKResourceInChild1-x"), "childStack/CDKResourceInChild1-x"),
+            (ResourceIdentifier("childStack/CDKResourceInChild2"), "childStack/CDKResourceInChild2"),
             (ResourceIdentifier("InvalidResourceId"), None),
             (ResourceIdentifier("InvalidStackId/CFNResourceInChild1"), None),
             # we should use iac_resource_id to define full path, could not use resource logical id in full path although
             # cdk id is there
             (ResourceIdentifier("childStack/CDKResourceInChild1"), None),
+            (ResourceIdentifier("CDKResource2-x"), None),
+            (ResourceIdentifier("childStack/CDKResourceInChild2-x"), None),
         ]
     )
     def test_get_resource_full_path_by_id(self, resource_id, expected_full_path):
         full_path = get_resource_full_path_by_id(self.stacks, resource_id)
         self.assertEqual(expected_full_path, full_path)
+
+
+class TestGetStack(TestCase):
+    root_stack = Stack("", "Root", "template.yaml", None, {})
+    child_stack = Stack("Root", "Child", "root_stack/template.yaml", None, {})
+    child_child_stack = Stack("Root/Child", "ChildChild", "root_stack/child_stack/template.yaml", None, {})
+
+    def test_get_parent_stack(self):
+        stack = Stack.get_parent_stack(self.child_stack, [self.root_stack, self.child_stack, self.child_child_stack])
+        self.assertEqual(stack, self.root_stack)
+
+        stack = Stack.get_parent_stack(self.root_stack, [self.root_stack, self.child_stack, self.child_child_stack])
+        self.assertIsNone(stack)
+
+    def test_get_stack_by_full_path(self):
+        stack = Stack.get_stack_by_full_path("Root/Child", [self.root_stack, self.child_stack, self.child_child_stack])
+        self.assertEqual(stack, self.child_stack)
+
+        stack = Stack.get_stack_by_full_path("Root", [self.root_stack, self.child_stack, self.child_child_stack])
+        self.assertEqual(stack, self.root_stack)
+
+        stack = Stack.get_stack_by_full_path("Child/Child", [self.root_stack, self.child_stack, self.child_child_stack])
+        self.assertIsNone(stack)
+
+    def test_get_child_stacks(self):
+        stack_list = Stack.get_child_stacks(
+            self.root_stack, [self.root_stack, self.child_stack, self.child_child_stack]
+        )
+        self.assertEqual(stack_list, [self.child_stack])
+
+        stack_list = Stack.get_child_stacks(
+            self.child_stack, [self.root_stack, self.child_stack, self.child_child_stack]
+        )
+        self.assertEqual(stack_list, [self.child_child_stack])
+
+        stack_list = Stack.get_child_stacks(
+            self.child_child_stack, [self.root_stack, self.child_stack, self.child_child_stack]
+        )
+        self.assertEqual(stack_list, [])
+
+
+class TestMicrovmImage(TestCase):
+    """Tests for MicrovmImage class."""
+
+    @parameterized.expand(
+        [
+            ("MyImage", "./app", "", None, "MyImage"),  # root stack, full_path = name (logical_id)
+            ("MyImage", "./app", "ChildStack", None, "ChildStack/MyImage"),  # nested stack
+            ("MyImage", "./app", "", {"SamResourceId": "MyImage-x"}, "MyImage-x"),  # CDK with SamResourceId
+        ]
+    )
+    def test_full_path(self, name, code_uri, stack_path, metadata, expected_full_path):
+        img = MicrovmImage(name=name, code_uri=code_uri, architecture="arm64", stack_path=stack_path, metadata=metadata)
+        self.assertEqual(img.full_path, expected_full_path)
+
+    def test_microvm_image_name(self):
+        img = MicrovmImage(name="MyImage", code_uri="./app", architecture="arm64", microvm_image_name="my-app")
+        self.assertEqual(img.microvm_image_name, "my-app")
+
+    @parameterized.expand(
+        [
+            (None, {}),  # None metadata defaults to empty dict
+            ({}, {}),  # empty dict stays empty
+            ({"SkipBuild": True}, {"SkipBuild": True}),  # metadata preserved
+        ]
+    )
+    def test_metadata(self, input_metadata, expected_metadata):
+        img = MicrovmImage(name="MyImage", code_uri="./app", architecture="arm64", metadata=input_metadata)
+        self.assertEqual(img.metadata, expected_metadata)
+
+    def test_microvm_image_id_defaults_to_name(self):
+        img = MicrovmImage(name="MyImage", code_uri="./app", architecture="arm64")
+        self.assertEqual(img.microvm_image_id, "MyImage")
+
+    def test_microvm_image_id_uses_sam_resource_id(self):
+        img = MicrovmImage(
+            name="MyImage", code_uri="./app", architecture="arm64", metadata={"SamResourceId": "MyImage-x"}
+        )
+        self.assertEqual(img.microvm_image_id, "MyImage-x")

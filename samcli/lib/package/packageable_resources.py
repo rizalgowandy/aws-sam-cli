@@ -1,10 +1,12 @@
 """
 Code for all Package-able resources
 """
+
 import logging
 import os
 import shutil
-from typing import Optional, Union, Dict
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Type, Union, cast
 
 import jmespath
 from botocore.utils import set_value_from_jmespath
@@ -14,43 +16,48 @@ from samcli.lib.package.ecr_uploader import ECRUploader
 from samcli.lib.package.s3_uploader import S3Uploader
 from samcli.lib.package.uploaders import Destination, Uploaders
 from samcli.lib.package.utils import (
-    resource_not_packageable,
-    is_local_file,
-    is_zip_file,
     copy_to_temp_dir,
+    is_ecr_url,
+    is_local_file,
+    is_path_value_valid,
+    is_s3_protocol_url,
+    is_zip_file,
+    make_abs_path,
+    resource_not_packageable,
     upload_local_artifacts,
     upload_local_image_artifacts,
-    is_s3_protocol_url,
-    is_path_value_valid,
-    is_ecr_url,
 )
-
+from samcli.lib.utils import graphql_api
+from samcli.lib.utils.packagetype import IMAGE, ZIP
 from samcli.lib.utils.resources import (
-    AWS_SERVERLESSREPO_APPLICATION,
-    AWS_SERVERLESS_FUNCTION,
-    AWS_SERVERLESS_API,
-    AWS_SERVERLESS_HTTPAPI,
+    AWS_APIGATEWAY_RESTAPI,
+    AWS_APIGATEWAY_V2_API,
+    AWS_APPSYNC_FUNCTIONCONFIGURATION,
     AWS_APPSYNC_GRAPHQLSCHEMA,
     AWS_APPSYNC_RESOLVER,
-    AWS_APPSYNC_FUNCTIONCONFIGURATION,
-    AWS_LAMBDA_FUNCTION,
-    AWS_APIGATEWAY_RESTAPI,
-    AWS_SERVERLESS_STATEMACHINE,
-    AWS_ELASTICBEANSTALK_APPLICATIONVERSION,
-    AWS_LAMBDA_LAYERVERSION,
-    AWS_SERVERLESS_LAYERVERSION,
-    AWS_GLUE_JOB,
-    AWS_STEPFUNCTIONS_STATEMACHINE,
     AWS_CLOUDFORMATION_MODULEVERSION,
     AWS_CLOUDFORMATION_RESOURCEVERSION,
-    METADATA_WITH_LOCAL_PATHS,
-    RESOURCES_WITH_LOCAL_PATHS,
-    RESOURCES_WITH_IMAGE_COMPONENT,
     AWS_ECR_REPOSITORY,
-    AWS_APIGATEWAY_V2_API,
+    AWS_ELASTICBEANSTALK_APPLICATIONVERSION,
+    AWS_GLUE_JOB,
+    AWS_LAMBDA_FUNCTION,
+    AWS_LAMBDA_LAYERVERSION,
+    AWS_LAMBDA_MICROVMIMAGE,
+    AWS_SERVERLESS_API,
+    AWS_SERVERLESS_FUNCTION,
+    AWS_SERVERLESS_GRAPHQLAPI,
+    AWS_SERVERLESS_HTTPAPI,
+    AWS_SERVERLESS_LAYERVERSION,
+    AWS_SERVERLESS_MICROVMIMAGE,
+    AWS_SERVERLESS_STATEMACHINE,
+    AWS_SERVERLESS_WEBFUNCTION,
+    AWS_SERVERLESSREPO_APPLICATION,
+    AWS_STEPFUNCTIONS_STATEMACHINE,
+    METADATA_WITH_LOCAL_PATHS,
+    RESOURCES_WITH_IMAGE_COMPONENT,
+    RESOURCES_WITH_LOCAL_PATHS,
 )
-
-from samcli.lib.utils.packagetype import IMAGE, ZIP
+from samcli.lib.utils.s3 import parse_s3_url
 
 LOG = logging.getLogger(__name__)
 
@@ -65,9 +72,17 @@ class Resource:
     EXPORT_DESTINATION: Destination
     ARTIFACT_TYPE: Optional[str] = None
 
-    def __init__(self, uploaders: Uploaders, code_signer):
+    # Parameter values propagated from the enclosing Template (parent stack's
+    # own params + CLI --parameter-overrides + pseudo-params). Used by
+    # CloudFormationStackResource.do_export to resolve Fn::ForEach collections
+    # in nested-stack templates.
+    parent_parameter_values: Optional[Dict] = None
+
+    def __init__(self, uploaders: Uploaders, code_signer, cache: Optional[Dict] = None):
         self.uploaders = uploaders
         self.code_signer = code_signer
+        self.cache = cache
+        self.parent_parameter_values: Optional[Dict] = None
 
     @property
     def uploader(self) -> Union[S3Uploader, ECRUploader]:
@@ -91,7 +106,7 @@ class ResourceZip(Resource):
     Base class representing a CloudFormation resource that can be exported
     """
 
-    RESOURCE_TYPE: Optional[str] = None
+    RESOURCE_TYPE: str = ""
     PROPERTY_NAME: str = ""
     PACKAGE_NULL_PROPERTY = True
     # Set this property to True in base class if you want the exporter to zip
@@ -135,30 +150,43 @@ class ResourceZip(Resource):
             if temp_dir:
                 shutil.rmtree(temp_dir)
 
-    def do_export(self, resource_id, resource_dict, parent_dir):
+    def do_export(
+        self,
+        resource_id,
+        resource_dict,
+        parent_dir,
+        property_path: Optional[str] = None,
+        local_path: Optional[str] = None,
+    ):
         """
         Default export action is to upload artifacts and set the property to
         S3 URL of the uploaded object
         If code signing configuration is provided for function/layer, uploaded artifact
         will be replaced by signed artifact location
         """
+        if property_path is None:
+            property_path = self.PROPERTY_NAME
+        uploader = cast(S3Uploader, self.uploader)
         # code signer only accepts files which has '.zip' extension in it
         # so package artifact with '.zip' if it is required to be signed
         should_sign_package = self.code_signer.should_sign_package(resource_id)
         artifact_extension = "zip" if should_sign_package else None
         uploaded_url = upload_local_artifacts(
+            self.RESOURCE_TYPE,
             resource_id,
             resource_dict,
-            self.PROPERTY_NAME,
+            property_path,
             parent_dir,
-            self.uploader,
+            uploader,
             artifact_extension,
+            local_path,
+            self.cache,
         )
         if should_sign_package:
             uploaded_url = self.code_signer.sign_package(
-                resource_id, uploaded_url, self.uploader.get_version_of_artifact(uploaded_url)
+                resource_id, uploaded_url, uploader.get_version_of_artifact(uploaded_url)
             )
-        set_value_from_jmespath(resource_dict, self.PROPERTY_NAME, uploaded_url)
+        set_value_from_jmespath(resource_dict, property_path, uploaded_url)
 
     def delete(self, resource_id, resource_dict):
         """
@@ -184,7 +212,7 @@ class ResourceZip(Resource):
         # artifact, as deletion of intrinsic ref function artifacts is not supported yet.
         # TODO: Allow deletion of S3 artifacts with intrinsic ref functions.
         if resource_path and isinstance(resource_path, str):
-            return self.uploader.parse_s3_url(resource_path)
+            return parse_s3_url(resource_path)
         return {"Bucket": None, "Key": None}
 
 
@@ -325,10 +353,10 @@ class ResourceWithS3UrlDict(ResourceZip):
         """
 
         artifact_s3_url = upload_local_artifacts(
-            resource_id, resource_dict, self.PROPERTY_NAME, parent_dir, self.uploader
+            self.RESOURCE_TYPE, resource_id, resource_dict, self.PROPERTY_NAME, parent_dir, self.uploader
         )
 
-        parsed_url = S3Uploader.parse_s3_url(
+        parsed_url = parse_s3_url(
             artifact_s3_url,
             bucket_name_property=self.BUCKET_NAME_PROPERTY,
             object_key_property=self.OBJECT_KEY_PROPERTY,
@@ -372,6 +400,42 @@ class ServerlessFunctionResource(ResourceZip):
     RESOURCE_TYPE = AWS_SERVERLESS_FUNCTION
     PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][0]
     FORCE_ZIP = True
+
+
+class ServerlessWebFunctionResource(ResourceZip):
+    RESOURCE_TYPE = AWS_SERVERLESS_WEBFUNCTION
+    PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][0]
+    FORCE_ZIP = True
+    EXPORT_DESTINATION = Destination.WEB_FUNCTION_S3
+
+    def do_export(
+        self,
+        resource_id,
+        resource_dict,
+        parent_dir,
+        property_path: Optional[str] = None,
+        local_path: Optional[str] = None,
+    ):
+        property_path = property_path or self.PROPERTY_NAME
+        original_value = jmespath.search(property_path, resource_dict)
+        super().do_export(resource_id, resource_dict, parent_dir, property_path, local_path)
+        if isinstance(original_value, str) and is_s3_protocol_url(original_value):
+            # Code already in S3 keeps its location
+            return
+        export_name = getattr(self.uploaders, "web_function_bucket_export", None)
+        uploaded_url = jmespath.search(property_path, resource_dict)
+        if not isinstance(export_name, str) or not export_name or not isinstance(uploaded_url, str):
+            return
+        # Importing the bucket name stops CloudFormation deleting the code bucket stack while this stack uses it
+        location = parse_s3_url(uploaded_url, version_property="Version")
+        code_uri: Dict[str, Any] = {"Bucket": {"Fn::ImportValue": export_name}, "Key": location["Key"]}
+        if location.get("Version"):
+            code_uri["Version"] = location["Version"]
+        set_value_from_jmespath(resource_dict, property_path, code_uri)
+
+    def delete(self, resource_id, resource_dict):
+        # Revisions keep reading this code; sam delete removes the code bucket after the stack
+        pass
 
 
 class ServerlessFunctionImageResource(ResourceImage):
@@ -429,6 +493,14 @@ class AppSyncResolverResponseTemplateResource(ResourceZip):
     PACKAGE_NULL_PROPERTY = False
 
 
+class AppSyncResolverCodeResource(ResourceZip):
+    RESOURCE_TYPE = AWS_APPSYNC_RESOLVER
+    PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][2]
+    # Don't package the directory if CodeS3Location is omitted.
+    # Necessary to support CodeS3Location
+    PACKAGE_NULL_PROPERTY = False
+
+
 class AppSyncFunctionConfigurationRequestTemplateResource(ResourceZip):
     RESOURCE_TYPE = AWS_APPSYNC_FUNCTIONCONFIGURATION
     PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][0]
@@ -442,6 +514,14 @@ class AppSyncFunctionConfigurationResponseTemplateResource(ResourceZip):
     PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][1]
     # Don't package the directory if ResponseMappingTemplateS3Location is omitted.
     # Necessary to support ResponseMappingTemplate
+    PACKAGE_NULL_PROPERTY = False
+
+
+class AppSyncFunctionConfigurationCodeResource(ResourceZip):
+    RESOURCE_TYPE = AWS_APPSYNC_FUNCTIONCONFIGURATION
+    PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][2]
+    # Don't package the directory if CodeS3Location is omitted.
+    # Necessary to support CodeS3Location
     PACKAGE_NULL_PROPERTY = False
 
 
@@ -570,17 +650,209 @@ class ECRResource(Resource):
         return jmespath.search(self.PROPERTY_NAME, resource_dict)
 
 
+class GraphQLApiSchemaResource(ResourceZip):
+    RESOURCE_TYPE = AWS_SERVERLESS_GRAPHQLAPI
+    PROPERTY_NAME = graphql_api.SCHEMA_ARTIFACT_PROPERTY
+    # Don't package the directory if SchemaUri is omitted.
+    # Necessary to support SchemaInline
+    PACKAGE_NULL_PROPERTY = False
+
+
+class GraphQLApiCodeResource(ResourceZip):
+    """CodeUri for GraphQLApi resource.
+
+    There can be more than a single instance of CodeUri property in GraphQLApi Resolvers and Functions.
+    This class handles them all.
+
+    GraphQLApi dict shape looks like the following (yaml representation)
+    >>> Resolvers:
+            Mutation:
+                Resolver1:
+                    CodeUri: ...
+                    Pipeline:
+                    - Func1
+                    - Func2
+            Query:
+                Resolver2:
+                    CodeUri: ...
+                    Pipeline:
+                    - Func3
+        Functions:
+            Func1:
+                CodeUri: ...
+            Func2:
+                CodeUri: ...
+            Func3:
+                CodeUri: ...
+        ... # other properties, which are not important here
+    """
+
+    RESOURCE_TYPE = AWS_SERVERLESS_GRAPHQLAPI
+    PROPERTY_NAME = graphql_api.CODE_ARTIFACT_PROPERTY
+    # if CodeUri is omitted the directory is not packaged because it's necessary to support CodeInline
+    PACKAGE_NULL_PROPERTY = False
+
+    def export(self, resource_id: str, resource_dict: Optional[Dict], parent_dir: str):
+        if resource_dict is None:
+            return
+
+        if resource_not_packageable(resource_dict):
+            return
+
+        # to be able to set different nested properties to S3 uri, paths are necessary
+        # jmespath doesn't provide that functionality, thus custom implementation
+        paths_values = graphql_api.find_all_paths_and_values(self.PROPERTY_NAME, resource_dict)
+        for property_path, property_value in paths_values:
+            if isinstance(property_value, dict):
+                LOG.debug("Property %s of %s resource is not a URL", self.PROPERTY_NAME, resource_id)
+                return
+
+            # If property is a file but not a zip file, place file in temp
+            # folder and send the temp folder to be zipped
+            temp_dir = None
+            if is_local_file(property_value) and not is_zip_file(property_value) and self.FORCE_ZIP:
+                temp_dir = copy_to_temp_dir(property_value)
+                set_value_from_jmespath(resource_dict, property_path, temp_dir)
+
+            try:
+                self.do_export(
+                    resource_id, resource_dict, parent_dir, property_path=property_path, local_path=property_value
+                )
+
+            except Exception as ex:
+                LOG.debug("Unable to export", exc_info=ex)
+                raise exceptions.ExportFailedError(
+                    resource_id=resource_id, property_name=property_path, property_value=property_value, ex=ex
+                )
+            finally:
+                if temp_dir:
+                    shutil.rmtree(temp_dir)
+
+
+# Directories that are almost never part of a MicrovmImage source, but are uploaded with it because the whole
+# source directory is zipped as is (for example when CodeUri is the project root)
+_MICROVM_IMAGE_UNEXPECTED_SOURCE_DIRS = (".aws-sam", ".git")
+
+
+def _check_microvm_image_source(resource_id: str, property_name: str, local_path: str, parent_dir: str) -> None:
+    """
+    A MicrovmImage is built from a directory with a Dockerfile at its root, or from a .zip of one. Reject a
+    single other file, such as the Dockerfile itself, instead of uploading a zip of just that file.
+
+    The source directory is uploaded as is, so warn when it contains directories such as .aws-sam or .git.
+    """
+    abs_path = make_abs_path(parent_dir, local_path)
+    if is_local_file(abs_path) and not is_zip_file(abs_path):
+        raise exceptions.ExportFailedError(
+            resource_id=resource_id,
+            property_name=property_name,
+            property_value=local_path,
+            ex=f"'{abs_path}' is a file. A MicrovmImage source must be a directory containing a Dockerfile, "
+            f"or a .zip of one, for example '{os.path.dirname(abs_path)}'.",
+        )
+    if os.path.isdir(abs_path):
+        found = [name for name in _MICROVM_IMAGE_UNEXPECTED_SOURCE_DIRS if os.path.isdir(os.path.join(abs_path, name))]
+        if found:
+            LOG.warning(
+                "MicrovmImage '%s': %s directory '%s' contains %s, and the whole directory is uploaded. Put the "
+                "Dockerfile and application code in a subdirectory and point %s at it, or point %s at a prepared .zip.",
+                resource_id,
+                property_name,
+                abs_path,
+                " and ".join(found),
+                property_name,
+                property_name,
+            )
+
+
+class ServerlessMicrovmImageResource(ResourceZip):
+    """
+    AWS::Serverless::MicrovmImage. The source directory, which holds the Dockerfile, is zipped and uploaded,
+    and CodeUri is set to its S3 URI. The MicroVM service builds the image from that zip.
+    """
+
+    RESOURCE_TYPE = AWS_SERVERLESS_MICROVMIMAGE
+    PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[AWS_SERVERLESS_MICROVMIMAGE][0]
+    # CodeUri is required, so a missing value is left for validation instead of packaging the template directory
+    PACKAGE_NULL_PROPERTY = False
+
+    def export(self, resource_id: str, resource_dict: Optional[Dict], parent_dir: str) -> None:
+        if resource_dict is not None and not resource_not_packageable(resource_dict):
+            code_uri = resource_dict.get(self.PROPERTY_NAME)
+            if isinstance(code_uri, str) and code_uri and not is_s3_protocol_url(code_uri):
+                _check_microvm_image_source(resource_id, self.PROPERTY_NAME, code_uri, parent_dir)
+        super().export(resource_id, resource_dict, parent_dir)
+
+
+class LambdaMicrovmImageResource(ResourceZip):
+    """
+    AWS::Lambda::MicrovmImage. Like ServerlessMicrovmImageResource, but the code is in CodeArtifact, which
+    CloudFormation requires as {Uri: s3://...}. A local path is accepted as {Uri: ./src}, or as a plain string
+    (CDK templates and built templates use that form), and is written back as {Uri: <S3 URI>}. An S3 URI given
+    as a plain string is written as {Uri: <S3 URI>} too, as Lambda function Code is written as an object.
+    Intrinsics are left unchanged.
+    """
+
+    RESOURCE_TYPE = AWS_LAMBDA_MICROVMIMAGE
+    PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[AWS_LAMBDA_MICROVMIMAGE][0]
+    URI_PROPERTY = "Uri"
+
+    def export(self, resource_id: str, resource_dict: Optional[Dict], parent_dir: str) -> None:
+        if resource_dict is None or resource_not_packageable(resource_dict):
+            return
+
+        code_artifact = resource_dict.get(self.PROPERTY_NAME)
+        if isinstance(code_artifact, dict):
+            local_path = code_artifact.get(self.URI_PROPERTY)
+            property_path = f"{self.PROPERTY_NAME}.{self.URI_PROPERTY}"
+        else:
+            local_path = code_artifact
+            property_path = self.PROPERTY_NAME
+        # Unresolved intrinsics are dicts; leave them and missing values unchanged
+        if not isinstance(local_path, str) or not local_path:
+            return
+        if is_s3_protocol_url(local_path):
+            if property_path == self.PROPERTY_NAME:
+                resource_dict[self.PROPERTY_NAME] = {self.URI_PROPERTY: local_path}
+            return
+
+        _check_microvm_image_source(resource_id, property_path, local_path, parent_dir)
+
+        try:
+            self.do_export(resource_id, resource_dict, parent_dir, property_path=property_path)
+            if property_path == self.PROPERTY_NAME:
+                resource_dict[self.PROPERTY_NAME] = {self.URI_PROPERTY: resource_dict[self.PROPERTY_NAME]}
+        except Exception as ex:
+            LOG.debug("Unable to export", exc_info=ex)
+            raise exceptions.ExportFailedError(
+                resource_id=resource_id, property_name=property_path, property_value=local_path, ex=ex
+            )
+
+    def get_property_value(self, resource_dict: Optional[Dict]) -> Dict[str, Optional[str]]:
+        if resource_dict is None:
+            return {"Bucket": None, "Key": None}
+
+        code_artifact = resource_dict.get(self.PROPERTY_NAME)
+        uri = code_artifact.get(self.URI_PROPERTY) if isinstance(code_artifact, dict) else code_artifact
+        if isinstance(uri, str) and is_s3_protocol_url(uri):
+            return parse_s3_url(uri)
+        return {"Bucket": None, "Key": None}
+
+
 RESOURCES_EXPORT_LIST = [
     ServerlessFunctionResource,
     ServerlessFunctionImageResource,
+    ServerlessWebFunctionResource,
     ServerlessApiResource,
     ServerlessHttpApiResource,
     ServerlessStateMachineResource,
     GraphQLSchemaResource,
     AppSyncResolverRequestTemplateResource,
     AppSyncResolverResponseTemplateResource,
+    AppSyncResolverCodeResource,
     AppSyncFunctionConfigurationRequestTemplateResource,
     AppSyncFunctionConfigurationResponseTemplateResource,
+    AppSyncFunctionConfigurationCodeResource,
     ApiGatewayRestApiResource,
     ApiGatewayV2Resource,
     StepFunctionsStateMachineResource,
@@ -593,9 +865,35 @@ RESOURCES_EXPORT_LIST = [
     CloudFormationModuleVersionModulePackage,
     CloudFormationResourceVersionSchemaHandlerPackage,
     ECRResource,
+    GraphQLApiSchemaResource,
+    GraphQLApiCodeResource,
+    ServerlessMicrovmImageResource,
+    LambdaMicrovmImageResource,
 ]
 
-METADATA_EXPORT_LIST = [ServerlessRepoApplicationReadme, ServerlessRepoApplicationLicense]
+
+@dataclass(frozen=True)
+class MetadataExportSpec:
+    """How a top-level Metadata.<type> entry is exported and merged back.
+
+    Used by Template._export_metadata to route entries to their exporter
+    classes, and by merge_language_extensions_s3_uris to copy rewritten
+    property values back into the original (Fn::ForEach-preserving)
+    child-stack template after LE expansion.
+    """
+
+    metadata_type: str
+    property_names: List[str]
+    exporters: List[Type["Resource"]] = field(default_factory=list)
+
+
+METADATA_EXPORTS: List[MetadataExportSpec] = [
+    MetadataExportSpec(
+        metadata_type=AWS_SERVERLESSREPO_APPLICATION,
+        property_names=["LicenseUrl", "ReadmeUrl"],
+        exporters=[ServerlessRepoApplicationLicense, ServerlessRepoApplicationReadme],
+    ),
+]
 
 
 def include_transform_export_handler(template_dict, uploader, parent_dir):
@@ -619,4 +917,29 @@ def include_transform_export_handler(template_dict, uploader, parent_dir):
     return template_dict
 
 
-GLOBAL_EXPORT_DICT = {"Fn::Transform": include_transform_export_handler}
+@dataclass(frozen=True)
+class GlobalTransformExportSpec:
+    """How a global (anywhere-in-the-tree) export hook is invoked.
+
+    The discriminator decides whether a given dict node matches this spec
+    (dispatch on Fn::Transform's "Name" field today; ready for future
+    Fn::Transform variants). The handler receives the matched node and
+    mutates it in place to rewrite local paths to S3 URLs.
+    """
+
+    template_key: str
+    discriminator: Callable[[object], bool]
+    handler: Callable
+
+
+def _is_aws_include(node: object) -> bool:
+    return isinstance(node, dict) and node.get("Name") == "AWS::Include"
+
+
+GLOBAL_TRANSFORM_EXPORTS: List[GlobalTransformExportSpec] = [
+    GlobalTransformExportSpec(
+        template_key="Fn::Transform",
+        discriminator=_is_aws_include,
+        handler=include_transform_export_handler,
+    ),
+]

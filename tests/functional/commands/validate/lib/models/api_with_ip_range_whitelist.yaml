@@ -2,8 +2,8 @@ Globals:
   Api:
     Auth:
       ResourcePolicy:
-        IpRangeWhitelist: ['1.2.3.4']
-        IpRangeBlacklist: ['1.2.3.4']
+        IpRangeWhitelist: [1.2.3.4]
+        IpRangeBlacklist: [1.2.3.4]
 Resources:
   MyFunction:
     Type: AWS::Serverless::Function
@@ -17,7 +17,7 @@ Resources:
           return response;
         };
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         Api:
           Type: Api

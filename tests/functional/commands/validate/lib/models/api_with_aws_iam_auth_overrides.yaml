@@ -1,13 +1,13 @@
 Resources:
   MyApiWithAwsIamAuthNoCallerCredentials:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
         DefaultAuthorizer: AWS_IAM
         InvokeRole: NONE
   MyApiWithAwsIamAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -21,7 +21,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API1:
           Type: Api
@@ -36,7 +36,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API2:
           Type: Api
@@ -49,7 +49,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API3:
           Type: Api
@@ -64,7 +64,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API3:
           Type: Api
@@ -80,7 +80,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API3:
           Type: Api
@@ -96,7 +96,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API3:
           Type: Api
@@ -112,7 +112,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API3:
           Type: Api
@@ -122,13 +122,13 @@ Resources:
             Path: /MyFunctionNullInvokeRole
             Auth:
               Authorizer: AWS_IAM
-              InvokeRole: null
+              InvokeRole:
   MyFunctionCallerCredentialsOverride:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API3:
           Type: Api
@@ -144,7 +144,7 @@ Resources:
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         API3:
           Type: Api

@@ -6,23 +6,27 @@ from parameterized import parameterized, param
 from unittest import TestCase
 from unittest.mock import patch
 from samcli.local.lambdafn.env_vars import EnvironmentVariables
+from samcli.lib.providers.provider import CapacityProviderConfig
+from samcli.lib.providers.provider import CapacityProviderConfig
 
 
 class TestEnvironmentVariables_init(TestCase):
     def test_must_initialize_with_empty_values(self):
-
         memory = 123
         timeout = 10
         handler = "handler"
+        logging_config = {"logFormat": "JSON"}
 
         environ = EnvironmentVariables()
         environ.memory = memory
         environ.timeout = timeout
         environ.handler = handler
+        environ.logging_config = logging_config
 
         self.assertEqual(environ.memory, memory)
         self.assertEqual(environ.timeout, timeout)
         self.assertEqual(environ.handler, handler)
+        self.assertEqual(environ.logging_config, logging_config)
 
     def test_must_initialize_values_with_required_values(self):
         memory = 123
@@ -64,6 +68,38 @@ class TestEnvironmentVariables_init(TestCase):
         self.assertEqual(environ.shell_env_values, {"c": "d"})
         self.assertEqual(environ.override_values, {"e": "f"})
         self.assertEqual(environ.aws_creds, {"g": "h"})
+
+    def test_must_initialize_with_capacity_provider_config(self):
+        name = "name"
+        memory = 1024
+        timeout = 123
+        handler = "handler"
+        variables = {"a": "b"}
+        shell_values = {"c": "d"}
+        overrides = {"e": "f"}
+        aws_creds = {"g": "h"}
+        capacity_provider_configuration = CapacityProviderConfig(
+            arn="arn:aws:lambda:us-east-1:123456789012:capacity-provider:my-capacity-provider-name",
+            execution_environment_max_concurrency=8,
+        )
+
+        environ = EnvironmentVariables(
+            name,
+            memory,
+            timeout,
+            handler,
+            variables=variables,
+            shell_env_values=shell_values,
+            override_values=overrides,
+            aws_creds=aws_creds,
+            capacity_provider_configuration=capacity_provider_configuration,
+        )
+
+        self.assertEqual(environ.variables, {"a": "b"})
+        self.assertEqual(environ.shell_env_values, {"c": "d"})
+        self.assertEqual(environ.override_values, {"e": "f"})
+        self.assertEqual(environ.aws_creds, {"g": "h"})
+        self.assertEqual(environ.capacity_provider_configuration, capacity_provider_configuration)
 
 
 class TestEnvironmentVariables_resolve(TestCase):
@@ -120,6 +156,7 @@ class TestEnvironmentVariables_resolve(TestCase):
             "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
             "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
             "AWS_REGION": "some region",
             "AWS_DEFAULT_REGION": "some region",
             "AWS_ACCESS_KEY_ID": "some key",
@@ -149,6 +186,7 @@ class TestEnvironmentVariables_resolve(TestCase):
             "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
             "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
             "AWS_REGION": "us-east-1",
             "AWS_ACCESS_KEY_ID": "defaultkey",
             "AWS_SECRET_ACCESS_KEY": "defaultsecret",
@@ -182,6 +220,7 @@ class TestEnvironmentVariables_resolve(TestCase):
             "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
             "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
             "AWS_REGION": "us-east-1",
             "AWS_ACCESS_KEY_ID": "defaultkey",
             "AWS_SECRET_ACCESS_KEY": "defaultsecret",
@@ -223,6 +262,7 @@ class TestEnvironmentVariables_resolve(TestCase):
             "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
             "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
             "AWS_REGION": "us-east-1",
             "AWS_ACCESS_KEY_ID": "defaultkey",
             "AWS_SECRET_ACCESS_KEY": "defaultsecret",
@@ -250,6 +290,104 @@ class TestEnvironmentVariables_resolve(TestCase):
 
         self.assertEqual(environ.resolve(), expected)
 
+    def test_with_capacity_provider_config(self):
+        """
+        Given capacity provider configuration with PerExecutionEnvironmentMaxConcurrency
+        """
+        capacity_provider_config = CapacityProviderConfig(
+            arn="arn:aws:lambda:us-east-1:123456789012:capacity-provider:my-capacity-provider-name",
+            execution_environment_max_concurrency=8,
+        )
+
+        expected = {
+            "AWS_SAM_LOCAL": "true",
+            "AWS_LAMBDA_MAX_CONCURRENCY": "8",
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
+            "AWS_LAMBDA_FUNCTION_TIMEOUT": "123",
+            "AWS_LAMBDA_FUNCTION_HANDLER": "handler",
+            "AWS_LAMBDA_FUNCTION_NAME": self.name,
+            "AWS_LAMBDA_FUNCTION_VERSION": "$LATEST",
+            "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
+            "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
+            "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
+            "AWS_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": "defaultkey",
+            "AWS_SECRET_ACCESS_KEY": "defaultsecret",
+            # This value is coming from user passed environment variable
+            "AWS_DEFAULT_REGION": "user-specified-region",
+            "variable2": "mystring",
+            # Value coming from the overrides
+            "variable1": "variable1 value from overrides",
+            "list_var": "list value coming from overrides",
+            "dict_var": "",
+            "none_var": "",
+            "true_var": "true",
+            "false_var": "false",
+        }
+
+        environ = EnvironmentVariables(
+            self.name,
+            self.memory,
+            self.timeout,
+            self.handler,
+            variables=self.variables,
+            shell_env_values=self.shell_env,
+            override_values=self.override,
+            capacity_provider_configuration=capacity_provider_config,
+        )
+
+        self.assertEqual(environ.resolve(), expected)
+
+    def test_with_capacity_provider_config_default_concurrency(self):
+        """
+        Given capacity provider configuration without PerExecutionEnvironmentMaxConcurrency (should default to 4)
+        """
+        capacity_provider_config = CapacityProviderConfig(
+            arn="arn:aws:lambda:us-east-1:123456789012:capacity-provider:my-capacity-provider-name"
+            # execution_environment_max_concurrency will default to 4
+        )
+
+        expected = {
+            "AWS_SAM_LOCAL": "true",
+            "AWS_LAMBDA_MAX_CONCURRENCY": "4",  # Default value
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
+            "AWS_LAMBDA_FUNCTION_TIMEOUT": "123",
+            "AWS_LAMBDA_FUNCTION_HANDLER": "handler",
+            "AWS_LAMBDA_FUNCTION_NAME": self.name,
+            "AWS_LAMBDA_FUNCTION_VERSION": "$LATEST",
+            "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
+            "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
+            "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
+            "AWS_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": "defaultkey",
+            "AWS_SECRET_ACCESS_KEY": "defaultsecret",
+            # This value is coming from user passed environment variable
+            "AWS_DEFAULT_REGION": "user-specified-region",
+            "variable2": "mystring",
+            # Value coming from the overrides
+            "variable1": "variable1 value from overrides",
+            "list_var": "list value coming from overrides",
+            "dict_var": "",
+            "none_var": "",
+            "true_var": "true",
+            "false_var": "false",
+        }
+
+        environ = EnvironmentVariables(
+            self.name,
+            self.memory,
+            self.timeout,
+            self.handler,
+            variables=self.variables,
+            shell_env_values=self.shell_env,
+            override_values=self.override,
+            capacity_provider_configuration=capacity_provider_config,
+        )
+
+        self.assertEqual(environ.resolve(), expected)
+
 
 class TestEnvironmentVariables_get_aws_variables(TestCase):
     def setUp(self):
@@ -266,7 +404,6 @@ class TestEnvironmentVariables_get_aws_variables(TestCase):
         }
 
     def test_must_work_with_overridden_aws_creds(self):
-
         expected = {
             "AWS_SAM_LOCAL": "true",
             "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
@@ -281,6 +418,7 @@ class TestEnvironmentVariables_get_aws_variables(TestCase):
             "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
             "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
             "AWS_SESSION_TOKEN": "some other token",
         }
 
@@ -289,7 +427,6 @@ class TestEnvironmentVariables_get_aws_variables(TestCase):
         self.assertEqual(expected, environ._get_aws_variables())
 
     def test_must_work_without_any_aws_creds(self):
-
         expected = {
             "AWS_SAM_LOCAL": "true",
             "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
@@ -300,6 +437,7 @@ class TestEnvironmentVariables_get_aws_variables(TestCase):
             "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
             "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
             # Default values assigned to these variables
             "AWS_REGION": "us-east-1",
             "AWS_DEFAULT_REGION": "us-east-1",
@@ -311,7 +449,6 @@ class TestEnvironmentVariables_get_aws_variables(TestCase):
         self.assertEqual(expected, environ._get_aws_variables())
 
     def test_must_work_with_partial_aws_creds(self):
-
         creds = {"region": "some other region", "sessiontoken": "my awesome token"}
 
         expected = {
@@ -324,6 +461,7 @@ class TestEnvironmentVariables_get_aws_variables(TestCase):
             "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
             "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
             "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
             # Values from the input creds
             "AWS_REGION": "some other region",
             "AWS_DEFAULT_REGION": "some other region",
@@ -336,10 +474,108 @@ class TestEnvironmentVariables_get_aws_variables(TestCase):
         environ = EnvironmentVariables(self.name, self.memory, self.timeout, self.handler, aws_creds=creds)
         self.assertEqual(expected, environ._get_aws_variables())
 
+    def test_must_work_with_text_logformat(self):
+        expected = {
+            "AWS_SAM_LOCAL": "true",
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
+            "AWS_LAMBDA_FUNCTION_TIMEOUT": "123",
+            "AWS_LAMBDA_FUNCTION_HANDLER": "handler",
+            "AWS_LAMBDA_FUNCTION_NAME": self.name,
+            "AWS_LAMBDA_FUNCTION_VERSION": "$LATEST",
+            "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
+            "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
+            "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
+            # Default values assigned to these variables
+            "AWS_REGION": "us-east-1",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": "defaultkey",
+            "AWS_SECRET_ACCESS_KEY": "defaultsecret",
+            "AWS_LAMBDA_LOG_FORMAT": "Text",
+        }
+
+        logging_config = {"LogFormat": "Text"}
+        environ = EnvironmentVariables(self.name, self.memory, self.timeout, self.handler, logging_config)
+        self.assertEqual(expected, environ._get_aws_variables())
+
+    def test_must_work_with_default_json_logging_config(self):
+        expected = {
+            "AWS_SAM_LOCAL": "true",
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
+            "AWS_LAMBDA_FUNCTION_TIMEOUT": "123",
+            "AWS_LAMBDA_FUNCTION_HANDLER": "handler",
+            "AWS_LAMBDA_FUNCTION_NAME": self.name,
+            "AWS_LAMBDA_FUNCTION_VERSION": "$LATEST",
+            "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
+            "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
+            "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
+            # Default values assigned to these variables
+            "AWS_REGION": "us-east-1",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": "defaultkey",
+            "AWS_SECRET_ACCESS_KEY": "defaultsecret",
+            "AWS_LAMBDA_LOG_LEVEL": "INFO",
+            "AWS_LAMBDA_LOG_FORMAT": "JSON",
+        }
+
+        logging_config = {"LogFormat": "JSON"}
+        environ = EnvironmentVariables(self.name, self.memory, self.timeout, self.handler, logging_config)
+        self.assertEqual(expected, environ._get_aws_variables())
+
+    def test_must_work_with_set_application_log_level(self):
+        expected = {
+            "AWS_SAM_LOCAL": "true",
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
+            "AWS_LAMBDA_FUNCTION_TIMEOUT": "123",
+            "AWS_LAMBDA_FUNCTION_HANDLER": "handler",
+            "AWS_LAMBDA_FUNCTION_NAME": self.name,
+            "AWS_LAMBDA_FUNCTION_VERSION": "$LATEST",
+            "AWS_LAMBDA_LOG_GROUP_NAME": f"aws/lambda/{self.name}",
+            "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
+            "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
+            # Default values assigned to these variables
+            "AWS_REGION": "us-east-1",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": "defaultkey",
+            "AWS_SECRET_ACCESS_KEY": "defaultsecret",
+            "AWS_LAMBDA_LOG_LEVEL": "TRACE",
+            "AWS_LAMBDA_LOG_FORMAT": "JSON",
+        }
+
+        logging_config = {"LogFormat": "JSON", "ApplicationLogLevel": "TRACE"}
+        environ = EnvironmentVariables(self.name, self.memory, self.timeout, self.handler, logging_config)
+        self.assertEqual(expected, environ._get_aws_variables())
+
+    def test_must_work_with_custom_log_group_name(self):
+        expected = {
+            "AWS_SAM_LOCAL": "true",
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "1024",
+            "AWS_LAMBDA_FUNCTION_TIMEOUT": "123",
+            "AWS_LAMBDA_FUNCTION_HANDLER": "handler",
+            "AWS_LAMBDA_FUNCTION_NAME": self.name,
+            "AWS_LAMBDA_FUNCTION_VERSION": "$LATEST",
+            "AWS_LAMBDA_LOG_GROUP_NAME": "myCustomLogGroup",
+            "AWS_LAMBDA_LOG_STREAM_NAME": "$LATEST",
+            "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_LAMBDA_INITIALIZATION_TYPE": "on-demand",
+            # Default values assigned to these variables
+            "AWS_REGION": "us-east-1",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": "defaultkey",
+            "AWS_SECRET_ACCESS_KEY": "defaultsecret",
+            "AWS_LAMBDA_LOG_LEVEL": "TRACE",
+            "AWS_LAMBDA_LOG_FORMAT": "JSON",
+        }
+
+        logging_config = {"LogFormat": "JSON", "ApplicationLogLevel": "TRACE", "LogGroup": "myCustomLogGroup"}
+        environ = EnvironmentVariables(self.name, self.memory, self.timeout, self.handler, logging_config)
+        self.assertEqual(expected, environ._get_aws_variables())
+
 
 class TestEnvironmentVariables_stringify_value(TestCase):
     def setUp(self):
-
         self.environ = EnvironmentVariables(1024, 10, "handler")
 
     @parameterized.expand([param([1, 2, 3]), param({"a": {"b": "c"}}), param(("this", "is", "tuple")), param(None)])
@@ -362,7 +598,6 @@ class TestEnvironmentVariables_stringify_value(TestCase):
 
 class TestEnvironmentVariables_add_lambda_event_body(TestCase):
     def test_must_add_proper_variable(self):
-
         value = "foobar"
 
         environ = EnvironmentVariables()

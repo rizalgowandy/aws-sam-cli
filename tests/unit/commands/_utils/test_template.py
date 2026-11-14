@@ -8,13 +8,20 @@ import shutil
 import yaml
 from botocore.utils import set_value_from_jmespath
 from parameterized import parameterized, param
+from samcli.lib.utils.graphql_api import CODE_ARTIFACT_PROPERTY, find_all_paths_and_values
 
-from samcli.lib.utils.resources import AWS_SERVERLESS_FUNCTION, AWS_SERVERLESS_API, RESOURCES_WITH_IMAGE_COMPONENT
+from samcli.lib.utils.resources import (
+    AWS_SERVERLESS_FUNCTION,
+    AWS_SERVERLESS_API,
+    AWS_SERVERLESS_GRAPHQLAPI,
+    RESOURCES_WITH_IMAGE_COMPONENT,
+)
 from samcli.commands._utils.template import (
     get_template_data,
     METADATA_WITH_LOCAL_PATHS,
     RESOURCES_WITH_LOCAL_PATHS,
     _update_relative_paths,
+    _update_sam_mappings_relative_paths,
     _resolve_relative_to,
     move_template,
     get_template_parameters,
@@ -140,7 +147,6 @@ class Test_get_template_data(TestCase):
         yaml_parse_mock.side_effect = exception
 
         with patch("samcli.commands._utils.template.open", m):
-
             with self.assertRaises(TemplateFailedParsingException) as ex_ctx:
                 get_template_data(filename)
 
@@ -184,7 +190,6 @@ class Test_get_template_data(TestCase):
 
 class Test_update_relative_paths(TestCase):
     def setUp(self):
-
         self.s3path = "s3://foo/bar"
         self.s3_full_url_https = "https://s3.amazonaws.com/examplebucket/exampletemplate.yml"
         self.s3_full_url_http = "http://s3.amazonaws.com/examplebucket/exampletemplate.yml"
@@ -198,7 +203,6 @@ class Test_update_relative_paths(TestCase):
 
     @parameterized.expand([(resource_type, props) for resource_type, props in METADATA_WITH_LOCAL_PATHS.items()])
     def test_must_update_relative_metadata_paths(self, resource_type, properties):
-
         for propname in properties:
             for path in [self.s3path, self.abspath, self.curpath, self.s3_full_url_https, self.s3_full_url_http]:
                 template_dict = {
@@ -218,35 +222,14 @@ class Test_update_relative_paths(TestCase):
     @parameterized.expand([(resource_type, props) for resource_type, props in RESOURCES_WITH_LOCAL_PATHS.items()])
     def test_must_update_relative_resource_paths(self, resource_type, properties):
         for propname in properties:
-            template_dict = {
-                "Resources": {
-                    "MyResourceWithRelativePath": {"Type": resource_type, "Properties": {}},
-                    "MyResourceWithS3Path": {"Type": resource_type, "Properties": {propname: self.s3path}},
-                    "MyResourceWithAbsolutePath": {"Type": resource_type, "Properties": {propname: self.abspath}},
-                    "MyResourceWithInvalidPath": {
-                        "Type": resource_type,
-                        "Properties": {
-                            # Path is not a string
-                            propname: {"foo": "bar"}
-                        },
-                    },
-                    "MyResourceWithoutProperties": {"Type": resource_type},
-                    "UnsupportedResourceType": {"Type": "AWS::Ec2::Instance", "Properties": {"Code": "bar"}},
-                    "ResourceWithoutType": {"foo": "bar"},
-                },
-                "Parameters": {"a": "b"},
-            }
+            template_dict = self._generate_template(resource_type, propname)
 
-            set_value_from_jmespath(
-                template_dict, f"Resources.MyResourceWithRelativePath.Properties.{propname}", self.curpath
-            )
+            self._set_property(self.curpath, propname, template_dict, resource_type, "MyResourceWithRelativePath")
 
             expected_template_dict = copy.deepcopy(template_dict)
 
-            set_value_from_jmespath(
-                expected_template_dict,
-                f"Resources.MyResourceWithRelativePath.Properties.{propname}",
-                self.expected_result,
+            self._set_property(
+                self.expected_result, propname, expected_template_dict, resource_type, "MyResourceWithRelativePath"
             )
 
             result = _update_relative_paths(template_dict, self.src, self.dest)
@@ -254,7 +237,13 @@ class Test_update_relative_paths(TestCase):
             self.maxDiff = None
             self.assertEqual(result, expected_template_dict)
 
-    @parameterized.expand([(resource_type, props) for resource_type, props in RESOURCES_WITH_LOCAL_PATHS.items()])
+    @parameterized.expand(
+        [
+            (resource_type, props)
+            for resource_type, props in RESOURCES_WITH_LOCAL_PATHS.items()
+            if resource_type != AWS_SERVERLESS_GRAPHQLAPI  # Metadata path to code artifacts is not supported
+        ]
+    )
     def test_must_update_relative_resource_metadata_paths(self, resource_type, properties):
         for propname in properties:
             template_dict = {
@@ -339,34 +328,18 @@ class Test_update_relative_paths(TestCase):
     ):
         for non_image_propname in non_image_properties:
             for image_propname in image_properties:
-                template_dict = {
-                    "Resources": {
-                        "MyResourceWithRelativePath": {"Type": non_image_resource_type, "Properties": {}},
-                        "MyResourceWithS3Path": {
-                            "Type": non_image_resource_type,
-                            "Properties": {non_image_propname: self.s3path},
-                        },
-                        "MyResourceWithAbsolutePath": {
-                            "Type": non_image_resource_type,
-                            "Properties": {non_image_propname: self.abspath},
-                        },
-                        "MyResourceWithInvalidPath": {
-                            "Type": non_image_resource_type,
-                            "Properties": {
-                                # Path is not a string
-                                non_image_propname: {"foo": "bar"}
-                            },
-                        },
-                        "MyResourceWithoutProperties": {"Type": non_image_resource_type},
-                        "UnsupportedResourceType": {"Type": "AWS::Ec2::Instance", "Properties": {"Code": "bar"}},
-                        "ResourceWithoutType": {"foo": "bar"},
-                        "ImageResource": {"Type": image_resource_type, "Properties": {"PackageType": "Image"}},
-                    },
-                    "Parameters": {"a": "b"},
+                template_dict = self._generate_template(non_image_resource_type, non_image_resource_type)
+                template_dict["Resources"]["ImageResource"] = {
+                    "Type": image_resource_type,
+                    "Properties": {"PackageType": "Image"},
                 }
 
-                set_value_from_jmespath(
-                    template_dict, f"Resources.MyResourceWithRelativePath.Properties.{non_image_propname}", self.curpath
+                self._set_property(
+                    self.curpath,
+                    non_image_propname,
+                    template_dict,
+                    non_image_resource_type,
+                    "MyResourceWithRelativePath",
                 )
 
                 set_value_from_jmespath(
@@ -375,10 +348,12 @@ class Test_update_relative_paths(TestCase):
 
                 expected_template_dict = copy.deepcopy(template_dict)
 
-                set_value_from_jmespath(
-                    expected_template_dict,
-                    f"Resources.MyResourceWithRelativePath.Properties.{non_image_propname}",
+                self._set_property(
                     self.expected_result,
+                    non_image_propname,
+                    expected_template_dict,
+                    non_image_resource_type,
+                    "MyResourceWithRelativePath",
                 )
 
                 result = _update_relative_paths(template_dict, self.src, self.dest)
@@ -422,6 +397,343 @@ class Test_update_relative_paths(TestCase):
         result = _update_relative_paths(template_dict, self.src, self.dest)
         self.maxDiff = None
         self.assertEqual(result, expected_template_dict)
+
+    def _generate_template(self, resource_type, property_name):
+        template = {
+            "Resources": {
+                "MyResourceWithRelativePath": {"Type": resource_type, "Properties": {}},
+                "MyResourceWithS3Path": {"Type": resource_type, "Properties": {}},
+                "MyResourceWithAbsolutePath": {"Type": resource_type, "Properties": {}},
+                "MyResourceWithInvalidPath": {
+                    "Type": resource_type,
+                    "Properties": {},
+                },
+                "MyResourceWithoutProperties": {"Type": resource_type},
+                "UnsupportedResourceType": {"Type": "AWS::Ec2::Instance", "Properties": {"Code": "bar"}},
+                "ResourceWithoutType": {"foo": "bar"},
+            },
+            "Parameters": {"a": "b"},
+        }
+        if self._is_graphql_code_uri(resource_type, property_name):
+            template["Resources"]["MyResourceWithRelativePath"]["Properties"] = self._generate_graphql_props(
+                property_name
+            )
+            template["Resources"]["MyResourceWithS3Path"]["Properties"] = self._generate_graphql_props(
+                property_name, self.s3path
+            )
+            template["Resources"]["MyResourceWithAbsolutePath"]["Properties"] = self._generate_graphql_props(
+                property_name, self.abspath
+            )
+            template["Resources"]["MyResourceWithInvalidPath"]["Properties"] = self._generate_graphql_props(
+                property_name, {"foo": "bar"}
+            )
+        else:
+            template["Resources"]["MyResourceWithS3Path"]["Properties"] = {property_name: self.s3path}
+            template["Resources"]["MyResourceWithAbsolutePath"]["Properties"] = {property_name: self.abspath}
+            template["Resources"]["MyResourceWithInvalidPath"]["Properties"] = {property_name: {"foo": "bar"}}
+        return template
+
+    @staticmethod
+    def _generate_graphql_props(property_name, path=None):
+        if path is not None:
+            return {
+                "Functions": {"Func1": {property_name: path}, "Func2": {property_name: path}},
+                "Resolvers": {"Mutation": {"Resolver1": {property_name: path}}},
+            }
+        return {
+            "Functions": {"Func1": {}, "Func2": {}},
+            "Resolvers": {"Mutation": {"Resolver1": {}}},
+        }
+
+    def _set_property(self, value, property_name, template, tested_type, resource_name):
+        if self._is_graphql_code_uri(tested_type, property_name):
+            resource_dict = template["Resources"][resource_name]
+            paths_values = find_all_paths_and_values(property_name, resource_dict)
+            for property_path, _ in paths_values:
+                set_value_from_jmespath(template, f"Resources.{resource_name}.{property_path}", value)
+        else:
+            set_value_from_jmespath(template, f"Resources.{resource_name}.Properties.{property_name}", value)
+
+    @staticmethod
+    def _is_graphql_code_uri(resource_type, property_name):
+        return resource_type == AWS_SERVERLESS_GRAPHQLAPI and property_name == CODE_ARTIFACT_PROPERTY
+
+    def _assert_templates_are_equal(self, actual, expected, tested_type, property_name):
+        if self._is_graphql_code_uri(tested_type, property_name):
+            actual_paths_values = find_all_paths_and_values(property_name, actual)
+            expepcted_paths_values = find_all_paths_and_values(property_name, expected)
+            self.assertListEqual(actual_paths_values, expepcted_paths_values)
+        else:
+            self.assertEqual(actual, expected)
+
+
+class Test_update_sam_mappings_relative_paths(TestCase):
+    """Tests for _update_sam_mappings_relative_paths which adjusts paths in SAM-generated Mappings."""
+
+    def test_updates_relative_paths_in_sam_mappings(self):
+        """SAM-prefixed Mapping values that are relative paths should be adjusted."""
+
+        mappings = {
+            "SAMCodeUriFunctions": {
+                "Alpha": {"CodeUri": os.path.join(".aws-sam", "build", "AlphaFunction")},
+                "Beta": {"CodeUri": os.path.join(".aws-sam", "build", "BetaFunction")},
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_root = tmpdir
+            new_root = os.path.join(tmpdir, ".aws-sam", "build")
+            os.makedirs(new_root, exist_ok=True)
+
+            _update_sam_mappings_relative_paths(mappings, original_root, new_root)
+
+            # After adjustment, paths should be relative to new_root (.aws-sam/build/)
+            # So .aws-sam/build/AlphaFunction relative to .aws-sam/build/ = AlphaFunction
+            self.assertEqual(mappings["SAMCodeUriFunctions"]["Alpha"]["CodeUri"], "AlphaFunction")
+            self.assertEqual(mappings["SAMCodeUriFunctions"]["Beta"]["CodeUri"], "BetaFunction")
+
+    def test_skips_non_sam_mappings(self):
+        """Mappings without the SAM prefix should not be modified."""
+
+        mappings = {
+            "UserDefinedMapping": {
+                "us-east-1": {"AMI": "ami-12345"},
+            }
+        }
+        original = copy.deepcopy(mappings)
+
+        _update_sam_mappings_relative_paths(mappings, "/original", "/new")
+
+        self.assertEqual(mappings, original)
+
+    def test_skips_s3_uris_in_mappings(self):
+        """S3 URIs in Mappings should not be modified."""
+
+        mappings = {
+            "SAMCodeUriFunctions": {
+                "Alpha": {"CodeUri": "s3://bucket/key/alpha.zip"},
+                "Beta": {"CodeUri": "s3://bucket/key/beta.zip"},
+            }
+        }
+        original = copy.deepcopy(mappings)
+
+        _update_sam_mappings_relative_paths(mappings, "/original", "/new")
+
+        self.assertEqual(mappings, original)
+
+    def test_handles_empty_mappings(self):
+        """Empty or non-dict Mappings should not cause errors."""
+        empty_mappings = {}
+        _update_sam_mappings_relative_paths(empty_mappings, "/original", "/new")
+        self.assertEqual(empty_mappings, {})
+
+        _update_sam_mappings_relative_paths(None, "/original", "/new")
+
+    def test_move_template_adjusts_sam_mappings(self):
+        """End-to-end: move_template should adjust SAM Mapping paths correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = tmpdir
+            build_dir = os.path.join(tmpdir, ".aws-sam", "build")
+            os.makedirs(build_dir, exist_ok=True)
+
+            template_dict = {
+                "Resources": {
+                    "Fn::ForEach::Functions": [
+                        "Name",
+                        ["Alpha", "Beta"],
+                        {
+                            "${Name}Function": {
+                                "Type": "AWS::Serverless::Function",
+                                "Properties": {
+                                    "Handler": "main.handler",
+                                    "CodeUri": {"Fn::FindInMap": ["SAMCodeUriFunctions", "${Name}", "CodeUri"]},
+                                },
+                            }
+                        },
+                    ]
+                },
+                "Mappings": {
+                    "SAMCodeUriFunctions": {
+                        "Alpha": {"CodeUri": os.path.join(".aws-sam", "build", "AlphaFunction")},
+                        "Beta": {"CodeUri": os.path.join(".aws-sam", "build", "BetaFunction")},
+                    }
+                },
+            }
+
+            src_template = os.path.join(src_dir, "template.yaml")
+            dest_template = os.path.join(build_dir, "template.yaml")
+
+            move_template(src_template, dest_template, template_dict)
+
+            with open(dest_template, "r") as f:
+                result = yaml.safe_load(f.read())
+
+            mappings = result.get("Mappings", {})
+            self.assertEqual(mappings["SAMCodeUriFunctions"]["Alpha"]["CodeUri"], "AlphaFunction")
+            self.assertEqual(mappings["SAMCodeUriFunctions"]["Beta"]["CodeUri"], "BetaFunction")
+
+    def test_skips_docker_image_uris_in_imageuri_mappings(self):
+        """Docker image references in ImageUri Mappings should not be rewritten with relative paths."""
+
+        mappings = {
+            "SAMImageUriFunctions": {
+                "alpha": {"ImageUri": "emulation-python3.9-alpha:latest"},
+                "beta": {"ImageUri": "emulation-python3.9-beta:latest"},
+            }
+        }
+        original = copy.deepcopy(mappings)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_root = tmpdir
+            new_root = os.path.join(tmpdir, ".aws-sam", "build")
+            os.makedirs(new_root, exist_ok=True)
+
+            _update_sam_mappings_relative_paths(mappings, original_root, new_root)
+
+            # Docker image references should remain unchanged
+            self.assertEqual(mappings, original)
+
+    def test_updates_imageuri_when_pointing_to_local_archive(self):
+        """ImageUri values that point to actual local files (e.g., .tar.gz archives) should be updated."""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_root = tmpdir
+            new_root = os.path.join(tmpdir, ".aws-sam", "build")
+            os.makedirs(new_root, exist_ok=True)
+
+            # Create a fake image archive at the resolved relative path from CWD
+            # _resolve_relative_to computes a path relative to new_root, and
+            # pathlib.Path(updated_path).is_file() checks relative to CWD.
+            # We need the file to exist at the CWD-relative resolved path.
+            resolved_relative = os.path.relpath(
+                os.path.join(original_root, "my-image.tar.gz"),
+                new_root,
+            )
+            # Create the archive at the CWD-relative resolved path
+            resolved_abs = os.path.join(os.getcwd(), resolved_relative)
+            os.makedirs(os.path.dirname(resolved_abs), exist_ok=True)
+            with open(resolved_abs, "w") as f:
+                f.write("fake archive")
+
+            try:
+                mappings = {
+                    "SAMImageUriFunctions": {
+                        "alpha": {"ImageUri": "my-image.tar.gz"},
+                    }
+                }
+
+                _update_sam_mappings_relative_paths(mappings, original_root, new_root)
+
+                # The path should be updated since it resolves to a real local file
+                updated_uri = mappings["SAMImageUriFunctions"]["alpha"]["ImageUri"]
+                self.assertEqual(updated_uri, resolved_relative)
+            finally:
+                # Clean up the file we created relative to CWD
+                if os.path.exists(resolved_abs):
+                    os.remove(resolved_abs)
+
+    def test_move_template_preserves_docker_imageuri_in_sam_mappings(self):
+        """End-to-end: move_template should not rewrite Docker image references in SAM ImageUri Mappings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = tmpdir
+            build_dir = os.path.join(tmpdir, ".aws-sam", "build")
+            os.makedirs(build_dir, exist_ok=True)
+
+            template_dict = {
+                "Resources": {
+                    "Fn::ForEach::Functions": [
+                        "FunctionName",
+                        ["alpha", "beta"],
+                        {
+                            "${FunctionName}Function": {
+                                "Type": "AWS::Serverless::Function",
+                                "Properties": {
+                                    "FunctionName": {"Fn::Sub": "${FunctionName}Function"},
+                                    "PackageType": "Image",
+                                    "ImageUri": {
+                                        "Fn::FindInMap": [
+                                            "SAMImageUriFunctions",
+                                            {"Ref": "FunctionName"},
+                                            "ImageUri",
+                                        ]
+                                    },
+                                },
+                            }
+                        },
+                    ]
+                },
+                "Mappings": {
+                    "SAMImageUriFunctions": {
+                        "alpha": {"ImageUri": "emulation-python3.9-alpha:latest"},
+                        "beta": {"ImageUri": "emulation-python3.9-beta:latest"},
+                    }
+                },
+            }
+
+            src_template = os.path.join(src_dir, "template.yaml")
+            dest_template = os.path.join(build_dir, "template.yaml")
+
+            move_template(src_template, dest_template, template_dict)
+
+            with open(dest_template, "r") as f:
+                result = yaml.safe_load(f.read())
+
+            mappings = result.get("Mappings", {})
+            self.assertEqual(
+                mappings["SAMImageUriFunctions"]["alpha"]["ImageUri"],
+                "emulation-python3.9-alpha:latest",
+            )
+            self.assertEqual(
+                mappings["SAMImageUriFunctions"]["beta"]["ImageUri"],
+                "emulation-python3.9-beta:latest",
+            )
+
+    def test_updates_glue_script_location_mapping(self):
+        """Mappings emitted for AWS::Glue::Job (key 'ScriptLocation' from leaf of 'Command.ScriptLocation')
+        must be recognized as SAM-generated and have their relative paths adjusted on template move.
+        """
+        mappings = {
+            "SAMScriptLocationJobs": {
+                "Etl1": {"ScriptLocation": os.path.join(".aws-sam", "build", "Etl1Job", "job.py")},
+                "Etl2": {"ScriptLocation": os.path.join(".aws-sam", "build", "Etl2Job", "job.py")},
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_root = tmpdir
+            new_root = os.path.join(tmpdir, ".aws-sam", "build")
+            os.makedirs(new_root, exist_ok=True)
+
+            _update_sam_mappings_relative_paths(mappings, original_root, new_root)
+
+            self.assertEqual(
+                mappings["SAMScriptLocationJobs"]["Etl1"]["ScriptLocation"],
+                os.path.join("Etl1Job", "job.py"),
+            )
+            self.assertEqual(
+                mappings["SAMScriptLocationJobs"]["Etl2"]["ScriptLocation"],
+                os.path.join("Etl2Job", "job.py"),
+            )
+
+    def test_updates_serverless_application_location_mapping(self):
+        """Mappings emitted for AWS::Serverless::Application (key 'Location') must be recognized."""
+        mappings = {
+            "SAMLocationApps": {
+                "Pub": {"Location": os.path.join(".aws-sam", "build", "PubApi", "template.yaml")},
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_root = tmpdir
+            new_root = os.path.join(tmpdir, ".aws-sam", "build")
+            os.makedirs(new_root, exist_ok=True)
+
+            _update_sam_mappings_relative_paths(mappings, original_root, new_root)
+
+            self.assertEqual(
+                mappings["SAMLocationApps"]["Pub"]["Location"],
+                os.path.join("PubApi", "template.yaml"),
+            )
 
 
 class Test_resolve_relative_to(TestCase):
@@ -582,6 +894,106 @@ class Test_get_template_artifacts_format(TestCase):
         }
         self.assertEqual(get_template_artifacts_format(MagicMock()), [])
 
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_template_get_artifacts_format_with_foreach(self, mock_get_template_data):
+        """Test that artifacts are detected inside Fn::ForEach blocks."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "Fn::ForEach::Functions": [
+                    "Name",
+                    ["Alpha", "Beta"],
+                    {
+                        "${Name}Function": {
+                            "Type": AWS_SERVERLESS_FUNCTION,
+                            "Properties": {"CodeUri": "./src", "PackageType": ZIP},
+                        }
+                    },
+                ]
+            }
+        }
+        self.assertEqual(get_template_artifacts_format(MagicMock()), [ZIP])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_template_get_artifacts_format_with_nested_foreach(self, mock_get_template_data):
+        """Test that artifacts are detected inside nested Fn::ForEach blocks."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "Fn::ForEach::Outer": [
+                    "OuterVar",
+                    ["A", "B"],
+                    {
+                        "Fn::ForEach::Inner": [
+                            "InnerVar",
+                            ["X", "Y"],
+                            {
+                                "${OuterVar}${InnerVar}Function": {
+                                    "Type": AWS_SERVERLESS_FUNCTION,
+                                    "Properties": {"CodeUri": "./src", "PackageType": ZIP},
+                                }
+                            },
+                        ]
+                    },
+                ]
+            }
+        }
+        self.assertEqual(get_template_artifacts_format(MagicMock()), [ZIP])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_template_get_artifacts_format_with_deeply_nested_foreach(self, mock_get_template_data):
+        """Test that artifacts are detected inside deeply nested Fn::ForEach blocks."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "Fn::ForEach::Level1": [
+                    "L1",
+                    ["A"],
+                    {
+                        "Fn::ForEach::Level2": [
+                            "L2",
+                            ["B"],
+                            {
+                                "Fn::ForEach::Level3": [
+                                    "L3",
+                                    ["C"],
+                                    {
+                                        "${L1}${L2}${L3}Function": {
+                                            "Type": AWS_SERVERLESS_FUNCTION,
+                                            "Properties": {"ImageUri": "myimage", "PackageType": IMAGE},
+                                        }
+                                    },
+                                ]
+                            },
+                        ]
+                    },
+                ]
+            }
+        }
+        self.assertEqual(get_template_artifacts_format(MagicMock()), [IMAGE])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_template_get_artifacts_format_mixed_foreach_and_regular(self, mock_get_template_data):
+        """Test that artifacts are detected from both Fn::ForEach and regular resources."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "RegularFunction": {
+                    "Type": AWS_SERVERLESS_FUNCTION,
+                    "Properties": {"ImageUri": "myimage", "PackageType": IMAGE},
+                },
+                "Fn::ForEach::Functions": [
+                    "Name",
+                    ["Alpha", "Beta"],
+                    {
+                        "${Name}Function": {
+                            "Type": AWS_SERVERLESS_FUNCTION,
+                            "Properties": {"CodeUri": "./src", "PackageType": ZIP},
+                        }
+                    },
+                ],
+            }
+        }
+        result = get_template_artifacts_format(MagicMock())
+        self.assertIn(IMAGE, result)
+        self.assertIn(ZIP, result)
+
 
 class Test_get_template_function_resouce_ids(TestCase):
     @patch("samcli.commands._utils.template.get_template_data")
@@ -593,3 +1005,146 @@ class Test_get_template_function_resouce_ids(TestCase):
             }
         }
         self.assertEqual(get_template_function_resource_ids(MagicMock(), IMAGE), ["HelloWorldFunction1"])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_get_template_function_resource_ids_with_foreach(self, mock_get_template_data):
+        """Test that function IDs are detected inside Fn::ForEach blocks."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "Fn::ForEach::Functions": [
+                    "Name",
+                    ["Alpha", "Beta"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "./src", "PackageType": ZIP},
+                        }
+                    },
+                ]
+            }
+        }
+        result = get_template_function_resource_ids(MagicMock(), ZIP)
+        # Should return the ForEach key as a placeholder
+        self.assertEqual(result, ["Fn::ForEach::Functions"])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_get_template_function_resource_ids_with_nested_foreach(self, mock_get_template_data):
+        """Test that function IDs are detected inside nested Fn::ForEach blocks."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "Fn::ForEach::Outer": [
+                    "OuterVar",
+                    ["A", "B"],
+                    {
+                        "Fn::ForEach::Inner": [
+                            "InnerVar",
+                            ["X", "Y"],
+                            {
+                                "${OuterVar}${InnerVar}Function": {
+                                    "Type": "AWS::Lambda::Function",
+                                    "Properties": {"PackageType": IMAGE},
+                                }
+                            },
+                        ]
+                    },
+                ]
+            }
+        }
+        result = get_template_function_resource_ids(MagicMock(), IMAGE)
+        # Should return the outer ForEach key as a placeholder
+        self.assertEqual(result, ["Fn::ForEach::Outer"])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_get_template_function_resource_ids_with_deeply_nested_foreach(self, mock_get_template_data):
+        """Test that function IDs are detected inside deeply nested Fn::ForEach blocks."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "Fn::ForEach::Level1": [
+                    "L1",
+                    ["A"],
+                    {
+                        "Fn::ForEach::Level2": [
+                            "L2",
+                            ["B"],
+                            {
+                                "Fn::ForEach::Level3": [
+                                    "L3",
+                                    ["C"],
+                                    {
+                                        "${L1}${L2}${L3}Function": {
+                                            "Type": "AWS::Serverless::Function",
+                                            "Properties": {"CodeUri": "./src", "PackageType": ZIP},
+                                        }
+                                    },
+                                ]
+                            },
+                        ]
+                    },
+                ]
+            }
+        }
+        result = get_template_function_resource_ids(MagicMock(), ZIP)
+        self.assertEqual(result, ["Fn::ForEach::Level1"])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_get_template_function_resource_ids_mixed_foreach_and_regular(self, mock_get_template_data):
+        """Test that function IDs are detected from both Fn::ForEach and regular resources."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "RegularFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "./src", "PackageType": ZIP},
+                },
+                "Fn::ForEach::Functions": [
+                    "Name",
+                    ["Alpha", "Beta"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Lambda::Function",
+                            "Properties": {"PackageType": ZIP},
+                        }
+                    },
+                ],
+            }
+        }
+        result = get_template_function_resource_ids(MagicMock(), ZIP)
+        self.assertIn("RegularFunction", result)
+        self.assertIn("Fn::ForEach::Functions", result)
+        self.assertEqual(len(result), 2)
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_get_template_function_resource_ids_foreach_no_matching_artifact(self, mock_get_template_data):
+        """Test that ForEach blocks with non-matching artifact types are not included."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                "Fn::ForEach::Functions": [
+                    "Name",
+                    ["Alpha", "Beta"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"ImageUri": "myimage", "PackageType": IMAGE},
+                        }
+                    },
+                ]
+            }
+        }
+        # Looking for ZIP but ForEach contains IMAGE functions
+        result = get_template_function_resource_ids(MagicMock(), ZIP)
+        self.assertEqual(result, [])
+
+    @patch("samcli.commands._utils.template.get_template_data")
+    def test_get_template_function_resource_ids_foreach_invalid_structure(self, mock_get_template_data):
+        """Test that invalid Fn::ForEach structures are handled gracefully."""
+        mock_get_template_data.return_value = {
+            "Resources": {
+                # Invalid: not a list
+                "Fn::ForEach::Invalid1": "not a list",
+                # Invalid: list too short
+                "Fn::ForEach::Invalid2": ["only", "two"],
+                # Invalid: output template not a dict
+                "Fn::ForEach::Invalid3": ["var", ["a", "b"], "not a dict"],
+            }
+        }
+        result = get_template_function_resource_ids(MagicMock(), ZIP)
+        self.assertEqual(result, [])

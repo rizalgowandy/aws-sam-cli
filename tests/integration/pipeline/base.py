@@ -9,18 +9,16 @@ from unittest.mock import Mock
 
 import boto3
 import botocore.exceptions
+import pytest
 from botocore.exceptions import ClientError
 
 from samcli.lib.pipeline.bootstrap.stage import Stage
+from tests.testing_utils import get_sam_command
 
 
+@pytest.mark.xdist_group(name="sam_pipeline")
 class PipelineBase(TestCase):
-    def base_command(self):
-        command = "sam"
-        if os.getenv("SAM_CLI_DEV"):
-            command = "samdev"
-
-        return command
+    pass
 
 
 class InitIntegBase(PipelineBase):
@@ -45,7 +43,7 @@ class InitIntegBase(PipelineBase):
         super().tearDown()
 
     def get_init_command_list(self, with_bootstrap=False):
-        command_list = [self.base_command(), "pipeline", "init"]
+        command_list = [get_sam_command(), "pipeline", "init"]
         if with_bootstrap:
             command_list.append("--bootstrap")
         return command_list
@@ -67,12 +65,31 @@ class BootstrapIntegBase(PipelineBase):
         super().setUp()
         shutil.rmtree(os.path.join(os.getcwd(), ".aws-sam", "pipeline"), ignore_errors=True)
 
+    # Max time in seconds to wait for each stack deletion to complete
+    STACK_DELETE_TIMEOUT_SECONDS = 180
+
     def tearDown(self):
         for stack_name in self.stack_names:
             self._cleanup_s3_buckets(stack_name)
             self.cf_client.delete_stack(StackName=stack_name)
+        self._wait_for_stack_deletions()
         shutil.rmtree(os.path.join(os.getcwd(), ".aws-sam", "pipeline"), ignore_errors=True)
         super().tearDown()
+
+    def _wait_for_stack_deletions(self):
+        """Wait for all stack deletions to complete so subsequent runs don't collide."""
+        waiter = self.cf_client.get_waiter("stack_delete_complete")
+        for stack_name in self.stack_names:
+            try:
+                waiter.wait(
+                    StackName=stack_name,
+                    WaiterConfig={
+                        "Delay": 10,
+                        "MaxAttempts": self.STACK_DELETE_TIMEOUT_SECONDS // 10,
+                    },
+                )
+            except botocore.exceptions.WaiterError:
+                logging.warning("Timed out waiting for stack %s to delete", stack_name)
 
     def _cleanup_s3_buckets(self, stack_name):
         try:
@@ -105,7 +122,7 @@ class BootstrapIntegBase(PipelineBase):
         image_repository: Optional[str] = None,
         no_confirm_changeset: bool = False,
     ):
-        command_list = [self.base_command(), "pipeline", "bootstrap"]
+        command_list = [get_sam_command(), "pipeline", "bootstrap"]
 
         if no_interactive:
             command_list += ["--no-interactive"]

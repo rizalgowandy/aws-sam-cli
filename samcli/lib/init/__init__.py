@@ -1,20 +1,31 @@
 """
 Init module to scaffold a project app from a template
 """
+
 import itertools
 import logging
 import platform
-
 from pathlib import Path
+from typing import Dict, Optional
 
 from cookiecutter.exceptions import CookiecutterException, RepositoryNotFound, UnknownRepoType
 from cookiecutter.main import cookiecutter
 
-from samcli.local.common.runtime_template import RUNTIME_DEP_TEMPLATE_MAPPING, is_custom_runtime
-from samcli.lib.utils.packagetype import ZIP
+from samcli.commands.exceptions import UserException
+from samcli.lib.config.samconfig import DEFAULT_CONFIG_FILE_EXTENSION, DEFAULT_CONFIG_FILE_NAME
+from samcli.lib.init.arbitrary_project import generate_non_cookiecutter_project
+from samcli.lib.init.default_samconfig import DefaultSamconfig
+from samcli.lib.init.exceptions import GenerateProjectFailedError, InvalidLocationError
+from samcli.lib.init.template_modifiers.application_insights_template_modifier import (
+    ApplicationInsightsTemplateModifier,
+)
+from samcli.lib.init.template_modifiers.structured_logging_template_modifier import StructuredLoggingTemplateModifier
+from samcli.lib.init.template_modifiers.xray_tracing_template_modifier import XRayTracingTemplateModifier
+from samcli.lib.telemetry.event import EventName, EventTracker, UsedFeature
 from samcli.lib.utils import osutils
-from .exceptions import GenerateProjectFailedError, InvalidLocationError
-from .arbitrary_project import generate_non_cookiecutter_project
+from samcli.lib.utils.packagetype import ZIP
+from samcli.lib.utils.template_hooks import UnsupportedTemplateHookError, guarded_template_hooks
+from samcli.local.common.runtime_template import RUNTIME_DEP_TEMPLATE_MAPPING, is_custom_runtime
 
 LOG = logging.getLogger(__name__)
 
@@ -28,6 +39,9 @@ def generate_project(
     name=None,
     no_input=False,
     extra_context=None,
+    tracing=False,
+    application_insights=False,
+    structured_logging=False,
 ):
     """Generates project using cookiecutter and options given
 
@@ -56,6 +70,20 @@ def generate_project(
         (the default is False, which prompts the user for values it doesn't know for baking)
     extra_context : Optional[Dict]
         An optional dictionary, the extra cookiecutter context
+    tracing: Optional[str]
+        Enable or disable X-Ray Tracing
+    application_insights: Optional[str]
+            Enable or disable AppInsights Monitoring
+    structured_logging: Optional[bool]
+        boolean value to determine if Json structured logging should be enabled or not
+
+    Returns
+    -------
+    Optional[str]
+        Path to the generated project directory. This is not always ``output_dir/name``: a
+        cookiecutter template names its own project directory, so for a ``location`` template
+        without a ``name`` the project is nested one level below ``output_dir``. None when the
+        directory could not be determined.
 
     Raises
     ------
@@ -63,6 +91,7 @@ def generate_project(
         If the process of baking a project fails
     """
     template = None
+    project_directory = None
 
     if runtime and not is_custom_runtime(runtime) and package_type == ZIP:
         for mapping in list(itertools.chain(*(RUNTIME_DEP_TEMPLATE_MAPPING.values()))):
@@ -90,7 +119,10 @@ def generate_project(
 
     try:
         LOG.debug("Baking a new template with cookiecutter with all parameters")
-        cookiecutter(**params)
+        # cookiecutter returns the directory it created, which is the only reliable way to know
+        # where the project landed when the template chooses its own project directory name.
+        with guarded_template_hooks():
+            project_directory = cookiecutter(**params)
         # Fixes gradlew line ending issue caused by Windows git
         # gradlew is a shell script which should not have CR LF line endings
         # Putting the conversion after cookiecutter as cookiecutter processing will also change the line endings
@@ -105,9 +137,78 @@ def generate_project(
             "it as a cookiecutter template"
         )
         project_output_dir = str(Path(output_dir, name)) if name else output_dir
-        generate_non_cookiecutter_project(location=params["template"], output_dir=project_output_dir)
+        project_directory = generate_non_cookiecutter_project(
+            location=params["template"], output_dir=project_output_dir
+        )
 
     except UnknownRepoType as e:
         raise InvalidLocationError(template=params["template"]) from e
-    except CookiecutterException as e:
-        raise GenerateProjectFailedError(project=name, provider_error=e) from e
+    except UnsupportedTemplateHookError as e:
+        # Actionable and expected, so keep the remedy as the whole message rather than letting the
+        # generic handler bury it behind "An error occurred while generating this project : ".
+        raise UserException(str(e), wrapped_from=e.__class__.__name__) from e
+    except (CookiecutterException, OSError) as e:
+        raise GenerateProjectFailedError(project=name if name else "", provider_error=e) from e
+    except TypeError as ex:
+        LOG.debug("Error from cookiecutter: %s", ex)
+
+    _apply_tracing(tracing, output_dir, name)
+
+    _enable_application_insights(application_insights, output_dir, name)
+
+    _enable_structured_logging(structured_logging, output_dir, name)
+
+    _create_default_samconfig(package_type, output_dir, name)
+
+    return project_directory
+
+
+def _apply_tracing(tracing: bool, output_dir: str, name: str) -> None:
+    if tracing:
+        template_file_path = f"{output_dir}/{name}/template.yaml"
+        template_modifier = XRayTracingTemplateModifier(template_file_path)
+        template_modifier.modify_template()
+
+
+def _enable_application_insights(application_insights: bool, output_dir: str, name: str) -> None:
+    if application_insights:
+        template_file_path = f"{output_dir}/{name}/template.yaml"
+        template_modifier = ApplicationInsightsTemplateModifier(template_file_path)
+        template_modifier.modify_template()
+        EventTracker.track_event(EventName.USED_FEATURE.value, UsedFeature.INIT_WITH_APPLICATION_INSIGHTS.value)
+
+
+def _enable_structured_logging(structured_logging, output_dir, name):
+    if structured_logging:
+        template_file_path = f"{output_dir}/{name}/template.yaml"
+        template_modifier = StructuredLoggingTemplateModifier(template_file_path)
+        template_modifier.modify_template()
+
+
+def _create_default_samconfig(package_type: str, output_dir: str, name: str) -> None:
+    """
+    Init post-processing function to create a default samconfig.toml
+    file and place it into the cookie cutter project.
+
+    Parameters
+    ----------
+    package_type: str
+        string representing the package type, 'Zip' or 'Image', see samcli/lib/utils/packagetype.py
+    output_dir: str
+        string representing the output directory of the template
+    name:
+        string representing the name of the application
+    """
+    # NOTE(sriram-mv): If this is coming from a `--location` without a corresponding project name,
+    # do not attempt to insert a configuration file for a straight cookie-cutter init.
+    if not name:
+        return
+
+    project_root_path = Path(output_dir, name) if name else Path(output_dir)
+    if Path(project_root_path, DEFAULT_CONFIG_FILE_NAME).is_file():
+        LOG.debug("Default %s already in cookie cutter template", DEFAULT_CONFIG_FILE_NAME)
+        return
+
+    LOG.debug("Moving %s into cookie cutter template", DEFAULT_CONFIG_FILE_NAME)
+    samconfig = DefaultSamconfig(project_root_path, package_type, name)
+    samconfig.create()

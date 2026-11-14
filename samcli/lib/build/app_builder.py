@@ -1,80 +1,108 @@
 """
 Builds the application
 """
-import os
+
 import io
 import json
 import logging
+import os
 import pathlib
-from typing import List, Optional, Dict, cast, Union, NamedTuple, Set
+import re
+import zipfile
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, cast
 
 import docker
 import docker.errors
 from aws_lambda_builders import (
     RPC_PROTOCOL_VERSION as lambda_builders_protocol_version,
-    __version__ as lambda_builders_version,
 )
 from aws_lambda_builders.builder import LambdaBuilder
 from aws_lambda_builders.exceptions import LambdaBuilderError
 
-from samcli.commands.local.lib.exceptions import OverridesNotWellDefinedError
-from samcli.lib.build.build_graph import FunctionBuildDefinition, LayerBuildDefinition, BuildGraph
-from samcli.lib.build.build_strategy import (
-    DefaultBuildStrategy,
-    CachedOrIncrementalBuildStrategyWrapper,
-    ParallelBuildStrategy,
-    BuildStrategy,
+from samcli.commands._utils.experimental import (
+    ExperimentalFlag,
+    get_enabled_experimental_flags,
+    is_experimental_enabled,
 )
+from samcli.lib.build.build_graph import (
+    BuildGraph,
+    FunctionBuildDefinition,
+    LayerBuildDefinition,
+    MicrovmImageBuildDefinition,
+)
+from samcli.lib.build.build_strategy import (
+    BuildStrategy,
+    CachedOrIncrementalBuildStrategyWrapper,
+    DefaultBuildStrategy,
+    ParallelBuildStrategy,
+    WorkspaceAwareBuildStrategy,
+)
+from samcli.lib.build.constants import BUILD_PROPERTIES, DEPRECATED_RUNTIMES
+from samcli.lib.build.exceptions import (
+    BuildError,
+    BuildInsideContainerError,
+    DockerBuildFailed,
+    DockerfileOutSideOfContext,
+    MicrovmImageSourceError,
+    UnsupportedBuilderLibraryVersionError,
+)
+from samcli.lib.build.utils import _get_host_architecture, _make_env_vars, warn_cross_architecture_build
+from samcli.lib.build.workflow_config import (
+    CONFIG,
+    UnsupportedRuntimeException,
+    get_layer_subfolder,
+    get_workflow_config,
+    supports_specified_workflow,
+)
+from samcli.lib.docker.log_streamer import LogStreamer, LogStreamError
+from samcli.lib.providers.provider import (
+    ResourcesToBuildCollector,
+    Stack,
+    WebFunction,
+    get_build_entry_point,
+    get_full_path,
+)
+from samcli.lib.samlib.resource_metadata_normalizer import ResourceMetadataNormalizer
+from samcli.lib.utils import osutils
+from samcli.lib.utils.colors import Colored, Colors
+from samcli.lib.utils.lambda_builders import patch_runtime
+from samcli.lib.utils.packagetype import IMAGE, ZIP
+from samcli.lib.utils.path_utils import check_path_valid_type, convert_path_to_unix_path
 from samcli.lib.utils.resources import (
     AWS_CLOUDFORMATION_STACK,
     AWS_LAMBDA_FUNCTION,
     AWS_LAMBDA_LAYERVERSION,
+    AWS_LAMBDA_MICROVMIMAGE,
     AWS_SERVERLESS_APPLICATION,
     AWS_SERVERLESS_FUNCTION,
     AWS_SERVERLESS_LAYERVERSION,
+    AWS_SERVERLESS_MICROVMIMAGE,
+    AWS_SERVERLESS_WEBFUNCTION,
 )
-from samcli.lib.samlib.resource_metadata_normalizer import ResourceMetadataNormalizer
-from samcli.lib.docker.log_streamer import LogStreamer, LogStreamError
-from samcli.lib.providers.provider import ResourcesToBuildCollector, Function, get_full_path, Stack, LayerVersion
-from samcli.lib.utils.colors import Colored
-from samcli.lib.utils import osutils
-from samcli.lib.utils.packagetype import IMAGE, ZIP
 from samcli.lib.utils.stream_writer import StreamWriter
-from samcli.local.docker.lambda_build_container import LambdaBuildContainer
-from samcli.local.docker.utils import is_docker_reachable, get_docker_platform
-from samcli.local.docker.manager import ContainerManager
-from samcli.commands._utils.experimental import get_enabled_experimental_flags
-from samcli.lib.build.exceptions import (
-    DockerConnectionError,
-    DockerfileOutSideOfContext,
-    DockerBuildFailed,
-    BuildError,
-    BuildInsideContainerError,
-    ContainerBuildNotSupported,
-    UnsupportedBuilderLibraryVersionError,
+from samcli.local.docker.container import ContainerContext
+from samcli.local.docker.container_client import ContainerClient
+from samcli.local.docker.exceptions import (
+    BuildkitNotAvailableException,
+    ContainerArchiveImageLoadFailedException,
+    ContainerImagePullFailedException,
 )
-
-from samcli.lib.build.workflow_config import (
-    get_workflow_config,
-    get_layer_subfolder,
-    supports_build_in_container,
-    CONFIG,
-    UnsupportedRuntimeException,
+from samcli.local.docker.image_build_client import CLIBuildClient, ImageBuildClient, SDKBuildClient
+from samcli.local.docker.lambda_build_container import LambdaBuildContainer
+from samcli.local.docker.manager import ContainerManager
+from samcli.local.docker.utils import (
+    get_docker_platform,
+    get_validated_container_client,
 )
 
 LOG = logging.getLogger(__name__)
 
-DEPRECATED_RUNTIMES: Set[str] = {
-    "nodejs4.3",
-    "nodejs6.10",
-    "nodejs8.10",
-    "nodejs10.x",
-    "dotnetcore2.0",
-    "dotnetcore2.1",
-    "python2.7",
-    "ruby2.5",
-}
-BUILD_PROPERTIES = "BuildProperties"
+FIRST_COMPATIBLE_RUNTIME_INDEX = 0
+HTTP_400 = 400
+HTTP_500 = 500
+HTTP_505 = 505
+JSON_RPC_CODE = -32601
 
 
 class ApplicationBuildResult(NamedTuple):
@@ -106,11 +134,15 @@ class ApplicationBuilder:
         parallel: bool = False,
         mode: Optional[str] = None,
         stream_writer: Optional[StreamWriter] = None,
-        docker_client: Optional[docker.DockerClient] = None,
+        container_client: Optional[ContainerClient] = None,
         container_env_var: Optional[Dict] = None,
         container_env_var_file: Optional[str] = None,
         build_images: Optional[Dict] = None,
         combine_dependencies: bool = True,
+        build_in_source: Optional[bool] = None,
+        mount_with_write: bool = False,
+        mount_symlinks: Optional[bool] = False,
+        use_buildkit: Optional[bool] = False,
     ) -> None:
         """
         Initialize the class
@@ -141,8 +173,8 @@ class ApplicationBuilder:
             Optional, name of the build mode to use ex: 'debug'
         stream_writer : Optional[StreamWriter]
             An optional stream writer to accept stderr output
-        docker_client : Optional[docker.DockerClient]
-            An optional Docker client object to replace the default one loaded from env
+        container_client : Optional[ContainerClient]
+            An optional container client object to replace the default one loaded from env
         container_env_var : Optional[Dict]
             An optional dictionary of environment variables to pass to the container
         container_env_var_file : Optional[str]
@@ -152,6 +184,14 @@ class ApplicationBuilder:
         combine_dependencies: bool
             An optional bool parameter to inform lambda builders whether we should separate the source code and
             dependencies or not.
+        build_in_source: Optional[bool]
+            Set to True to build in the source directory.
+        mount_with_write: bool
+            Mount source code directory with write permissions when building inside container.
+        mount_symlinks: Optional[bool]
+            True if symlinks should be mounted in the container.
+        use_buildkit: Optional[bool]
+            Optional flag for building Image functions with buildkit support.
         """
         self._resources_to_build = resources_to_build
         self._build_dir = build_dir
@@ -165,7 +205,13 @@ class ApplicationBuilder:
         self._parallel = parallel
         self._mode = mode
         self._stream_writer = stream_writer if stream_writer else StreamWriter(stream=osutils.stderr(), auto_flush=True)
-        self._docker_client = docker_client if docker_client else docker.from_env()
+
+        # Store container_client parameter for lazy initialization
+        # Only validate container runtime when container client is actually accessed
+        # This prevents unnecessary validation for builds that don't require containers
+        # NOTE: It seems like at this point container_client is only ever passed in the tests for mocking.
+        self._container_client_param = container_client
+        self._validated_container_client: Optional[ContainerClient] = None
 
         self._deprecated_runtimes = DEPRECATED_RUNTIMES
         self._colored = Colored()
@@ -173,6 +219,26 @@ class ApplicationBuilder:
         self._container_env_var_file = container_env_var_file
         self._build_images = build_images or {}
         self._combine_dependencies = combine_dependencies
+        self._build_in_source = build_in_source
+        self._mount_with_write = mount_with_write
+        self._mount_symlinks = mount_symlinks
+        self._use_buildkit = use_buildkit
+        self._image_build_client: Optional[ImageBuildClient] = None
+        # Absolute source directory each MicrovmImage was built from, keyed by full path. The built template
+        # points back at this directory, because the source (not the local image) is the deployment artifact.
+        self._microvm_image_source_dirs: Dict[str, str] = {}
+        # one SubprocessNpm per build session, so `npm prefix` answers are cached per directory
+        self._npm_subprocess: Optional[object] = None
+
+    @property
+    def _container_client(self) -> ContainerClient:
+        """
+        Lazy initialization of container client. Only validates container runtime when actually accessed.
+        This prevents unnecessary container runtime validation for builds that don't require containers.
+        """
+        if self._validated_container_client is None:
+            self._validated_container_client = self._container_client_param or get_validated_container_client()
+        return self._validated_container_client
 
     def build(self) -> ApplicationBuildResult:
         """
@@ -185,8 +251,21 @@ class ApplicationBuilder:
             to the path string
         """
         build_graph = self._get_build_graph(self._container_env_var, self._container_env_var_file)
+        self._warn_on_microvm_image_tag_collisions()
+
+        # Add cross-architecture warning when using containers
+        if self._container_manager:
+            functions = self._resources_to_build.functions
+            container_runtime = self._container_manager.container_client.get_runtime_type()
+            warn_cross_architecture_build(functions, container_runtime)
+
         build_strategy: BuildStrategy = DefaultBuildStrategy(
-            build_graph, self._build_dir, self._build_function, self._build_layer
+            build_graph,
+            self._build_dir,
+            self._build_function,
+            self._build_layer,
+            self._build_microvm_image,
+            self._cached,
         )
 
         if self._parallel:
@@ -201,6 +280,7 @@ class ApplicationBuilder:
                         self._cache_dir,
                         self._manifest_path_override,
                         self._is_building_specific_resource,
+                        bool(self._container_manager),
                     ),
                 )
             else:
@@ -214,6 +294,27 @@ class ApplicationBuilder:
                 self._cache_dir,
                 self._manifest_path_override,
                 self._is_building_specific_resource,
+                bool(self._container_manager),
+            )
+
+        if (
+            is_experimental_enabled(ExperimentalFlag.NodejsMonorepo)
+            and self._build_in_source
+            and not self._cached
+            and not self._container_manager
+        ):
+            # npm workspaces monorepo: install the shared dependency tree once per workspace root
+            # instead of once per function. Outside ParallelBuildStrategy on purpose - the install
+            # must complete before any grouped function build starts. --cached is excluded because
+            # it supplies dependencies from .aws-sam/deps and manages download_dependencies itself.
+            # Behind SAM_CLI_BETA_NODEJS_MONOREPO while the grouping rolls out: without it every
+            # function keeps its own install, which is the behaviour every release so far has had.
+            build_strategy = WorkspaceAwareBuildStrategy(
+                build_graph,
+                build_strategy,
+                self._base_dir,
+                self._resolve_npm_project_root,
+                self._prepare_workspace_shared_project,
             )
 
         return ApplicationBuildResult(build_graph, build_strategy.build())
@@ -229,6 +330,7 @@ class ApplicationBuilder:
         build_graph = BuildGraph(self._build_dir)
         functions = self._resources_to_build.functions
         layers = self._resources_to_build.layers
+        microvm_images = self._resources_to_build.microvm_images
         file_env_vars = {}
         if env_vars_file:
             try:
@@ -240,20 +342,25 @@ class ApplicationBuilder:
                 ) from ex
 
         for function in functions:
-            container_env_vars = self._make_env_vars(function, file_env_vars, inline_env_vars)
+            container_env_vars = _make_env_vars(function, file_env_vars, inline_env_vars)
             function_build_details = FunctionBuildDefinition(
                 function.runtime,
                 function.codeuri,
+                # Web Functions only have .zip code
+                None if isinstance(function, WebFunction) else function.imageuri,
                 function.packagetype,
                 function.architecture,
                 function.metadata,
-                function.handler,
+                get_build_entry_point(function),
                 env_vars=container_env_vars,
+                resource_type=(
+                    AWS_SERVERLESS_WEBFUNCTION if isinstance(function, WebFunction) else AWS_SERVERLESS_FUNCTION
+                ),
             )
             build_graph.put_function_build_definition(function_build_details, function)
 
         for layer in layers:
-            container_env_vars = self._make_env_vars(layer, file_env_vars, inline_env_vars)
+            container_env_vars = _make_env_vars(layer, file_env_vars, inline_env_vars)
 
             layer_build_details = LayerBuildDefinition(
                 layer.full_path,
@@ -265,11 +372,19 @@ class ApplicationBuilder:
             )
             build_graph.put_layer_build_definition(layer_build_details, layer)
 
+        for microvm_image in microvm_images:
+            microvm_build_details = MicrovmImageBuildDefinition(
+                microvm_image.full_path,
+                microvm_image.code_uri,
+                cast(str, microvm_image.architecture),
+            )
+            build_graph.put_microvm_image_build_definition(microvm_build_details, microvm_image)
+
         build_graph.clean_redundant_definitions_and_update(not self._is_building_specific_resource)
         return build_graph
 
-    @staticmethod
     def update_template(
+        self,
         stack: Stack,
         built_artifacts: Dict[str, str],
         stack_output_template_path_by_stack_path: Dict[str, str],
@@ -332,8 +447,11 @@ class ApplicationBuilder:
                 store_path = os.path.relpath(absolute_output_path, original_dir)
 
             if has_build_artifact:
+                if resource_type in (AWS_SERVERLESS_MICROVMIMAGE, AWS_LAMBDA_MICROVMIMAGE):
+                    self._point_microvm_image_at_source_dir(full_path, resource_type, properties, original_dir)
+
                 ApplicationBuilder._update_built_resource(
-                    built_artifacts[full_path], properties, resource_type, store_path
+                    built_artifacts[full_path], properties, resource_type or "", store_path
                 )
 
             if is_stack:
@@ -345,9 +463,56 @@ class ApplicationBuilder:
 
         return template_dict
 
+    def _point_microvm_image_at_source_dir(
+        self, full_path: str, resource_type: str, properties: Dict, original_dir: pathlib.Path
+    ) -> None:
+        """
+        Set a built MicrovmImage's code path to the directory it was actually built from.
+
+        The path is written relative to the template's directory, which is what move_template expects
+        when it rebases paths into the build directory. Using the built directory, rather than the original
+        value, keeps the built template correct for intrinsics (!Ref), the CodeArtifact {Uri: ...} structure,
+        and --base-dir (where the source is resolved from base_dir, not from the template's directory).
+
+        Parameters
+        ----------
+        full_path : str
+            Stack-path-qualified identifier of the MicrovmImage
+        resource_type : str
+            AWS::Serverless::MicrovmImage or AWS::Lambda::MicrovmImage
+        properties : dict
+            Properties of the resource in the template being written, modified in place
+        original_dir : pathlib.Path
+            Directory of the template being written
+        """
+        source_dir = self._microvm_image_source_dirs.get(full_path)
+        if not source_dir:
+            return
+
+        # In Windows, if the template and the source are on different drives, relpath fails
+        source_path = (
+            os.path.relpath(source_dir, original_dir)
+            if pathlib.Path(source_dir).drive == original_dir.drive
+            else source_dir
+        )
+
+        code_prop = "CodeUri" if resource_type == AWS_SERVERLESS_MICROVMIMAGE else "CodeArtifact"
+        code_value = properties.get(code_prop)
+        if resource_type == AWS_LAMBDA_MICROVMIMAGE and isinstance(code_value, dict) and "Uri" in code_value:
+            properties[code_prop] = {**code_value, "Uri": source_path}
+        else:
+            properties[code_prop] = source_path
+
     @staticmethod
     def _update_built_resource(path: str, resource_properties: Dict, resource_type: str, absolute_path: str) -> None:
+        # MicrovmImage: the Docker image is local-only for testing, so the code path is not set to a build artifact.
+        # The deployment artifact is the zip of the source directory (handled by sam package), not the Docker image.
+        # update_template points the code path at the built source directory before reaching here.
+        if resource_type in (AWS_SERVERLESS_MICROVMIMAGE, AWS_LAMBDA_MICROVMIMAGE):
+            return
         if resource_type == AWS_SERVERLESS_FUNCTION and resource_properties.get("PackageType", ZIP) == ZIP:
+            resource_properties["CodeUri"] = absolute_path
+        if resource_type == AWS_SERVERLESS_WEBFUNCTION:
             resource_properties["CodeUri"] = absolute_path
         if resource_type == AWS_LAMBDA_FUNCTION and resource_properties.get("PackageType", ZIP) == ZIP:
             resource_properties["Code"] = absolute_path
@@ -359,6 +524,38 @@ class ApplicationBuilder:
             resource_properties["Code"] = {"ImageUri": path}
         if resource_type == AWS_SERVERLESS_FUNCTION and resource_properties.get("PackageType", ZIP) == IMAGE:
             resource_properties["ImageUri"] = path
+
+    def _is_web_function(self, function_name: str) -> bool:
+        """Whether function_name is a Web Function, which can't use layers and so keeps its dependencies"""
+        functions = getattr(self._resources_to_build, "functions", None)
+        if not isinstance(functions, list):
+            return False
+        return any(isinstance(function, WebFunction) and function.name == function_name for function in functions)
+
+    def _get_image_build_client(self) -> ImageBuildClient:
+        """
+        Lazily create the client used for image builds, shared by Lambda image functions and MicrovmImages.
+        Uses the CLI client (BuildKit) with --use-buildkit, otherwise the Docker SDK client.
+
+        Raises
+        ------
+        BuildkitNotAvailableException
+            When --use-buildkit is set but BuildKit is not available for the container runtime
+        """
+        if not self._image_build_client:
+            if self._use_buildkit:
+                engine_type = self._container_client.get_runtime_type()
+
+                is_available, error_msg = CLIBuildClient.is_available(engine_type)
+                if not is_available:
+                    raise BuildkitNotAvailableException(error_msg)
+
+                self._image_build_client = CLIBuildClient(engine_type=engine_type)
+                LOG.debug(f"Using CLIBuildClient with engine_type {engine_type}")
+            else:
+                self._image_build_client = SDKBuildClient(self._container_client)
+                LOG.debug("Using SDKBuildClient")
+        return self._image_build_client
 
     def _build_lambda_image(self, function_name: str, metadata: Dict, architecture: str) -> str:
         """
@@ -385,9 +582,11 @@ class ApplicationBuilder:
         docker_context = cast(str, metadata.get("DockerContext"))
         # Have a default tag if not present.
         tag = metadata.get("DockerTag", "latest")
-        docker_tag = f"{function_name.lower()}:{tag}"
+        image_name = cast(str, metadata.get("DockerImage", function_name))
+        docker_tag = f"{image_name.lower()}:{tag}"
         docker_build_target = metadata.get("DockerBuildTarget", None)
         docker_build_args = metadata.get("DockerBuildArgs", {})
+        docker_build_extra_params = metadata.get("DockerBuildExtraParams", [])
 
         if not dockerfile or not docker_context:
             raise DockerBuildFailed("Docker file or Docker context metadata are missed.")
@@ -395,36 +594,54 @@ class ApplicationBuilder:
         if not isinstance(docker_build_args, dict):
             raise DockerBuildFailed("DockerBuildArgs needs to be a dictionary!")
 
+        if docker_build_extra_params is not None and (
+            not isinstance(docker_build_extra_params, list)
+            or not all(isinstance(p, str) for p in docker_build_extra_params)
+        ):
+            raise DockerBuildFailed("DockerBuildExtraParams must be a list of strings!")
+
         docker_context_dir = pathlib.Path(self._base_dir, docker_context).resolve()
-        if not is_docker_reachable(self._docker_client):
-            raise DockerConnectionError(msg=f"Building image for {function_name} requires Docker. is Docker running?")
 
         if os.environ.get("SAM_BUILD_MODE") and isinstance(docker_build_args, dict):
             docker_build_args["SAM_BUILD_MODE"] = os.environ.get("SAM_BUILD_MODE")
             docker_tag = "-".join([docker_tag, docker_build_args["SAM_BUILD_MODE"]])
 
         if isinstance(docker_build_args, dict):
-            LOG.info("Setting DockerBuildArgs: %s for %s function", docker_build_args, function_name)
+            LOG.info("Setting DockerBuildArgs for %s function", function_name)
 
         build_args = {
             "path": str(docker_context_dir),
-            "dockerfile": dockerfile,
+            "dockerfile": str(pathlib.Path(dockerfile).as_posix()),
             "tag": docker_tag,
             "buildargs": docker_build_args,
-            "decode": True,
             "platform": get_docker_platform(architecture),
+            "rm": True,
         }
         if docker_build_target:
             build_args["target"] = cast(str, docker_build_target)
+        if docker_build_extra_params:
+            build_args["extra_params"] = docker_build_extra_params
 
-        build_logs = self._docker_client.api.build(**build_args)
+        try:
+            build_logs = self._get_image_build_client().build_image(**build_args)  # type: ignore[arg-type]
+            LOG.debug(f"Image built for {function_name} function")
+        except docker.errors.BuildError as ex:
+            LOG.error("Failed building function %s", function_name)
+            self._stream_lambda_image_build_logs(ex.build_log, function_name, False)
+            raise DockerBuildFailed(str(ex)) from ex
+        except docker.errors.APIError as e:
+            if self._container_client.is_dockerfile_error(e):
+                raise DockerfileOutSideOfContext(e.explanation) from e
+
+            # Re-raise other API errors
+            raise
 
         # The Docker-py low level api will stream logs back but if an exception is raised by the api
         # this is raised when accessing the generator. So we need to wrap accessing build_logs in a try: except.
         try:
-            self._stream_lambda_image_build_logs(build_logs, function_name)
+            self._stream_lambda_image_build_logs(build_logs, function_name)  # type: ignore[arg-type]
         except docker.errors.APIError as e:
-            if e.is_server_error and "Cannot locate specified Dockerfile" in e.explanation:
+            if self._container_client.is_dockerfile_error(e):
                 raise DockerfileOutSideOfContext(e.explanation) from e
 
             # Not sure what else can be raise that we should be catching but re-raising for now
@@ -432,7 +649,9 @@ class ApplicationBuilder:
 
         return docker_tag
 
-    def _stream_lambda_image_build_logs(self, build_logs: List[Dict[str, str]], function_name: str) -> None:
+    def _stream_lambda_image_build_logs(
+        self, build_logs: List[Dict[str, str]], function_name: str, throw_on_error: bool = True
+    ) -> None:
         """
         Stream logs to the console from an Lambda image build.
 
@@ -443,11 +662,19 @@ class ApplicationBuilder:
         function_name str
             Name of the function that is being built
         """
-        build_log_streamer = LogStreamer(self._stream_writer)
+        build_log_streamer = LogStreamer(self._stream_writer, throw_on_error)
         try:
             build_log_streamer.stream_progress(build_logs)
         except LogStreamError as ex:
             raise DockerBuildFailed(msg=f"{function_name} failed to build: {str(ex)}") from ex
+
+    def _load_lambda_image(self, image_archive_path: str) -> str:
+        try:
+            with open(image_archive_path, mode="rb") as image_archive:
+                image = self._container_client.load_image_from_archive(image_archive)
+                return f"{image.id}"
+        except (docker.errors.APIError, OSError, ContainerArchiveImageLoadFailedException) as ex:
+            raise DockerBuildFailed(msg=str(ex)) from ex
 
     def _build_layer(
         self,
@@ -460,6 +687,7 @@ class ApplicationBuilder:
         container_env_vars: Optional[Dict] = None,
         dependencies_dir: Optional[str] = None,
         download_dependencies: bool = True,
+        layer_metadata: Optional[Dict] = None,
     ) -> str:
         """
         Given the layer information, this method will build the Lambda layer. Depending on the configuration
@@ -488,6 +716,8 @@ class ApplicationBuilder:
         download_dependencies: bool
             An optional boolean parameter to inform lambda builders whether download dependencies or use previously
             downloaded ones. Default value is True.
+        layer_metadata: Optional[Dict]
+            An optional dictionary that contain the layer version metadata information.
 
         Returns
         -------
@@ -500,16 +730,44 @@ class ApplicationBuilder:
 
         config = get_workflow_config(None, code_dir, self._base_dir, specified_workflow)
         subfolder = get_layer_subfolder(specified_workflow)
+        if (
+            config.language == "provided"
+            and isinstance(layer_metadata, dict)
+            and layer_metadata.get("ProjectRootDirectory")
+        ):
+            code_dir = str(pathlib.Path(self._base_dir, layer_metadata.get("ProjectRootDirectory", code_dir)).resolve())
 
         # artifacts directory will be created by the builder
         artifact_subdir = str(pathlib.Path(artifact_dir, subfolder))
 
         with osutils.mkdir_temp() as scratch_dir:
-            manifest_path = self._manifest_path_override or os.path.join(code_dir, config.manifest_name)
+            manifest_context_path = code_dir
+            if config.language == "provided" and isinstance(layer_metadata, dict) and layer_metadata.get("ContextPath"):
+                manifest_context_path = str(
+                    pathlib.Path(self._base_dir, layer_metadata.get("ContextPath", code_dir)).resolve()
+                )
+            manifest_path = (
+                self._manifest_path_override
+                if self._manifest_path_override
+                else (os.path.join(manifest_context_path, config.manifest_name) if config.manifest_name else None)
+            )
 
             # By default prefer to build in-process for speed
+            scratch_dir_path = (
+                LambdaBuildContainer.get_container_dirs(code_dir, manifest_path)["scratch_dir"]
+                if self._container_manager
+                else scratch_dir
+            )
             build_runtime = specified_workflow
-            options = ApplicationBuilder._get_build_options(layer_name, config.language, None)
+            options = ApplicationBuilder._get_build_options(
+                layer_name,
+                config.language,
+                self._base_dir,
+                None,
+                metadata=layer_metadata,
+                source_code_path=code_dir,
+                scratch_dir=scratch_dir_path,
+            )
             if self._container_manager:
                 # None key represents the global build image for all functions/layers
                 if config.language == "provided":
@@ -518,9 +776,13 @@ class ApplicationBuilder:
                     )
                     # Only set to this value if specified workflow is makefile
                     # which will result in config language as provided
-                    build_runtime = compatible_runtimes[0]
+                    build_runtime = (
+                        compatible_runtimes[FIRST_COMPATIBLE_RUNTIME_INDEX] if compatible_runtimes else config.language
+                    )
                 global_image = self._build_images.get(None)
                 image = self._build_images.get(layer_name, global_image)
+                # pass to container only when specified workflow is supported to overwrite runtime to get image
+                supported_specified_workflow = supports_specified_workflow(specified_workflow)
                 self._build_function_on_container(
                     config,
                     code_dir,
@@ -532,6 +794,7 @@ class ApplicationBuilder:
                     container_env_vars,
                     image,
                     is_building_layer=True,
+                    specified_workflow=specified_workflow if supported_specified_workflow else None,
                 )
             else:
                 self._build_function_in_process(
@@ -552,10 +815,73 @@ class ApplicationBuilder:
             # Not including subfolder in return so that we copy subfolder, instead of copying artifacts inside it.
             return artifact_dir
 
+    def _resolve_npm_project_root(self, code_dir: str) -> Optional[str]:
+        """
+        Ask npm (through aws-lambda-builders) which project root covers code_dir.
+
+        Returns None when the answer is unavailable for any reason - npm missing, an
+        aws-lambda-builders too old to expose the resolver - which disables workspace grouping for
+        that function and keeps today's per-function install.
+        """
+        try:
+            from aws_lambda_builders.workflows.nodejs_npm.npm import SubprocessNpm
+            from aws_lambda_builders.workflows.nodejs_npm.utils import OSUtils as NpmOSUtils
+        except ImportError:
+            return None
+
+        if self._npm_subprocess is None:
+            self._npm_subprocess = SubprocessNpm(NpmOSUtils())
+        resolver = getattr(self._npm_subprocess, "resolve_project_root", None)
+        if resolver is None:
+            return None
+        try:
+            return cast(Optional[str], resolver(code_dir))
+        except OSError as ex:
+            LOG.debug("Could not resolve the npm project root of %s: %s", code_dir, ex)
+            return None
+
+    def _prepare_workspace_shared_project(self, project_root: str, build_definition: "FunctionBuildDefinition") -> bool:
+        """
+        Do once, at project_root, the work every workspace function under it shares.
+
+        For the npm workflows that is installing the hoisted dependency tree. The build definition
+        supplies the workflow (npm or npm-esbuild) whose builder does it; both funnel into the same
+        npm project tree. Returns False on any failure so the caller leaves the grouped functions on
+        per-function installs.
+        """
+        code_dir = str(pathlib.Path(self._base_dir, cast(str, build_definition.codeuri)).resolve())
+        specified_workflow = build_definition.metadata.get("BuildMethod") if build_definition.metadata else None
+        try:
+            config = get_workflow_config(
+                build_definition.runtime, code_dir, self._base_dir, specified_workflow=specified_workflow
+            )
+            builder = LambdaBuilder(
+                language=config.language,
+                dependency_manager=config.dependency_manager,
+                application_framework=config.application_framework,
+            )
+            prepare = getattr(builder, "prepare_shared_project", None)
+            if prepare is None:
+                LOG.debug("Installed aws-lambda-builders has no shared-project hook; skipping grouping")
+                return False
+            # The same flags the per-function build() calls get: the builders hook refuses without
+            # experimentalNodejsMonorepo, because the per-function artifacts link is gated on it too
+            # and preparing the root without it would ship artifacts carrying no dependencies.
+            prepare(project_root, experimental_flags=get_enabled_experimental_flags())
+            return True
+        except (UnsupportedRuntimeException, LambdaBuilderError) as ex:
+            LOG.warning(
+                "Preparing the shared project root %s failed (%s); falling back to per-function installs",
+                project_root,
+                ex,
+            )
+            return False
+
     def _build_function(  # pylint: disable=R1710
         self,
         function_name: str,
         codeuri: str,
+        imageuri: Optional[str],
         packagetype: str,
         runtime: str,
         architecture: str,
@@ -576,6 +902,9 @@ class ApplicationBuilder:
             Name or LogicalId of the function
         codeuri : str
             Path to where the code lives
+        imageuri : str
+            Location of the Lambda Image which is of the form {image}:{tag}, sha256:{digest},
+            or a path to a local archive
         packagetype : str
             The package type, 'Zip' or 'Image', see samcli/lib/utils/packagetype.py
         runtime : str
@@ -603,6 +932,10 @@ class ApplicationBuilder:
             Path to the location where built artifacts are available
         """
         if packagetype == IMAGE:
+            if (
+                imageuri and check_path_valid_type(imageuri) and Path(imageuri).is_file()
+            ):  # something exists at this path and what exists is a file
+                return self._load_lambda_image(imageuri)  # should be an image archive – load it instead of building it
             # pylint: disable=fixme
             # FIXME: _build_lambda_image assumes metadata is not None, we need to throw an exception here
             return self._build_lambda_image(
@@ -615,30 +948,53 @@ class ApplicationBuilder:
                     f"update to a newer supported runtime. For more information please check AWS Lambda Runtime "
                     f"Support Policy: https://docs.aws.amazon.com/lambda/latest/dg/runtime-support-policy.html"
                 )
-                LOG.warning(self._colored.yellow(message))
+                LOG.warning(self._colored.color_log(msg=message, color=Colors.WARNING), extra=dict(markup=True))
                 raise UnsupportedRuntimeException(f"Building functions with {runtime} is no longer supported")
 
             # Create the arguments to pass to the builder
             # Code is always relative to the given base directory.
             code_dir = str(pathlib.Path(self._base_dir, codeuri).resolve())
-
             # Determine if there was a build workflow that was specified directly in the template.
-            specified_build_workflow = metadata.get("BuildMethod", None) if metadata else None
+            specified_workflow = metadata.get("BuildMethod", None) if metadata else None
+            config = get_workflow_config(runtime, code_dir, self._base_dir, specified_workflow=specified_workflow)
 
-            config = get_workflow_config(runtime, code_dir, self._base_dir, specified_workflow=specified_build_workflow)
+            if config.language == "provided" and isinstance(metadata, dict) and metadata.get("ProjectRootDirectory"):
+                code_dir = str(pathlib.Path(self._base_dir, metadata.get("ProjectRootDirectory", code_dir)).resolve())
 
             with osutils.mkdir_temp() as scratch_dir:
-                manifest_path = self._manifest_path_override or os.path.join(code_dir, config.manifest_name)
-
+                manifest_context_path = code_dir
+                if config.language == "provided" and isinstance(metadata, dict) and metadata.get("ContextPath"):
+                    manifest_context_path = str(
+                        pathlib.Path(self._base_dir, metadata.get("ContextPath", code_dir)).resolve()
+                    )
+                manifest_path = (
+                    self._manifest_path_override
+                    if self._manifest_path_override
+                    else (os.path.join(manifest_context_path, config.manifest_name) if config.manifest_name else None)
+                )
+                scratch_dir_path = (
+                    LambdaBuildContainer.get_container_dirs(code_dir, manifest_path)["scratch_dir"]
+                    if self._container_manager
+                    else scratch_dir
+                )
                 options = ApplicationBuilder._get_build_options(
-                    function_name, config.language, handler, config.dependency_manager, metadata
+                    function_name,
+                    config.language,
+                    self._base_dir,
+                    handler,
+                    config.dependency_manager,
+                    metadata,
+                    source_code_path=code_dir,
+                    scratch_dir=scratch_dir_path,
+                    is_web_function=self._is_web_function(function_name),
                 )
                 # By default prefer to build in-process for speed
                 if self._container_manager:
                     # None represents the global build image for all functions/layers
                     global_image = self._build_images.get(None)
                     image = self._build_images.get(function_name, global_image)
-
+                    # pass to container only when specified workflow is supported to overwrite runtime to get image
+                    supported_specified_workflow = supports_specified_workflow(specified_workflow)
                     return self._build_function_on_container(
                         config,
                         code_dir,
@@ -649,6 +1005,7 @@ class ApplicationBuilder:
                         options,
                         container_env_vars,
                         image,
+                        specified_workflow=specified_workflow if supported_specified_workflow else None,
                     )
 
                 return self._build_function_in_process(
@@ -662,7 +1019,7 @@ class ApplicationBuilder:
                     options,
                     dependencies_dir,
                     download_dependencies,
-                    self._combine_dependencies,
+                    self._combine_dependencies or self._is_web_function(function_name),
                 )
 
         # pylint: disable=fixme
@@ -673,23 +1030,35 @@ class ApplicationBuilder:
     def _get_build_options(
         function_name: str,
         language: str,
+        base_dir: str,
         handler: Optional[str],
         dependency_manager: Optional[str] = None,
         metadata: Optional[dict] = None,
+        source_code_path: Optional[str] = None,
+        scratch_dir: Optional[str] = None,
+        is_web_function: bool = False,
     ) -> Optional[Dict]:
         """
         Parameters
         ----------
         function_name str
-            currrent function resource name
+            current function resource name
         language str
             language of the runtime
+        base_dir str
+            Path to a folder. Use this folder as the root to resolve relative source code paths against
         handler str
             Handler value of the Lambda Function Resource
         dependency_manager str
             Dependency manager to check in addition to language
-        metadata
+        metadata Dict
             Metadata object to search for build properties
+        source_code_path str
+            The lambda function source code path that will be used to calculate the working directory
+        scratch_dir str
+            The temporary directory path where the lambda function code will be copied to.
+        is_web_function bool
+            True when handler is a Web Function's EntryPoint, which is a file path rather than a Lambda handler
         Returns
         -------
         dict
@@ -704,16 +1073,212 @@ class ApplicationBuilder:
             # as a required argument. This corresponds to the lambda function handler.
             normalized_build_props = ResourceMetadataNormalizer.normalize_build_properties(build_props)
             if handler and not build_props.get("EntryPoints"):
-                entry_points = [handler.split(".")[0]]
+                # A Web Function's EntryPoint is a file path; Lambda Builders adds .ts/.js if it's missing
+                entry_points = [handler if is_web_function else handler.split(".")[0]]
                 normalized_build_props["entry_points"] = entry_points
             return normalized_build_props
 
-        _build_options: Dict = {
-            "go": {"artifact_executable_name": handler},
+        _build_options: Dict[str, Dict] = {
+            "go": {
+                "artifact_executable_name": handler,
+                "trim_go_path": build_props.get("TrimGoPath", False),
+            },
             "provided": {"build_logical_id": function_name},
             "nodejs": {"use_npm_ci": build_props.get("UseNpmCi", False)},
         }
-        return _build_options.get(language, None)
+        options = _build_options.get(language, None)
+        if language == "provided":
+            options = options if options else {}
+            working_directory = ApplicationBuilder._get_working_directory_path(
+                base_dir, metadata, source_code_path, scratch_dir
+            )
+            if working_directory:
+                options = {**options, "working_directory": convert_path_to_unix_path(working_directory)}
+
+        if language == "rust" and "Binary" in build_props:
+            options = options if options else {}
+            options["artifact_executable_name"] = build_props["Binary"]
+
+        if language == "python" and "ParentPackageMode" in build_props:
+            options = options if options else {}
+            package_root_mode = build_props["ParentPackageMode"]
+            if package_root_mode == "auto":
+                options["parent_python_packages"] = ApplicationBuilder._infer_parent_python_packages(
+                    handler, source_code_path
+                )
+            elif package_root_mode == "explicit":
+                options["parent_python_packages"] = build_props.get("ParentPackages", None)
+
+        return options
+
+    @staticmethod
+    def _get_working_directory_path(
+        base_dir: str, metadata: Optional[Dict], source_code_path: Optional[str], scratch_dir: Optional[str]
+    ) -> Optional[str]:
+        """
+        Get the working directory from the lambda resource metadata information, and  check if it is not None, and it
+        is a child path to the source directory path, then return the working directory as a child to the scratch
+        directory.
+
+        Parameters
+        ----------
+        base_dir : str
+            Path to a folder. Use this folder as the root to resolve relative source code paths against
+        metadata Dict
+            Lambda resource metadata object to search for build properties
+        source_code_path str
+            The lambda resource source code path that will be used to calculate the working directory
+        scratch_dir str
+            The temporary directory path where the lambda resource code will be copied to.
+        Returns
+        -------
+        str
+            The working directory path or None if there is no working_dir metadata info.
+        """
+        working_directory = None
+        if metadata and isinstance(metadata, dict):
+            working_directory = metadata.get("WorkingDirectory")
+            if working_directory:
+                working_directory = str(pathlib.Path(base_dir, working_directory).resolve())
+
+                # check if the working directory is a child of the lambda resource source code path, to update the
+                # working directory to be child of the scratch directory
+                if (
+                    source_code_path
+                    and scratch_dir
+                    and os.path.commonpath([source_code_path, working_directory]) == os.path.normpath(source_code_path)
+                ):
+                    working_directory = os.path.relpath(working_directory, source_code_path)
+                    working_directory = os.path.normpath(os.path.join(scratch_dir, working_directory))
+
+        return working_directory
+
+    def _warn_on_microvm_image_tag_collisions(self) -> None:
+        """
+        Warn when MicrovmImages in this build map to the same local tag, so the image built last overwrites the
+        others. Tags are derived from the full path, so for example IDs that differ only in case collide.
+        """
+        full_paths_by_tag: Dict[str, List[str]] = {}
+        for image in self._resources_to_build.microvm_images:
+            full_paths_by_tag.setdefault(self._microvm_image_tag(image.full_path), []).append(image.full_path)
+        for tag, full_paths in full_paths_by_tag.items():
+            if len(full_paths) > 1:
+                LOG.warning(
+                    "MicrovmImages %s all map to the local image tag '%s', so the image built last overwrites "
+                    "the others. Rename the resources so their IDs differ by more than case or punctuation.",
+                    ", ".join(full_paths),
+                    tag,
+                )
+
+    @staticmethod
+    def _microvm_image_tag(full_path: str) -> str:
+        """
+        Local Docker tag for a MicrovmImage: <full path, lowercased>:latest.
+
+        CDK construct IDs (used as the resource ID) can contain characters Docker rejects in an image
+        name, such as spaces, so every run of non-alphanumeric characters (including the nested stack "/")
+        becomes a single "-".
+        """
+        name = re.sub(r"[^a-z0-9]+", "-", full_path.lower()).strip("-") or "microvm-image"
+        return f"{name}:latest"
+
+    def _build_microvm_image(self, full_path: str, code_uri: str, architecture: str) -> str:
+        """
+        Build a Docker image for a MicrovmImage resource.
+
+        Uses CodeUri as the Docker build context. Dockerfile must be in that directory.
+        Tags the image with _microvm_image_tag (the full path, lowercased and with "/" turned into "-"),
+        so that MicrovmImage resources with the same logical ID in different nested stacks don't collide
+        on the same local Docker tag.
+        Does NOT update the built template.
+
+        Parameters
+        ----------
+        full_path : str
+            Stack-path-qualified unique identifier of the MicrovmImage resource (see
+            MicrovmImage.full_path), e.g. "MyImage" or "ChildStack/MyImage"
+        code_uri : str
+            Local path to the source directory containing the Dockerfile
+        architecture : str
+            CPU architecture for the Docker build platform
+
+        Returns
+        -------
+        str
+            The Docker image tag that was built
+        """
+        docker_context_dir = pathlib.Path(self._base_dir, code_uri).resolve()
+        dockerfile_path = docker_context_dir / "Dockerfile"
+
+        # These checks run before any Docker build, so they raise MicrovmImageSourceError, not DockerBuildFailed
+        if not docker_context_dir.exists():
+            raise MicrovmImageSourceError(
+                f"CodeUri directory '{docker_context_dir}' for MicrovmImage '{full_path}' does not exist. "
+                "If CodeUri references a template parameter, provide its value via --parameter-overrides."
+            )
+        if not docker_context_dir.is_dir():
+            # Reached for a .zip only when the image is the build target; building all resources skips a CodeUri
+            # ending in .zip. Check the content, as sam package does, so a corrupt .zip is reported as a file.
+            if zipfile.is_zipfile(docker_context_dir):
+                raise MicrovmImageSourceError(
+                    f"CodeUri '{docker_context_dir}' for MicrovmImage '{full_path}' is a .zip file. sam build builds "
+                    "MicrovmImages from a source directory containing a Dockerfile; point CodeUri at that directory "
+                    "to build locally. sam package uploads a .zip as is."
+                )
+            raise MicrovmImageSourceError(
+                f"CodeUri '{docker_context_dir}' for MicrovmImage '{full_path}' is a file. CodeUri must be a "
+                f"directory containing a Dockerfile, for example '{docker_context_dir.parent}'."
+            )
+        if not dockerfile_path.exists():
+            raise MicrovmImageSourceError(
+                f"Dockerfile not found in CodeUri directory '{docker_context_dir}' for MicrovmImage '{full_path}'."
+            )
+
+        # The image is built for the target platform, but RUN steps execute on the host CPU.
+        host_architecture = _get_host_architecture()
+        if host_architecture != architecture:
+            LOG.warning(
+                "Building MicrovmImage '%s' for %s on a %s host. Dockerfile RUN steps execute %s binaries "
+                "and need emulation (for example QEMU via binfmt_misc); without it the build fails with "
+                "'exec format error'.",
+                full_path,
+                architecture,
+                host_architecture,
+                architecture,
+            )
+
+        docker_tag = self._microvm_image_tag(full_path)
+
+        build_args = {
+            "path": str(docker_context_dir),
+            "dockerfile": "Dockerfile",
+            "tag": docker_tag,
+            "buildargs": {},
+            "platform": get_docker_platform(architecture),
+            "rm": True,
+        }
+
+        try:
+            build_logs = self._get_image_build_client().build_image(**build_args)  # type: ignore[arg-type]
+            LOG.debug("MicrovmImage built for %s", full_path)
+        except docker.errors.BuildError as ex:
+            LOG.error("Failed building MicrovmImage %s", full_path)
+            self._stream_lambda_image_build_logs(ex.build_log, full_path, False)
+            raise DockerBuildFailed(str(ex)) from ex
+        except docker.errors.APIError as e:
+            if self._container_client.is_dockerfile_error(e):
+                raise DockerfileOutSideOfContext(e.explanation) from e
+            raise DockerBuildFailed(f"{full_path} failed to build: {e.explanation or e}") from e
+
+        try:
+            self._stream_lambda_image_build_logs(build_logs, full_path)  # type: ignore[arg-type]
+        except docker.errors.APIError as e:
+            if self._container_client.is_dockerfile_error(e):
+                raise DockerfileOutSideOfContext(e.explanation) from e
+            raise DockerBuildFailed(f"{full_path} failed to build: {e.explanation or e}") from e
+
+        self._microvm_image_source_dirs[full_path] = str(docker_context_dir)
+        return docker_tag
 
     def _build_function_in_process(
         self,
@@ -721,7 +1286,7 @@ class ApplicationBuilder:
         source_dir: str,
         artifacts_dir: str,
         scratch_dir: str,
-        manifest_path: str,
+        manifest_path: Optional[str],
         runtime: str,
         architecture: str,
         options: Optional[Dict],
@@ -730,14 +1295,13 @@ class ApplicationBuilder:
         combine_dependencies: bool,
         is_building_layer: bool = False,
     ) -> str:
-
         builder = LambdaBuilder(
             language=config.language,
             dependency_manager=config.dependency_manager,
             application_framework=config.application_framework,
         )
 
-        runtime = runtime.replace(".al2", "")
+        runtime_patched = patch_runtime(runtime)
 
         try:
             builder.build(
@@ -745,7 +1309,8 @@ class ApplicationBuilder:
                 artifacts_dir,
                 scratch_dir,
                 manifest_path,
-                runtime=runtime,
+                runtime=runtime_patched,
+                unpatched_runtime=runtime,
                 executable_search_paths=config.executable_search_paths,
                 mode=self._mode,
                 options=options,
@@ -755,6 +1320,7 @@ class ApplicationBuilder:
                 combine_dependencies=combine_dependencies,
                 is_building_layer=is_building_layer,
                 experimental_flags=get_enabled_experimental_flags(),
+                build_in_source=self._build_in_source,
             )
         except LambdaBuilderError as ex:
             raise BuildError(wrapped_from=ex.__class__.__name__, msg=str(ex)) from ex
@@ -766,32 +1332,23 @@ class ApplicationBuilder:
         config: CONFIG,
         source_dir: str,
         artifacts_dir: str,
-        manifest_path: str,
+        manifest_path: Optional[str],
         runtime: str,
         architecture: str,
         options: Optional[Dict],
         container_env_vars: Optional[Dict] = None,
         build_image: Optional[str] = None,
         is_building_layer: bool = False,
+        specified_workflow: Optional[str] = None,
     ) -> str:
         # _build_function_on_container() is only called when self._container_manager if not None
         if not self._container_manager:
             raise RuntimeError("_build_function_on_container() is called when self._container_manager is None.")
 
-        if not self._container_manager.is_docker_reachable:
-            raise BuildInsideContainerError(
-                "Docker is unreachable. Docker needs to be running to build inside a container."
-            )
-
-        container_build_supported, reason = supports_build_in_container(config)
-        if not container_build_supported:
-            raise ContainerBuildNotSupported(reason)
-
         # If we are printing debug logs in SAM CLI, the builder library should also print debug logs
         log_level = LOG.getEffectiveLevel()
 
         container_env_vars = container_env_vars or {}
-
         container = LambdaBuildContainer(
             lambda_builders_protocol_version,
             config.language,
@@ -801,6 +1358,7 @@ class ApplicationBuilder:
             manifest_path,
             runtime,
             architecture,
+            specified_workflow=specified_workflow,
             log_level=log_level,
             optimizations=None,
             options=options,
@@ -809,17 +1367,20 @@ class ApplicationBuilder:
             env_vars=container_env_vars,
             image=build_image,
             is_building_layer=is_building_layer,
+            build_in_source=self._build_in_source,
+            mount_with_write=self._mount_with_write,
+            build_dir=self._build_dir,
+            mount_symlinks=self._mount_symlinks,
         )
 
         try:
             try:
-                self._container_manager.run(container)
+                self._container_manager.run(container, context=ContainerContext.BUILD)
             except docker.errors.APIError as ex:
                 if "executable file not found in $PATH" in str(ex):
                     raise UnsupportedBuilderLibraryVersionError(
                         container.image, "{} executable not found in container".format(container.executable_name)
                     ) from ex
-
             # Container's output provides status of whether the build succeeded or failed
             # stdout contains the result of JSON-RPC call
             stdout_stream = io.BytesIO()
@@ -838,6 +1399,10 @@ class ApplicationBuilder:
             # "/." is a Docker thing that instructions the copy command to download contents of the folder only
             result_dir_in_container = response["result"]["artifacts_dir"] + "/."
             container.copy(result_dir_in_container, artifacts_dir)
+
+        except ContainerImagePullFailedException as ex:
+            raise BuildInsideContainerError(ex)
+
         finally:
             self._container_manager.stop(container)
 
@@ -846,13 +1411,12 @@ class ApplicationBuilder:
 
     @staticmethod
     def _parse_builder_response(stdout_data: str, image_name: str) -> Dict:
-
         try:
             response = json.loads(stdout_data)
         except Exception:
             # Invalid JSON is produced as an output only when the builder process crashed for some reason.
             # Report this as a crash
-            LOG.debug("Builder crashed")
+            LOG.error("Builder crashed: %s", stdout_data)
             raise
 
         if "error" in response:
@@ -860,11 +1424,11 @@ class ApplicationBuilder:
             err_code = error.get("code")
             msg = error.get("message")
 
-            if 400 <= err_code < 500:
+            if HTTP_400 <= err_code < HTTP_500:
                 # Like HTTP 4xx - customer error
                 raise BuildInsideContainerError(msg)
 
-            if err_code == 505:
+            if err_code == HTTP_505:
                 # Like HTTP 505 error code: Version of the protocol is not supported
                 # In this case, this error means that the Builder Library within the container is
                 # not compatible with the version of protocol expected SAM CLI installation supports.
@@ -872,7 +1436,7 @@ class ApplicationBuilder:
                 # https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/505
                 raise UnsupportedBuilderLibraryVersionError(image_name, msg)
 
-            if err_code == -32601:
+            if err_code == JSON_RPC_CODE:
                 # Default JSON Rpc Code for Method Unavailable https://www.jsonrpc.org/specification
                 # This can happen if customers are using an incompatible version of builder library within the
                 # container
@@ -885,63 +1449,49 @@ class ApplicationBuilder:
         return cast(Dict, response)
 
     @staticmethod
-    def _make_env_vars(
-        resource: Union[Function, LayerVersion], file_env_vars: Dict, inline_env_vars: Optional[Dict]
-    ) -> Dict:
-        """Returns the environment variables configuration for this function
-
-        Priority order (high to low):
-        1. Function specific env vars from command line
-        2. Function specific env vars from json file
-        3. Global env vars from command line
-        4. Global env vars from json file
+    def _infer_parent_python_packages(handler: Optional[str], source_code_path: Optional[str]) -> Optional[str]:
+        """
+        Infers the parent python packages from the handler and source code path. The parent packages are the
+        packages are the union of the handler's parent packages and the source code path's parent packages.
 
         Parameters
         ----------
-        resource : Union[Function, LayerVersion]
-            Lambda function or layer to generate the configuration for
-        file_env_vars : Dict
-            The dictionary of environment variables loaded from the file
-        inline_env_vars : Optional[Dict]
-            The optional dictionary of environment variables defined inline
-
-
+        handler: str
+            The handler value of the function
+        source_code_path: str
+            The directory path to the source code of the function
         Returns
         -------
-        dictionary
-            Environment variable configuration for this function
-
-        Raises
-        ------
-        samcli.commands.local.lib.exceptions.OverridesNotWellDefinedError
-            If the environment dict is in the wrong format to process environment vars
+        str
 
         """
+        MODULE_PART_COUNT = 2  # file name and function name
+        if not handler or not source_code_path:
+            LOG.warning(
+                "Both function Handler and CodeUri must be provided when using PackageRootMode 'auto'."
+                + "Continuing without parent packages."
+            )
+            return None
+        if handler.count(".") < MODULE_PART_COUNT:
+            # Handler does not have any parent packages
+            LOG.warning("Handler '%s' does not have any parent python packages", handler)
+            return None
 
-        name = resource.name
-        result = {}
+        handler_parts = handler.split(".")[0:-MODULE_PART_COUNT]
+        code_path_parts = list(pathlib.Path(source_code_path).parts)
 
-        # validate and raise OverridesNotWellDefinedError
-        for env_var in list((file_env_vars or {}).values()) + list((inline_env_vars or {}).values()):
-            if not isinstance(env_var, dict):
-                reason = "Environment variables {} in incorrect format".format(env_var)
-                LOG.debug(reason)
-                raise OverridesNotWellDefinedError(reason)
+        # Remove parts from the start of the path until we find the first part of the handler
+        while len(code_path_parts) > 0 and code_path_parts[0] != handler_parts[0]:
+            code_path_parts.pop(0)
 
-        if file_env_vars:
-            parameter_result = file_env_vars.get("Parameters", {})
-            result.update(parameter_result)
-
-        if inline_env_vars:
-            inline_parameter_result = inline_env_vars.get("Parameters", {})
-            result.update(inline_parameter_result)
-
-        if file_env_vars:
-            specific_result = file_env_vars.get(name, {})
-            result.update(specific_result)
-
-        if inline_env_vars:
-            inline_specific_result = inline_env_vars.get(name, {})
-            result.update(inline_specific_result)
-
-        return result
+        if len(code_path_parts) > 0:
+            parent_packages = ".".join(code_path_parts[0 : len(handler_parts)])
+            LOG.debug("Inferred parent python packages '%s'", parent_packages)
+            return parent_packages
+        LOG.warning(
+            "Could not infer parent python packages from Handler '%s' and CodeUri '%s'."
+            + "Continuing without parent packages.",
+            handler,
+            source_code_path,
+        )
+        return None

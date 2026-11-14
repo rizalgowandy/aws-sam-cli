@@ -3,74 +3,82 @@ CLI command for "local start-lambda" command
 """
 
 import logging
+
 import click
 
-from samcli.cli.main import pass_context, common_options as cli_framework_options, aws_creds_options, print_cmdline_args
+from samcli.cli.cli_config_file import ConfigProvider, configuration_option, save_params_option
+from samcli.cli.main import aws_creds_options, pass_context, print_cmdline_args
+from samcli.cli.main import common_options as cli_framework_options
+from samcli.commands._utils.option_value_processor import process_image_options
+from samcli.commands._utils.options import (
+    generate_next_command_recommendation,
+    hook_name_click_option,
+    language_extensions_option,
+    skip_prepare_infra_option,
+    terraform_plan_file_option,
+)
 from samcli.commands.local.cli_common.options import (
     invoke_common_options,
+    local_common_options,
     service_common_options,
     warm_containers_common_options,
-    local_common_options,
 )
 from samcli.commands.local.lib.exceptions import InvalidIntermediateImageError
+from samcli.commands.local.start_lambda.core.command import InvokeLambdaCommand
 from samcli.lib.telemetry.metric import track_command
-from samcli.cli.cli_config_file import configuration_option, TomlProvider
 from samcli.lib.utils.version_checker import check_newer_version
-from samcli.local.docker.exceptions import ContainerNotStartableException
-from samcli.commands._utils.option_value_processor import process_image_options
+from samcli.local.docker.exceptions import ContainerNotStartableException, PortAlreadyInUse, ProcessSigTermException
 
 LOG = logging.getLogger(__name__)
 
+
 HELP_TEXT = """
-You can use this command to programmatically invoke your Lambda function locally using the AWS CLI or SDKs.
-This command starts a local endpoint that emulates the AWS Lambda service, and you can run your automated
-tests against this local Lambda endpoint. When you send an invoke to this endpoint using the AWS CLI or
-SDK, it will locally execute the Lambda function specified in the request.\n
-\b
-SETUP
-------
-Start the local Lambda endpoint by running this command in the directory that contains your AWS SAM template.
-$ sam local start-lambda\n
-\b
-USING AWS CLI
--------------
-Then, you can invoke your Lambda function locally using the AWS CLI
-$ aws lambda invoke --function-name "HelloWorldFunction" --endpoint-url "http://127.0.0.1:3001" --no-verify-ssl out.txt
-\n
-\b
-USING AWS SDK
--------------
-You can also use the AWS SDK in your automated tests to invoke your functions programatically.
-Here is a Python example:
-    self.lambda_client = boto3.client('lambda',
-                                  endpoint_url="http://127.0.0.1:3001",
-                                  use_ssl=False,
-                                  verify=False,
-                                  config=Config(signature_version=UNSIGNED,
-                                                read_timeout=0,
-                                                retries={'max_attempts': 0}))
-    self.lambda_client.invoke(FunctionName="HelloWorldFunction")
+Emulate AWS serverless functions locally.
+"""
+
+DESCRIPTION = """
+  Programmatically invoke your Lambda function locally using the AWS CLI or SDKs.
+  Start a local endpoint that emulates the AWS Lambda service, and one can run their automated
+  tests against this local Lambda endpoint. Invokes to this endpoint can be sent using the AWS CLI or
+  SDK and they will in turn locally execute the Lambda function specified in the request.
+
+  For testing multi-tenant functions, pass tenant-id via the TenantId parameter in Lambda API calls. By default, each 
+  invocation uses a new container providing tenant isolation. When using --warm-containers, containers are reused 
+  and do not provide tenant isolation like production Lambda.
 """
 
 
 @click.command(
     "start-lambda",
+    cls=InvokeLambdaCommand,
     help=HELP_TEXT,
-    short_help="Starts a local endpoint you can use to invoke your local Lambda functions.",
+    short_help=HELP_TEXT,
+    description=DESCRIPTION,
+    requires_credentials=False,
+    context_settings={"max_content_width": 120},
 )
-@configuration_option(provider=TomlProvider(section="parameters"))
+@click.argument("function_logical_ids", nargs=-1, required=False)
+@configuration_option(provider=ConfigProvider(section="parameters"))
+@terraform_plan_file_option
+@hook_name_click_option(
+    force_prepare=False, invalid_coexist_options=["t", "template-file", "template", "parameter-overrides"]
+)
+@skip_prepare_infra_option
 @service_common_options(3001)
+@language_extensions_option
 @invoke_common_options
 @warm_containers_common_options
 @local_common_options
 @cli_framework_options
 @aws_creds_options
+@save_params_option
 @pass_context
 @track_command
 @check_newer_version
 @print_cmdline_args
 def cli(
     ctx,  # pylint: disable=R0914
+    function_logical_ids,
     # start-lambda Specific Options
     host,
     port,
@@ -88,6 +96,7 @@ def cli(
     skip_pull_image,
     force_image_build,
     parameter_overrides,
+    save_params,
     config_file,
     config_env,
     warm_containers,
@@ -95,7 +104,15 @@ def cli(
     debug_function,
     container_host,
     container_host_interface,
+    add_host,
     invoke_image,
+    hook_name,
+    skip_prepare_infra,
+    terraform_plan_file,
+    no_watch,
+    language_extensions,
+    no_memory_limit,
+    container_dns,
 ):
     """
     `sam local start-lambda` command entry point
@@ -104,6 +121,7 @@ def cli(
 
     do_cli(
         ctx,
+        function_logical_ids,
         host,
         port,
         template_file,
@@ -124,12 +142,19 @@ def cli(
         debug_function,
         container_host,
         container_host_interface,
+        add_host,
         invoke_image,
+        hook_name,
+        language_extensions,
+        no_memory_limit,
+        no_watch,
+        container_dns,
     )  # pragma: no cover
 
 
 def do_cli(  # pylint: disable=R0914
     ctx,
+    function_logical_ids,
     host,
     port,
     template,
@@ -150,7 +175,13 @@ def do_cli(  # pylint: disable=R0914
     debug_function,
     container_host,
     container_host_interface,
+    add_host,
     invoke_image,
+    hook_name,
+    language_extensions,
+    no_mem_limit,
+    no_watch,
+    container_dns,
 ):
     """
     Implementation of the ``cli`` method, just separated out for unit testing purposes
@@ -158,10 +189,10 @@ def do_cli(  # pylint: disable=R0914
 
     from samcli.commands.local.cli_common.invoke_context import InvokeContext
     from samcli.commands.local.cli_common.user_exceptions import UserException
-    from samcli.lib.providers.exceptions import InvalidLayerReference
+    from samcli.commands.local.lib.exceptions import OverridesNotWellDefinedError
     from samcli.commands.local.lib.local_lambda_service import LocalLambdaService
     from samcli.commands.validate.lib.exceptions import InvalidSamDocumentException
-    from samcli.commands.local.lib.exceptions import OverridesNotWellDefinedError
+    from samcli.lib.providers.exceptions import InvalidLayerReference
     from samcli.local.docker.lambda_debug_settings import DebuggingNotSupported
 
     LOG.debug("local start_lambda command is called")
@@ -194,11 +225,24 @@ def do_cli(  # pylint: disable=R0914
             shutdown=shutdown,
             container_host=container_host,
             container_host_interface=container_host_interface,
+            add_host=add_host,
             invoke_images=processed_invoke_images,
+            function_logical_ids=function_logical_ids,
+            language_extensions=language_extensions,
+            no_mem_limit=no_mem_limit,
+            no_watch=no_watch,
+            container_dns=container_dns,
         ) as invoke_context:
-
             service = LocalLambdaService(lambda_invoke_context=invoke_context, port=port, host=host)
             service.start()
+            command_suggestions = generate_next_command_recommendation(
+                [
+                    ("Validate SAM template", "sam validate"),
+                    ("Test Function in the Cloud", "sam sync --stack-name {{stack-name}} --watch"),
+                    ("Deploy", "sam deploy --guided"),
+                ]
+            )
+            click.secho(command_suggestions, fg="yellow")
 
     except (
         InvalidSamDocumentException,
@@ -206,7 +250,10 @@ def do_cli(  # pylint: disable=R0914
         InvalidLayerReference,
         InvalidIntermediateImageError,
         DebuggingNotSupported,
+        PortAlreadyInUse,
     ) as ex:
         raise UserException(str(ex), wrapped_from=ex.__class__.__name__) from ex
     except ContainerNotStartableException as ex:
         raise UserException(str(ex), wrapped_from=ex.__class__.__name__) from ex
+    except ProcessSigTermException:
+        LOG.debug("Successfully exited SIGTERM terminated process")

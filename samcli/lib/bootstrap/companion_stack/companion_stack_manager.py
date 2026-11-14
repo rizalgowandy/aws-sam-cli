@@ -1,28 +1,26 @@
 """
-    Companion stack manager
+Companion stack manager
 """
+
 import logging
-from typing import List, Dict, Optional
-import typing
+from typing import Dict, List, Optional
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError, NoRegionError, NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError, NoRegionError
+from mypy_boto3_cloudformation.client import CloudFormationClient
+from mypy_boto3_cloudformation.type_defs import WaiterConfigTypeDef
+from mypy_boto3_s3.client import S3Client
 
-from samcli.commands.exceptions import CredentialsError, RegionError
+from samcli.commands.exceptions import AWSServiceClientError, RegionError
 from samcli.lib.bootstrap.companion_stack.companion_stack_builder import CompanionStackBuilder
 from samcli.lib.bootstrap.companion_stack.data_types import CompanionStack, ECRRepo
 from samcli.lib.package.artifact_exporter import mktempfile
 from samcli.lib.package.s3_uploader import S3Uploader
-from samcli.lib.utils.packagetype import IMAGE
 from samcli.lib.providers.sam_function_provider import SamFunctionProvider
 from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
-
-# pylint: disable=E0401
-if typing.TYPE_CHECKING:  # pragma: no cover
-    from mypy_boto3_cloudformation.client import CloudFormationClient
-    from mypy_boto3_cloudformation.type_defs import WaiterConfigTypeDef
-    from mypy_boto3_s3.client import S3Client
+from samcli.lib.utils.packagetype import IMAGE
+from samcli.lib.utils.s3 import parse_s3_url
 
 LOG = logging.getLogger(__name__)
 
@@ -36,12 +34,12 @@ class CompanionStackManager:
     _companion_stack: CompanionStack
     _builder: CompanionStackBuilder
     _boto_config: Config
-    _update_stack_waiter_config: "WaiterConfigTypeDef"
-    _delete_stack_waiter_config: "WaiterConfigTypeDef"
+    _update_stack_waiter_config: WaiterConfigTypeDef
+    _delete_stack_waiter_config: WaiterConfigTypeDef
     _s3_bucket: str
     _s3_prefix: str
-    _cfn_client: "CloudFormationClient"
-    _s3_client: "S3Client"
+    _cfn_client: CloudFormationClient
+    _s3_client: S3Client
 
     def __init__(self, stack_name, region, s3_bucket, s3_prefix):
         self._companion_stack = CompanionStack(stack_name)
@@ -58,7 +56,7 @@ class CompanionStackManager:
             self._account_id = boto3.client("sts").get_caller_identity().get("Account")
             self._region_name = self._cfn_client.meta.region_name
         except NoCredentialsError as ex:
-            raise CredentialsError(
+            raise AWSServiceClientError(
                 "Error Setting Up Managed Stack Client: Unable to resolve "
                 "credentials for the AWS SDK for Python client. "
                 "Please see their documentation for options to pass in credentials: "
@@ -67,7 +65,7 @@ class CompanionStackManager:
         except NoRegionError as ex:
             raise RegionError(
                 "Error Setting Up Managed Stack Client: Unable to resolve a region. "
-                "Please provide a region via the --region parameter or by the AWS_REGION environment variable."
+                "Please provide a region via the --region parameter or by the AWS_DEFAULT_REGION environment variable."
             ) from ex
 
     def set_functions(
@@ -112,7 +110,7 @@ class CompanionStackManager:
                 self._s3_client, bucket_name=self._s3_bucket, prefix=self._s3_prefix, no_progressbar=True
             )
             # TemplateUrl property requires S3 URL to be in path-style format
-            parts = S3Uploader.parse_s3_url(
+            parts = parse_s3_url(
                 s3_uploader.upload_with_dedup(temporary_file.name, "template"), version_property="Version"
             )
 
@@ -309,7 +307,7 @@ def sync_ecr_stack(
     image_repositories = image_repositories.copy() if image_repositories else {}
     manager = CompanionStackManager(stack_name, region, s3_bucket, s3_prefix)
 
-    stacks = SamLocalStackProvider.get_stacks(template_file)[0]
+    stacks = SamLocalStackProvider.get_stacks(template_file, language_extensions_enabled=False)[0]
     function_provider = SamFunctionProvider(stacks, ignore_code_extraction_warnings=True)
     function_logical_ids = [
         function.full_path for function in function_provider.get_all() if function.packagetype == IMAGE

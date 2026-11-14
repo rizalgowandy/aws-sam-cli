@@ -2,72 +2,54 @@
 Common CLI options shared by various commands
 """
 
-import os
 import logging
+import os
 from functools import partial
-import types
+from typing import Dict, List, Tuple
 
 import click
 from click.types import FuncParamType
 
-from samcli.commands._utils.template import get_template_data, TemplateNotFoundException
 from samcli.cli.types import (
-    CfnParameterOverridesType,
     CfnMetadataType,
+    CfnParameterOverridesType,
     CfnTags,
-    SigningProfilesOptionType,
-    ImageRepositoryType,
     ImageRepositoriesType,
+    ImageRepositoryType,
+    RemoteInvokeBotoApiParameterType,
+    SigningProfilesOptionType,
+    SyncWatchExcludeType,
 )
+from samcli.commands._utils.click_mutex import ClickMutex
+from samcli.commands._utils.constants import (
+    DEFAULT_BUILD_DIR,
+    DEFAULT_BUILT_TEMPLATE_PATH,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_STACK_NAME,
+    SAM_TEMPLATE_FILE_NAMES,
+)
+from samcli.commands._utils.custom_options.hook_name_option import HookNameOption
 from samcli.commands._utils.custom_options.option_nargs import OptionNargs
-from samcli.commands._utils.template import get_template_artifacts_format
+from samcli.commands._utils.custom_options.replace_help_option import ReplaceHelpSummaryOption
+from samcli.commands._utils.custom_options.structured_output_option import StructuredOutputOption
+from samcli.commands._utils.parameterized_option import parameterized_option
+from samcli.commands._utils.template import TemplateNotFoundException, get_template_artifacts_format, get_template_data
+from samcli.lib.hook.hook_wrapper import get_available_hook_packages_ids
 from samcli.lib.observability.util import OutputOption
-from samcli.lib.utils.packagetype import ZIP, IMAGE
+from samcli.lib.utils.packagetype import IMAGE, ZIP
+from samcli.local.docker.lambda_image import Runtime
 
 _TEMPLATE_OPTION_DEFAULT_VALUE = "template.[yaml|yml|json]"
-DEFAULT_STACK_NAME = "sam-app"
-DEFAULT_BUILD_DIR = os.path.join(".aws-sam", "build")
-DEFAULT_BUILD_DIR_WITH_AUTO_DEPENDENCY_LAYER = os.path.join(".aws-sam", "auto-dependency-layer")
-DEFAULT_CACHE_DIR = os.path.join(".aws-sam", "cache")
+SUPPORTED_BUILD_IN_SOURCE_WORKFLOWS = [
+    Runtime.nodejs16x.value,
+    Runtime.nodejs18x.value,
+    Runtime.nodejs20x.value,
+    Runtime.nodejs22x.value,
+    "Makefile",
+    "esbuild",
+]
 
 LOG = logging.getLogger(__name__)
-
-
-def parameterized_option(option):
-    """Meta decorator for option decorators.
-    This adds the ability to specify optional parameters for option decorators.
-
-    Usage:
-        @parameterized_option
-        def some_option(f, required=False)
-            ...
-
-        @some_option
-        def command(...)
-
-        or
-
-        @some_option(required=True)
-        def command(...)
-    """
-
-    def parameter_wrapper(*args, **kwargs):
-        if len(args) == 1 and isinstance(args[0], types.FunctionType):
-            # Case when option decorator does not have parameter
-            # @stack_name_option
-            # def command(...)
-            return option(args[0])
-
-        # Case when option decorator does have parameter
-        # @stack_name_option("a", "b")
-        # def command(...)
-
-        def option_wrapper(f):
-            return option(f, *args, **kwargs)
-
-        return option_wrapper
-
-    return parameter_wrapper
 
 
 def get_or_default_template_file_name(ctx, param, provided_value, include_build):
@@ -85,10 +67,10 @@ def get_or_default_template_file_name(ctx, param, provided_value, include_build)
 
     original_template_path = os.path.abspath(provided_value)
 
-    search_paths = ["template.yaml", "template.yml", "template.json"]
+    search_paths = list(SAM_TEMPLATE_FILE_NAMES)
 
     if include_build:
-        search_paths.insert(0, os.path.join(".aws-sam", "build", "template.yaml"))
+        search_paths.insert(0, DEFAULT_BUILT_TEMPLATE_PATH)
 
     if provided_value == _TEMPLATE_OPTION_DEFAULT_VALUE:
         # "--template" is an alias of "--template-file", however, only the first option name "--template-file" in
@@ -159,6 +141,36 @@ def image_repositories_callback(ctx, param, provided_value):
         image_repositories.update(value)
 
     return image_repositories if image_repositories else None
+
+
+def remote_invoke_boto_parameter_callback(ctx, param, provided_value):
+    """
+    Create an dictionary of boto parameters to their provided values.
+    :param ctx: Click Context
+    :param param: Param name
+    :param provided_value: Value provided by Click, after being processed by RemoteInvokeBotoApiParameterType.
+    :return: dictionary of boto api parameters to their provided values. E.g. LogType=Tail for Lambda invoke API
+    """
+    boto_api_parameters = {}
+    for value in provided_value:
+        boto_api_parameters.update(value)
+
+    return boto_api_parameters
+
+
+def local_add_host_callback(ctx, param, provided_value):
+    """
+    Create a dictionary of hostnames to IP addresses to add into Docker container's hosts file.
+    :param ctx: Click Context
+    :param param: Param name
+    :param provided_value: Value provided by Click, after being processed by DockerAdditionalHostType.
+    :return: dictionary of hostnames to IP addresses.
+    """
+    extra_hosts = {}
+    for value in provided_value:
+        extra_hosts.update(value)
+
+    return extra_hosts
 
 
 def artifact_callback(ctx, param, provided_value, artifact):
@@ -233,6 +245,59 @@ def resolve_s3_callback(ctx, param, provided_value, artifact, exc_set, exc_not_s
     return provided_value
 
 
+def skip_prepare_infra_callback(ctx, param, provided_value):
+    """
+    Callback for --skip-prepare-infra to check if --hook-name is also specified
+
+    Parameters
+    ----------
+    ctx: click.core.Context
+        Click context
+    param: click.Option
+        Parameter properties
+    provided_value: bool
+        True if option was provided
+    """
+    is_option_provided = provided_value or ctx.default_map.get("skip_prepare_infra")
+    is_hook_provided = ctx.params.get("hook_name") or ctx.default_map.get("hook_name")
+
+    if is_option_provided and not is_hook_provided:
+        raise click.BadOptionUsage(option_name=param.name, ctx=ctx, message="Missing option --hook-name")
+
+
+def watch_exclude_option_callback(
+    ctx: click.Context, param: click.Option, values: Tuple[Dict[str, List[str]]]
+) -> Dict[str, List[str]]:
+    """
+    Parses the multiple provided values into a mapping of resources to a list of exclusions.
+
+    Parameters
+    ----------
+    ctx: click.Context
+        The click context
+    param: click.Option
+        The parameter that was provided
+    values: Tuple[Dict[str, List[str]]]
+        A list of values that was passed in
+
+    Returns
+    -------
+    Dict[str, List[str]]
+        A mapping of LogicalIds to a list of files and/or folders to exclude
+        from file change watches
+    """
+    resource_exclude_mappings: Dict[str, List[str]] = {}
+
+    for mappings in values:
+        for resource_id, excluded_files in mappings.items():
+            current_excludes = resource_exclude_mappings.get(resource_id, [])
+            current_excludes.extend(excluded_files)
+
+            resource_exclude_mappings[resource_id] = current_excludes
+
+    return resource_exclude_mappings
+
+
 def template_common_option(f):
     """
     Common ClI option for template
@@ -263,13 +328,17 @@ def template_click_option(include_build=True):
         "-t",
         default=_TEMPLATE_OPTION_DEFAULT_VALUE,
         type=click.Path(),
+        cls=ReplaceHelpSummaryOption,
+        replace_help_option="-t,--template,--template-file",
         envvar="SAM_TEMPLATE_FILE",
         callback=partial(get_or_default_template_file_name, include_build=include_build),
         show_default=True,
         is_eager=True,
-        help="AWS SAM template which references built artifacts for resources in the template. (if applicable)"
-        if include_build
-        else "AWS SAM template file.",
+        help=(
+            "AWS SAM template which references built artifacts for resources in the template. (if applicable)"
+            if include_build
+            else "AWS SAM template file."
+        ),
     )
 
 
@@ -285,16 +354,17 @@ def docker_click_options():
         click.option(
             "--skip-pull-image",
             is_flag=True,
-            help="Specify whether CLI should skip pulling down the latest Docker image for Lambda runtime.",
+            help="Skip pulling down the latest Docker image for Lambda runtime.",
             envvar="SAM_SKIP_PULL_IMAGE",
             default=False,
         ),
         click.option(
             "--docker-network",
             envvar="SAM_DOCKER_NETWORK",
-            help="Specifies the name or id of an existing docker network to lambda docker "
-            "containers should connect to, along with the default bridge network. If not specified, "
-            "the Lambda containers will only connect to the default bridge docker network.",
+            help="Name or ID of an existing docker network for AWS Lambda docker containers"
+            " to connect to, along with the default bridge network. "
+            "If not specified, the Lambda containers will only connect to the default"
+            " bridge docker network.",
         ),
     ]
 
@@ -305,9 +375,7 @@ def parameter_override_click_option():
         cls=OptionNargs,
         type=CfnParameterOverridesType(),
         default={},
-        help="Optional. A string that contains AWS CloudFormation parameter overrides encoded as key=value pairs."
-        "For example, 'ParameterKey=KeyPairName,ParameterValue=MyKey ParameterKey=InstanceType,"
-        "ParameterValue=t1.micro' or KeyPairName=MyKey InstanceType=t1.micro",
+        help="String that contains AWS CloudFormation parameter overrides encoded as key=value pairs.",
     )
 
 
@@ -321,7 +389,7 @@ def no_progressbar_click_option():
         default=False,
         required=False,
         is_flag=True,
-        help="Does not showcase a progress bar when uploading artifacts to s3 ",
+        help="Does not showcase a progress bar when uploading artifacts to S3 and pushing docker images to ECR",
     )
 
 
@@ -335,7 +403,7 @@ def signing_profiles_click_option():
         cls=OptionNargs,
         type=SigningProfilesOptionType(),
         default={},
-        help="Optional. A string that contains Code Sign configuration parameters as "
+        help="A string that contains Code Sign configuration parameters as "
         "FunctionOrLayerNameToSign=SigningProfileName:SigningProfileOwner "
         "Since signing profile owner is optional, it could also be written as "
         "FunctionOrLayerNameToSign=SigningProfileName",
@@ -363,16 +431,8 @@ def common_observability_click_options():
             "formatted timestamp like '2018-01-01 10:10:10'",
         ),
         click.option(
-            "--tail",
-            "-t",
-            is_flag=True,
-            help="Tail events. This will ignore the end time argument and continue to fetch events as they "
-            "become available. [Beta Feature] If in beta --tail without a --name will pull from all possible resources",
-        ),
-        click.option(
             "--output",
             help="""
-            [Beta Feature]
             The formatting style of the command output. Following options are available:\n
             TEXT: Prints information as regular text with some formatting (default option)\n
             JSON: Prints each line as JSON without formatting
@@ -389,11 +449,33 @@ def common_observability_options(f):
     return f
 
 
+def structured_output_click_option():
+    """Shared --output option for commands that support structured (JSON) output.
+
+    Uses text|json choices matching the OutputOption enum in samcli.lib.observability.util.
+    Intended as the single shared contract for all commands adopting --output json.
+    """
+    return click.option(
+        "--output",
+        default=OutputOption.text.value,
+        help="Output the results from the command in a given output format. "
+        "Supported formats: text (default), json.",
+        # Derive choices from OutputOption so the accepted CLI values cannot drift from the enum.
+        type=click.Choice([option.value for option in OutputOption], case_sensitive=False),
+        # Lets --save-params recognise this option by type, so it is not persisted.
+        cls=StructuredOutputOption,
+    )
+
+
+def structured_output_option(f):
+    return structured_output_click_option()(f)
+
+
 def metadata_click_option():
     return click.option(
         "--metadata",
         type=CfnMetadataType(),
-        help="Optional. A map of metadata to attach to ALL the artifacts that are referenced in your template.",
+        help="Map of metadata to attach to ALL the artifacts that are referenced in the template.",
     )
 
 
@@ -408,16 +490,10 @@ def capabilities_click_option(default):
         required=False,
         default=default,
         type=FuncParamType(func=_space_separated_list_func_type),
-        help="A list of capabilities that you must specify "
-        "before AWS Cloudformation can create certain stacks. Some stack templates "
-        "might include resources that can affect permissions in your AWS "
-        "account, for example, by creating new AWS Identity and Access Management "
-        "(IAM) users. For those stacks, you must explicitly acknowledge "
-        "their capabilities by specifying this parameter. The only valid values"
-        "are CAPABILITY_IAM and CAPABILITY_NAMED_IAM. If you have IAM resources, "
-        "you can specify either capability. If you have IAM resources with custom "
-        "names, you must specify CAPABILITY_NAMED_IAM. If you don't specify "
-        "this parameter, this action returns an InsufficientCapabilities error.",
+        help="List of capabilities that one must specify "
+        "before AWS Cloudformation can create certain stacks."
+        "\n\nAccepted Values: CAPABILITY_IAM, CAPABILITY_NAMED_IAM, CAPABILITY_RESOURCE_POLICY, CAPABILITY_AUTO_EXPAND."
+        "\n\nLearn more at: https://docs.aws.amazon.com/serverlessrepo/latest/devguide/acknowledging-application-capabilities.html",  # noqa
     )
 
 
@@ -428,13 +504,7 @@ def capabilities_option(f, default=None):
 
 def tags_click_option():
     return click.option(
-        "--tags",
-        cls=OptionNargs,
-        type=CfnTags(),
-        required=False,
-        help="A list of tags to associate with the stack that is created or updated."
-        "AWS CloudFormation also propagates these tags to resources "
-        "in the stack if the resource supports it.",
+        "--tags", cls=OptionNargs, type=CfnTags(), required=False, help="List of tags to associate with the stack."
     )
 
 
@@ -448,9 +518,7 @@ def notification_arns_click_option():
         cls=OptionNargs,
         type=FuncParamType(func=_space_separated_list_func_type),
         required=False,
-        help="Amazon  Simple  Notification  Service  topic"
-        "Amazon  Resource  Names  (ARNs) that AWS CloudFormation associates with"
-        "the stack.",
+        help="ARNs of SNS topics that AWS Cloudformation associates with the stack.",
     )
 
 
@@ -460,12 +528,7 @@ def notification_arns_option(f):
 
 def stack_name_click_option(required, callback):
     return click.option(
-        "--stack-name",
-        required=required,
-        callback=callback,
-        help="The name of the AWS CloudFormation stack you're deploying to. "
-        "If you specify an existing stack, the command updates the stack. "
-        "If you specify a new stack, the command creates it.",
+        "--stack-name", required=required, callback=callback, help="Name of the AWS CloudFormation stack."
     )
 
 
@@ -474,19 +537,20 @@ def stack_name_option(f, required=False, callback=None):
     return stack_name_click_option(required, callback)(f)
 
 
-def s3_bucket_click_option(guided):
-    callback = None if guided else partial(artifact_callback, artifact=ZIP)
+def s3_bucket_click_option(disable_callback):
+    callback = None if disable_callback else partial(artifact_callback, artifact=ZIP)
+
     return click.option(
         "--s3-bucket",
         required=False,
+        help="AWS S3 bucket where artifacts referenced in the template are uploaded.",
         callback=callback,
-        help="The name of the S3 bucket where this command uploads the artifacts that are referenced in your template.",
     )
 
 
 @parameterized_option
-def s3_bucket_option(f, guided=False):
-    return s3_bucket_click_option(guided)(f)
+def s3_bucket_option(f, disable_callback=False):
+    return s3_bucket_click_option(disable_callback)(f)
 
 
 def build_dir_click_option():
@@ -495,8 +559,8 @@ def build_dir_click_option():
         "-b",
         default=DEFAULT_BUILD_DIR,
         type=click.Path(file_okay=False, dir_okay=True, writable=True),  # Must be a directory
-        help="Path to a folder where the built artifacts will be stored. "
-        "This directory will be first removed before starting a build.",
+        help="Directory to store build artifacts."
+        "Note: This directory will be first removed before starting a build.",
     )
 
 
@@ -510,8 +574,7 @@ def cache_dir_click_option():
         "-cd",
         default=DEFAULT_CACHE_DIR,
         type=click.Path(file_okay=False, dir_okay=True, writable=True),  # Must be a directory
-        help="The folder where the cache artifacts will be stored when --cached is specified. "
-        "The default cache directory is .aws-sam/cache",
+        help="Directory to store cached artifacts. The default cache directory is .aws-sam/cache",
     )
 
 
@@ -525,9 +588,9 @@ def base_dir_click_option():
         "-s",
         default=None,
         type=click.Path(dir_okay=True, file_okay=False),  # Must be a directory
-        help="Resolve relative paths to function's source code with respect to this folder. Use this if "
-        "SAM template and your source code are not in same enclosing folder. By default, relative paths "
-        "are resolved with respect to the SAM template's location",
+        help="Resolve relative paths to function's source code with respect to this directory. Use this if "
+        "SAM template and source code are not in same enclosing folder. By default, relative paths "
+        "are resolved with respect to the SAM template's location.",
     )
 
 
@@ -541,7 +604,7 @@ def manifest_click_option():
         "-m",
         default=None,
         type=click.Path(),
-        help="Path to a custom dependency manifest (e.g., package.json) to use instead of the default one",
+        help="Path to a custom dependency manifest. Example: custom-package.json",
     )
 
 
@@ -551,16 +614,19 @@ def manifest_option(f):
 
 def cached_click_option():
     return click.option(
-        "--cached",
+        "--cached/--no-cached",
         "-c",
+        default=False,
+        required=False,
         is_flag=True,
-        help="Enable cached builds. Use this flag to reuse build artifacts that have not changed from previous builds. "
-        "AWS SAM evaluates whether you have made any changes to files in your project directory. \n\n"
-        "Note: AWS SAM does not evaluate whether changes have been made to third party modules "
-        "that your project depends on, where you have not provided a specific version. "
-        "For example, if your Python function includes a requirements.txt file with the following entry "
+        help="Enable cached builds."
+        "Reuse build artifacts that have not changed from previous builds. "
+        "\n\nAWS SAM CLI evaluates if files in your project directory have changed. \n\n"
+        "Note: AWS SAM CLI does not evaluate changes made to third party modules "
+        "that the project depends on."
+        "Example: Python function includes a requirements.txt file with the following entry "
         "requests=1.x and the latest request module version changes from 1.1 to 1.2, "
-        "SAM will not pull the latest version until you run a non-cached build.",
+        "AWS SAM CLI will not pull the latest version until a non-cached build is run.",
     )
 
 
@@ -574,7 +640,7 @@ def image_repository_click_option():
         callback=partial(artifact_callback, artifact=IMAGE),
         type=ImageRepositoryType(),
         required=False,
-        help="ECR repo uri where this command uploads the image artifacts that are referenced in your template.",
+        help="AWS ECR repository URI where artifacts referenced in the template are uploaded.",
     )
 
 
@@ -589,8 +655,9 @@ def image_repositories_click_option():
         callback=image_repositories_callback,
         type=ImageRepositoriesType(),
         required=False,
-        help="Specify mapping of Function Logical ID to ECR Repo uri, of the form Function_Logical_ID=ECR_Repo_Uri."
-        "This option can be specified multiple times.",
+        help="Mapping of Function Logical ID to AWS ECR Repository URI."
+        "\n\nExample: Function_Logical_ID=ECR_Repo_Uri"
+        "\nThis option can be specified multiple times.",
     )
 
 
@@ -598,13 +665,41 @@ def image_repositories_option(f):
     return image_repositories_click_option()(f)
 
 
+def remote_invoke_parameter_click_option():
+    return click.option(
+        "--parameter",
+        multiple=True,
+        type=RemoteInvokeBotoApiParameterType(),
+        callback=remote_invoke_boto_parameter_callback,
+        required=False,
+        help="Additional parameters that can be passed"
+        " to invoke the resource.\n\n"
+        "Lambda Function (Buffered stream): The following additional parameters can be used to invoke a lambda resource"
+        " and get a buffered response: InvocationType='Event'|'RequestResponse'|'DryRun', LogType='None'|'Tail', "
+        "ClientContext='base64-encoded string' Qualifier='string'.\n\n"
+        "Lambda Function (Response stream): The following additional parameters can be used to invoke a lambda resource"
+        " with response streaming: InvocationType='RequestResponse'|'DryRun', LogType='None'|'Tail', "
+        "ClientContext='base64-encoded string', Qualifier='string'.\n\n"
+        "Step Functions: The following additional parameters can be used to start a state machine execution: "
+        "name='string', traceHeader='string'\n\n"
+        "SQS Queue: The following additional parameters can be used to send a message to an SQS queue: "
+        "DelaySeconds=integer, MessageAttributes='json string', MessageSystemAttributes='json string',"
+        " MessageDeduplicationId='string', MessageGroupId='string'\n\n"
+        "Kinesis Data Stream: The following additional parameters can be used to put a record"
+        " in the kinesis data stream: PartitionKey='string', ExplicitHashKey='string',"
+        " SequenceNumberForOrdering='string', StreamARN='string' ",
+    )
+
+
+def remote_invoke_parameter_option(f):
+    return remote_invoke_parameter_click_option()(f)
+
+
 def s3_prefix_click_option():
     return click.option(
         "--s3-prefix",
         required=False,
-        help="A prefix name that the command adds to the artifacts "
-        "name when it uploads them to the S3 bucket. The prefix name is a "
-        "path name (folder name) for the S3 bucket.",
+        help="Prefix name that is added to the artifact's name when it is uploaded to the AWS S3 bucket.",
     )
 
 
@@ -616,7 +711,7 @@ def kms_key_id_click_option():
     return click.option(
         "--kms-key-id",
         required=False,
-        help="The ID of an AWS KMS key that the command uses to encrypt artifacts that are at rest in the S3 bucket.",
+        help="The ID of an AWS KMS key that is used to encrypt artifacts that are at rest in the AWS S3 bucket.",
     )
 
 
@@ -654,7 +749,7 @@ def force_upload_option(f):
 
 
 def resolve_s3_click_option(guided):
-    from samcli.commands.package.exceptions import PackageResolveS3AndS3SetError, PackageResolveS3AndS3NotSetError
+    from samcli.commands.package.exceptions import PackageResolveS3AndS3NotSetError, PackageResolveS3AndS3SetError
 
     callback = (
         None
@@ -667,15 +762,81 @@ def resolve_s3_click_option(guided):
         )
     )
     return click.option(
-        "--resolve-s3",
+        "--resolve-s3/--no-resolve-s3",
         required=False,
+        default=False,
         is_flag=True,
         callback=callback,
-        help="Automatically resolve s3 bucket for non-guided deployments. "
-        "Enabling this option will also create a managed default s3 bucket for you. "
-        "If you do not provide a --s3-bucket value, the managed bucket will be used. "
-        "Do not use --s3-guided parameter with this option.",
+        help="Automatically resolve AWS S3 bucket for non-guided deployments. "
+        "Enabling this option will also create a managed default AWS S3 bucket for you. "
+        "If one does not provide a --s3-bucket value, the managed bucket will be used. "
+        "Do not use --guided with this option.",
     )
+
+
+def hook_name_click_option(force_prepare=True, invalid_coexist_options=None):
+    """
+    Click Option for hook-name option
+    """
+
+    def hook_name_setup(f):
+        return click.option(
+            "--hook-name",
+            default=None,
+            type=click.STRING,
+            required=False,
+            help=f"Hook package id to extend AWS SAM CLI commands functionality. "
+            f"\n\n Example: `terraform` to extend AWS SAM CLI commands "
+            f"functionality to support terraform applications. "
+            f"\n\n Available Hook Names: {get_available_hook_packages_ids()}",
+        )(f)
+
+    def hook_name_processer_wrapper(f):
+        configuration_setup_params = ()
+        configuration_setup_attrs = {}
+        configuration_setup_attrs["help"] = (
+            "This is a hidden click option whose callback function to run the provided hook package."
+        )
+        configuration_setup_attrs["is_eager"] = True
+        configuration_setup_attrs["expose_value"] = False
+        configuration_setup_attrs["hidden"] = True
+        configuration_setup_attrs["type"] = click.STRING
+        configuration_setup_attrs["cls"] = HookNameOption
+        configuration_setup_attrs["force_prepare"] = force_prepare
+        configuration_setup_attrs["invalid_coexist_options"] = (
+            invalid_coexist_options if invalid_coexist_options else []
+        )
+        return click.option(*configuration_setup_params, **configuration_setup_attrs)(f)
+
+    def composed_decorator(decorators):
+        def decorator(f):
+            for deco in decorators:
+                f = deco(f)
+            return f
+
+        return decorator
+
+    # Compose decorators here to make sure the context parameters are updated before callback function
+    decorator_list = [hook_name_setup, hook_name_processer_wrapper]
+    return composed_decorator(decorator_list)
+
+
+def skip_prepare_infra_click_option():
+    """
+    Click option to skip the hook preparation stage
+    """
+    return click.option(
+        "--skip-prepare-infra/--prepare-infra",
+        is_flag=True,
+        required=False,
+        callback=skip_prepare_infra_callback,
+        help="Skip preparation stage when there are no infrastructure changes. "
+        "Only used in conjunction with --hook-name.",
+    )
+
+
+def skip_prepare_infra_option(f):
+    return skip_prepare_infra_click_option()(f)
 
 
 @parameterized_option
@@ -687,9 +848,7 @@ def role_arn_click_option():
     return click.option(
         "--role-arn",
         required=False,
-        help="The Amazon Resource Name (ARN) of an  AWS  Identity "
-        "and  Access  Management (IAM) role that AWS CloudFormation assumes when "
-        "executing the change set.",
+        help="ARN of an IAM role that AWS Cloudformation assumes when executing a deployment change set.",
     )
 
 
@@ -712,6 +871,155 @@ def resolve_image_repos_option(f):
     return resolve_image_repos_click_option()(f)
 
 
+def use_container_build_click_option():
+    return click.option(
+        "--use-container/--no-use-container",
+        "-u",
+        required=False,
+        default=False,
+        is_flag=True,
+        help="Build functions within an AWS Lambda-like container.",
+    )
+
+
+def use_container_build_option(f):
+    return use_container_build_click_option()(f)
+
+
+def use_buildkit_click_option():
+    return click.option(
+        "--use-buildkit/--no-use-buildkit",
+        required=False,
+        default=False,
+        is_flag=True,
+        help="Enable buildkit for container image builds. Requires Docker with buildx plugin or Finch CLI.",
+    )
+
+
+def use_buildkit_option(f):
+    return use_buildkit_click_option()(f)
+
+
+def mount_symlinks_click_option():
+    return click.option(
+        "--mount-symlinks/--no-mount-symlinks",
+        default=False,
+        is_flag=True,
+        help="Specify if symlinks at the top level of the code should be mounted inside the container. "
+        "Activating this flag could allow access to locations outside of your workspace by using a symbolic link. "
+        "By default symlinks are not mounted.",
+    )
+
+
+def mount_symlinks_option(f):
+    return mount_symlinks_click_option()(f)
+
+
+def no_memory_limit_click_option():
+    return click.option(
+        "--no-memory-limit",
+        default=False,
+        is_flag=True,
+        help="Remove the Memory limit during emulation. This runs the container without the --memory parameter",
+    )
+
+
+def no_memory_limit_option(f):
+    return no_memory_limit_click_option()(f)
+
+
+def terraform_plan_file_callback(ctx, param, provided_value):
+    """
+    Callback for --terraform-plan-file to check if --hook-name is also specified
+
+    Parameters
+    ----------
+    ctx: click.core.Context
+        Click context
+    param: click.Option
+        Parameter properties
+    provided_value: bool
+        True if option was provided
+    """
+    is_option_provided = provided_value or ctx.default_map.get("terraform_plan_file")
+    is_hook_provided = ctx.params.get("hook_name") or ctx.default_map.get("hook_name")
+
+    if is_option_provided and not is_hook_provided:
+        raise click.BadOptionUsage(option_name=param.name, ctx=ctx, message="Missing option --hook-name")
+
+
+def terraform_plan_file_click_option():
+    return click.option(
+        "--terraform-plan-file",
+        type=click.Path(),
+        required=False,
+        callback=terraform_plan_file_callback,
+        help="Used for passing a custom plan file when executing the Terraform hook.",
+    )
+
+
+def terraform_plan_file_option(f):
+    return terraform_plan_file_click_option()(f)
+
+
+def terraform_project_root_path_callback(ctx, param, provided_value):
+    """
+    Callback for --terraform-project-root-path to check if --hook-name is also specified
+
+    Parameters
+    ----------
+    ctx: click.core.Context
+        Click context
+    param: click.Option
+        Parameter properties
+    provided_value: bool
+        True if option was provided
+    """
+    is_option_provided = provided_value or ctx.default_map.get("terraform_project_root_path")
+    is_hook_provided = ctx.params.get("hook_name") or ctx.default_map.get("hook_name")
+
+    if is_option_provided and not is_hook_provided:
+        raise click.BadOptionUsage(option_name=param.name, ctx=ctx, message="Missing option --hook-name")
+
+
+def terraform_project_root_path_click_option():
+    return click.option(
+        "--terraform-project-root-path",
+        type=click.Path(),
+        required=False,
+        callback=terraform_project_root_path_callback,
+        help="Used for passing the Terraform project root directory path. Current directory will be used as a default "
+        "value, if this parameter is not provided.",
+    )
+
+
+def terraform_project_root_path_option(f):
+    return terraform_project_root_path_click_option()(f)
+
+
+def build_image_click_option(cls):
+    return click.option(
+        "--build-image",
+        "-bi",
+        default=None,
+        multiple=True,  # Can pass in multiple build images
+        required=False,
+        help="Container image URIs for building functions/layers. "
+        "You can specify for all functions/layers with just the image URI "
+        "(--build-image public.ecr.aws/sam/build-nodejs18.x:latest). "
+        "You can specify for each individual function with "
+        "(--build-image FunctionLogicalID=public.ecr.aws/sam/build-nodejs18.x:latest). "
+        "A combination of the two can be used. If a function does not have build image specified or "
+        "an image URI for all functions, the default SAM CLI build images will be used.",
+        cls=cls,
+    )
+
+
+@parameterized_option
+def build_image_option(f, cls):
+    return build_image_click_option(cls)(f)
+
+
 def _space_separated_list_func_type(value):
     if isinstance(value, str):
         return value.split(" ")
@@ -720,4 +1028,103 @@ def _space_separated_list_func_type(value):
     raise ValueError()
 
 
-_space_separated_list_func_type.__name__ = "LIST"
+_space_separated_list_func_type.__name__ = "list,string"
+
+
+def generate_next_command_recommendation(command_tuples: List[Tuple[str, str]]) -> str:
+    """
+    Generates a message containing some suggested commands to run next.
+
+    :type command_tuples: list[tuple]
+    :param command_tuples: list of tuples containing the command with their respective description
+    """
+    template = """
+Commands you can use next
+=========================
+{}
+"""
+    command_list_txt = "\n".join(f"[*] {description}: {command}" for description, command in command_tuples)
+    return template.format(command_list_txt)
+
+
+def build_in_source_click_option():
+    return click.option(
+        "--build-in-source/--no-build-in-source",
+        required=False,
+        is_flag=True,
+        help="Opts in to build project in the source folder. The following workflows support "
+        f"building in source: {SUPPORTED_BUILD_IN_SOURCE_WORKFLOWS}\n"
+        "\n"
+        "For `sam build` on an npm workspaces monorepo, npm installs once at the workspace root "
+        "instead of once per function, and each function's artifacts are narrowed to the "
+        "dependencies it resolves. The install runs in the workspace root npm itself reports, "
+        "which is inside your project but above the function's CodeUri.\n"
+        "\n"
+        "This grouping is in beta: enable it with --beta-features or "
+        "SAM_CLI_BETA_NODEJS_MONOREPO=1. Without it, every function installs for itself, as in "
+        "earlier releases. It is also skipped for --use-container and --cached builds, so "
+        "`sam sync` does not use it.",
+        cls=ClickMutex,
+        incompatible_params=["use_container", "hook_name"],
+    )
+
+
+def build_in_source_option(f):
+    return build_in_source_click_option()(f)
+
+
+def watch_exclude_option(f):
+    return watch_exclude_click_option()(f)
+
+
+def watch_exclude_click_option():
+    return click.option(
+        "--watch-exclude",
+        help="Excludes a file or folder from being observed for file changes. "
+        "Files and folders that are excluded will not trigger a sync workflow. "
+        "This option can be provided multiple times.\n\n"
+        "Examples:\n\nHelloWorldFunction=package-lock.json\n\n"
+        "ChildStackA/FunctionName=database.sqlite3",
+        multiple=True,
+        type=SyncWatchExcludeType(),
+        callback=watch_exclude_option_callback,
+    )
+
+
+def container_env_var_file_click_option(cls):
+    """
+    Click option to --container-env-var-file option
+    """
+    return click.option(
+        "--container-env-var-file",
+        "-ef",
+        default=None,
+        type=click.Path(),  # Must be a json file
+        help="Environment variables json file (e.g., env_vars.json) to be passed to containers.",
+        cls=cls,
+    )
+
+
+@parameterized_option
+def container_env_var_file_option(f, cls):
+    return container_env_var_file_click_option(cls)(f)
+
+
+def language_extensions_click_option():
+    return click.option(
+        "--language-extensions/--no-language-extensions",
+        "language_extensions",
+        required=False,
+        default=None,
+        is_flag=True,
+        help=(
+            "Expand AWS::LanguageExtensions transforms (Fn::ForEach, Fn::Length, "
+            "Fn::ToJsonString, Fn::FindInMap with DefaultValue) locally before "
+            "running SAM transforms. Off by default. "
+            "Equivalent env var: SAM_CLI_ENABLE_LANGUAGE_EXTENSIONS=1."
+        ),
+    )
+
+
+def language_extensions_option(f):
+    return language_extensions_click_option()(f)

@@ -5,10 +5,9 @@
   "keywords": [],
   "author": "",
   "license": "APACHE2.0",
+  "main": "main.js",
   "dependencies": {
-    "minimal-request-promise": "*"
-  },
-  "devDependencies": {
+    "minimal-request-promise": "*",
     "esbuild": "^0.14.14"
   }
 }

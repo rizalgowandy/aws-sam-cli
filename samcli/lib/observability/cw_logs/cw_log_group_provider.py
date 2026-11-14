@@ -1,17 +1,17 @@
 """
 Discover & provide the log group name
 """
+
 import logging
 from typing import Optional
 
-from samcli.commands._utils.experimental import force_experimental, ExperimentalFlag
+from samcli.lib.utils.boto_utils import BotoProviderType
 from samcli.lib.utils.resources import (
-    AWS_LAMBDA_FUNCTION,
     AWS_APIGATEWAY_RESTAPI,
     AWS_APIGATEWAY_V2_API,
+    AWS_LAMBDA_FUNCTION,
     AWS_STEPFUNCTIONS_STATEMACHINE,
 )
-from samcli.lib.utils.boto_utils import BotoProviderType
 
 LOG = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class LogGroupProvider:
     def for_resource(boto_client_provider: BotoProviderType, resource_type: str, name: str) -> Optional[str]:
         log_group = None
         if resource_type == AWS_LAMBDA_FUNCTION:
-            log_group = LogGroupProvider.for_lambda_function(name)
+            log_group = LogGroupProvider.for_lambda_function(boto_client_provider, name)
         elif resource_type == AWS_APIGATEWAY_RESTAPI:
             log_group = LogGroupProvider.for_apigw_rest_api(name)
         elif resource_type == AWS_APIGATEWAY_V2_API:
@@ -36,12 +36,14 @@ class LogGroupProvider:
         return log_group
 
     @staticmethod
-    def for_lambda_function(function_name: str) -> str:
+    def for_lambda_function(boto_client_provider: BotoProviderType, function_name: str) -> str:
         """
         Returns the CloudWatch Log Group Name created by default for the AWS Lambda function with given name
 
         Parameters
         ----------
+        boto_client_provider: BotoProviderType
+            Boto client provider which contains region and other configurations
         function_name : str
             Name of the Lambda function
 
@@ -50,10 +52,20 @@ class LogGroupProvider:
         str
             Default Log Group name used by this function
         """
-        return "/aws/lambda/{}".format(function_name)
+        log_group_name = ""
+        try:
+            function_configuration = boto_client_provider("lambda").get_function_configuration(
+                FunctionName=function_name
+            )
+            logging_config = function_configuration.get("LoggingConfig")
+            if logging_config:
+                log_group_name = logging_config.get("LogGroup")
+        except Exception as ex:
+            LOG.debug("Could not retrive function configuration for function (%s):  (%s)", function_name, str(ex))
+
+        return log_group_name if bool(log_group_name) else f"/aws/lambda/{function_name}"
 
     @staticmethod
-    @force_experimental(config_entry=ExperimentalFlag.Accelerate)  # pylint: disable=E1120
     def for_apigw_rest_api(rest_api_id: str, stage: str = "Prod") -> str:
         """
         Returns the CloudWatch Log Group Name created by default for the AWS Api gateway rest api with given id
@@ -76,7 +88,6 @@ class LogGroupProvider:
         return "API-Gateway-Execution-Logs_{}/{}".format(rest_api_id, stage)
 
     @staticmethod
-    @force_experimental(config_entry=ExperimentalFlag.Accelerate)  # pylint: disable=E1120
     def for_apigwv2_http_api(
         boto_client_provider: BotoProviderType, http_api_id: str, stage: str = "$default"
     ) -> Optional[str]:
@@ -110,7 +121,6 @@ class LogGroupProvider:
         return log_group_name
 
     @staticmethod
-    @force_experimental(config_entry=ExperimentalFlag.Accelerate)  # pylint: disable=E1120
     def for_step_functions(
         boto_client_provider: BotoProviderType,
         step_function_name: str,
@@ -144,9 +154,10 @@ class LogGroupProvider:
             log_group_arn = logging_destination.get("cloudWatchLogsLogGroup", {}).get("logGroupArn")
             LOG.debug("Log group ARN: %s", log_group_arn)
             if log_group_arn:
-                if ":" in log_group_arn and len(log_group_arn.split(":")) > 6:
+                log_group_index_in_arn = 6
+                if ":" in log_group_arn and len(log_group_arn.split(":")) > log_group_index_in_arn:
                     log_group_arn_parts = log_group_arn.split(":")
-                    log_group_name = log_group_arn_parts[6]
+                    log_group_name = log_group_arn_parts[log_group_index_in_arn]
                     return str(log_group_name)
 
                 LOG.warning(
@@ -155,6 +166,6 @@ class LogGroupProvider:
                     step_function_name,
                     log_group_arn,
                 )
-        LOG.warning("Logging is not configured for StepFunctions (%s)")
+        LOG.warning("Logging is not configured for StepFunctions (%s)", step_function_name)
 
         return None

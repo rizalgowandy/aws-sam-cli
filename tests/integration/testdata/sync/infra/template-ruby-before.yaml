@@ -5,6 +5,11 @@ Globals:
   Function:
     Timeout: 10
 
+Parameters:
+  HelloWorldLayerName:
+    Type: String
+    Description: Name of the HelloWorldLayer which will be used with current deployment
+
 Resources:
   HelloWorldRubyFunction:
     Type: AWS::Serverless::Function
@@ -12,7 +17,7 @@ Resources:
       AutoPublishAlias: Hello1Alias
       CodeUri: before/Ruby/function/
       Handler: app.lambda_handler
-      Runtime: ruby2.7
+      Runtime: ruby3.4
       Architectures:
         - x86_64
       Layers:
@@ -21,10 +26,10 @@ Resources:
   HelloWorldRubyLayer:
     Type: AWS::Serverless::LayerVersion
     Properties:
-      LayerName: HelloWorldRubyLayer
+      LayerName: !Ref HelloWorldLayerName
       Description: Hello World Ruby Layer
       ContentUri: before/Ruby/layer/
       CompatibleRuntimes:
-        - ruby2.7
+        - ruby3.4
     Metadata:
-      BuildMethod: ruby2.7
+      BuildMethod: ruby3.4

@@ -4,10 +4,12 @@ from collections import OrderedDict
 from unittest import TestCase
 
 from unittest.mock import patch, Mock
+from parameterized import parameterized
 
 from samcli.lib.providers.api_provider import ApiProvider
 from samcli.lib.providers.cfn_api_provider import CfnApiProvider
-from samcli.local.apigw.local_apigw_service import Route
+from samcli.local.apigw.route import Route
+from samcli.local.apigw.authorizers.lambda_authorizer import LambdaAuthorizer
 from tests.unit.commands.local.lib.test_sam_api_provider import make_swagger
 from samcli.lib.providers.provider import Cors, Stack
 
@@ -169,6 +171,7 @@ class TestCloudFormationStageValues(TestCase):
                     "Type": "AWS::ApiGateway::RestApi",
                     "Properties": {
                         "Body": {
+                            "swagger": "2.0",
                             "paths": {
                                 "/path": {
                                     "get": {
@@ -183,7 +186,7 @@ class TestCloudFormationStageValues(TestCase):
                                         }
                                     }
                                 }
-                            }
+                            },
                         }
                     },
                 },
@@ -211,6 +214,7 @@ class TestCloudFormationStageValues(TestCase):
                     "Type": "AWS::ApiGateway::RestApi",
                     "Properties": {
                         "Body": {
+                            "swagger": "2.0",
                             "paths": {
                                 "/path": {
                                     "get": {
@@ -225,7 +229,7 @@ class TestCloudFormationStageValues(TestCase):
                                         }
                                     }
                                 }
-                            }
+                            },
                         }
                     },
                 },
@@ -244,6 +248,7 @@ class TestCloudFormationStageValues(TestCase):
                     "Type": "AWS::ApiGateway::RestApi",
                     "Properties": {
                         "Body": {
+                            "swagger": "2.0",
                             "paths": {
                                 "/path": {
                                     "get": {
@@ -271,7 +276,7 @@ class TestCloudFormationStageValues(TestCase):
                                         }
                                     }
                                 },
-                            }
+                            },
                         }
                     },
                 }
@@ -468,11 +473,11 @@ class TestCloudFormationResourceMethod(TestCase):
                 },
                 "AWSAlphaLambdaFunction": {
                     "Type": "AWS::Lambda::Function",
-                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.6"},
+                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.9"},
                 },
                 "AWSBetaLambdaFunction": {
                     "Type": "AWS::Lambda::Function",
-                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.6"},
+                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.9"},
                 },
             }
         }
@@ -542,11 +547,11 @@ class TestCloudFormationResourceMethod(TestCase):
                 },
                 "AWSAlphaLambdaFunction": {
                     "Type": "AWS::Lambda::Function",
-                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.6"},
+                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.9"},
                 },
                 "AWSBetaLambdaFunction": {
                     "Type": "AWS::Lambda::Function",
-                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.6"},
+                    "Properties": {"Code": ".", "Handler": "main.run_test", "Runtime": "Python3.9"},
                 },
             }
         }
@@ -560,7 +565,7 @@ class TestCloudFormationResourceMethod(TestCase):
             "Resources": {
                 "HelloHandler2E4FBA4D": {
                     "Type": "AWS::Lambda::Function",
-                    "Properties": {"Code": ".", "Handler": "main.handler", "Runtime": "python3.6"},
+                    "Properties": {"Code": ".", "Handler": "main.handler", "Runtime": "python3.9"},
                     "DependsOn": ["HelloHandlerServiceRole11EF7C63"],
                 },
                 "EndpointEEF1FD8F": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": "Endpoint"}},
@@ -964,6 +969,7 @@ class TestCloudFormationWithApiGatewayV2Stage(TestCase):
                     "Type": "AWS::ApiGatewayV2::Api",
                     "Properties": {
                         "Body": {
+                            "openapi": "3.0",
                             "paths": {
                                 "/path": {
                                     "get": {
@@ -978,7 +984,7 @@ class TestCloudFormationWithApiGatewayV2Stage(TestCase):
                                         }
                                     }
                                 }
-                            }
+                            },
                         }
                     },
                 },
@@ -1006,6 +1012,7 @@ class TestCloudFormationWithApiGatewayV2Stage(TestCase):
                     "Type": "AWS::ApiGatewayV2::Api",
                     "Properties": {
                         "Body": {
+                            "openapi": "3.0",
                             "paths": {
                                 "/path": {
                                     "get": {
@@ -1020,7 +1027,7 @@ class TestCloudFormationWithApiGatewayV2Stage(TestCase):
                                         }
                                     }
                                 }
-                            }
+                            },
                         }
                     },
                 },
@@ -1039,6 +1046,7 @@ class TestCloudFormationWithApiGatewayV2Stage(TestCase):
                     "Type": "AWS::ApiGatewayV2::Api",
                     "Properties": {
                         "Body": {
+                            "openapi": "3.0",
                             "paths": {
                                 "/path": {
                                     "get": {
@@ -1066,7 +1074,7 @@ class TestCloudFormationWithApiGatewayV2Stage(TestCase):
                                         }
                                     }
                                 },
-                            }
+                            },
                         }
                     },
                 }
@@ -1133,11 +1141,100 @@ class TestApiGatewayMethodCorsSettings(TestCase):
                             ]
                         },
                     },
-                }
+                },
             }
         }
         provider = ApiProvider(make_mock_stacks_from_template(template))
-        self.assertEqual(expected_cors, provider.api.cors)
+        # CORS should now be on the route, not globally on the API
+        self.assertEqual(len(provider.routes), 1)
+        route = provider.routes[0]
+        self.assertEqual(expected_cors, route.cors)
+
+    def test_multiple_options_methods_with_different_cors(self):
+        """Test that multiple OPTIONS methods with different CORS configurations are handled correctly per-route"""
+        template = {
+            "Resources": {
+                "PostResource": {
+                    "Type": "AWS::ApiGateway::Resource",
+                    "Properties": {
+                        "PathPart": "post",
+                    },
+                },
+                "PutResource": {
+                    "Type": "AWS::ApiGateway::Resource",
+                    "Properties": {
+                        "PathPart": "put",
+                    },
+                },
+                "ApiGatewayMethodPostOptions": {
+                    "Type": "AWS::ApiGateway::Method",
+                    "Properties": {
+                        "HttpMethod": "OPTIONS",
+                        "ResourceId": "PostResource",
+                        "Integration": {
+                            "IntegrationResponses": [
+                                {
+                                    "StatusCode": "200",
+                                    "ResponseParameters": {
+                                        "method.response.header.Access-Control-Allow-Origin": "'*'",
+                                        "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization'",
+                                        "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,POST'",
+                                    },
+                                }
+                            ],
+                        },
+                    },
+                },
+                "ApiGatewayMethodPutOptions": {
+                    "Type": "AWS::ApiGateway::Method",
+                    "Properties": {
+                        "HttpMethod": "OPTIONS",
+                        "ResourceId": "PutResource",
+                        "Integration": {
+                            "IntegrationResponses": [
+                                {
+                                    "StatusCode": "200",
+                                    "ResponseParameters": {
+                                        "method.response.header.Access-Control-Allow-Origin": "'*'",
+                                        "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization'",
+                                        "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,PUT'",
+                                    },
+                                }
+                            ],
+                        },
+                    },
+                },
+            }
+        }
+
+        provider = ApiProvider(make_mock_stacks_from_template(template))
+
+        # Find the routes
+        post_route = None
+        put_route = None
+        for route in provider.routes:
+            if route.path == "/post":
+                post_route = route
+            elif route.path == "/put":
+                put_route = route
+
+        # Verify both routes exist
+        self.assertIsNotNone(post_route, "Post route should exist")
+        self.assertIsNotNone(put_route, "Put route should exist")
+
+        # Verify each route has its own CORS configuration
+        self.assertIsNotNone(post_route.cors, "Post route should have CORS")
+        self.assertIsNotNone(put_route.cors, "Put route should have CORS")
+
+        # Verify the CORS methods are different
+        self.assertEqual(post_route.cors.allow_methods, "OPTIONS,POST", "Post route should allow OPTIONS,POST")
+        self.assertEqual(put_route.cors.allow_methods, "OPTIONS,PUT", "Put route should allow OPTIONS,PUT")
+
+        # Verify other CORS properties are the same
+        self.assertEqual(post_route.cors.allow_origin, "*")
+        self.assertEqual(put_route.cors.allow_origin, "*")
+        self.assertEqual(post_route.cors.allow_headers, "Content-Type,X-Amz-Date,Authorization")
+        self.assertEqual(put_route.cors.allow_headers, "Content-Type,X-Amz-Date,Authorization")
 
     def test_cors_not_set_for_other_integration_responses(self):
         template = {
@@ -1177,3 +1274,253 @@ class TestApiGatewayMethodCorsSettings(TestCase):
         }
         provider = ApiProvider(make_mock_stacks_from_template(template))
         self.assertIsNone(provider.api.cors)
+
+
+class TestExtractResourcesWithDisableAuthorizerFlag(TestCase):
+    @parameterized.expand(
+        [
+            ("when enabled doesn't extract authorizer", True),
+            ("when disabled extracts authorizer", False),
+        ]
+    )
+    @patch("samcli.lib.providers.cfn_api_provider.CfnApiProvider._get_route_function_name")
+    def test_extract_resources_apigw_v2_route(self, _, disable_authorizer, mock_get_route_function_name: Mock):
+        template = {
+            "Resources": {
+                "MyRoute": {
+                    "Type": "AWS::ApiGatewayV2::Route",
+                    "Properties": {
+                        "ApiId": "MockApiId",
+                        "AuthorizationType": "CUSTOM",
+                        "RouteKey": "Get /Test",
+                        "Target": "DummyTarget",
+                        "AuthorizerId": "AuthorizerId",
+                        "OperationName": "MockOperation",
+                    },
+                },
+            }
+        }
+        mock_get_route_function_name.return_value = ("Dummy", "Values")
+        provider = CfnApiProvider()
+        mock_collector = Mock()
+        mock_collector.add_routes = Mock()
+        provider._extract_cfn_gateway_v2_route(
+            stack_path="stack_path",
+            resources={},
+            logical_id="MyRoute",
+            route_resource=template["Resources"]["MyRoute"],
+            collector=mock_collector,
+            disable_authorizer=disable_authorizer,
+        )
+
+        if disable_authorizer:
+            route = mock_collector.add_routes.call_args[0][1][0]
+            self.assertIsNone(route.authorizer_name)
+
+        if not disable_authorizer:
+            mock_collector.add_routes.assert_called()
+            route = mock_collector.add_routes.call_args[0][1][0]
+            self.assertEqual(route.authorizer_name, "AuthorizerId")
+
+    @parameterized.expand(
+        [("when disable authorizer flag is enabled", True), ("when disable authorizer flag is disabled", False)]
+    )
+    @patch("samcli.lib.providers.cfn_api_provider.CfnApiProvider._extract_cfn_gateway_v2_authorizer")
+    @patch("samcli.lib.providers.cfn_api_provider.CfnApiProvider._extract_cloud_formation_authorizer")
+    def test_extract_resources_skips_authorizer_resource(
+        self,
+        _,
+        disable_authorizer,
+        mock_extract_cfn_gateway_v2_authorizer: Mock,
+        mock_extract_cloud_formation_authorizer: Mock,
+    ):
+        template = {
+            "Resources": {
+                "AuthorizerV2": {
+                    "Type": "AWS::ApiGatewayV2::Authorizer",
+                    "Properties": {"ApiId": "DummyId", "AuthorizerType": "REQUEST", "Name": "my-authorizer-v2"},
+                },
+                "Authorizer": {
+                    "Type": "AWS::ApiGateway::Authorizer",
+                    "Properties": {"Name": "my-authorizer", "RestApiId": "DummyId", "Type": "TOKEN"},
+                },
+            }
+        }
+        provider = CfnApiProvider()
+        mock_collector = Mock()
+        provider.extract_resources(
+            stacks=make_mock_stacks_from_template(template),
+            collector=mock_collector,
+            disable_authorizer=disable_authorizer,
+        )
+
+        if disable_authorizer:
+            mock_extract_cfn_gateway_v2_authorizer.assert_not_called()
+            mock_extract_cloud_formation_authorizer.assert_not_called()
+        if not disable_authorizer:
+            mock_extract_cfn_gateway_v2_authorizer.assert_called_once()  # Testing inverse
+            mock_extract_cloud_formation_authorizer.assert_called_once()
+
+    @parameterized.expand(
+        [("when enabled does not extract authorizer", True), ("when disabled extracts authorizer", False)]
+    )
+    def test_extract_api_gateway_method(self, _, disable_authorizer):
+        template = {
+            "MyMethod": {
+                "Type": "AWS::ApiGateway::Method",
+                "Properties": {
+                    "HttpMethod": "GET",
+                    "ResourceId": "DummyId",
+                    "RestApiId": "DummyId",
+                    "AuthorizerId": "AuthorizerId",
+                },
+            }
+        }
+        provider = CfnApiProvider()
+        mock_collector = Mock()
+        mock_collector.add_routes = Mock()
+
+        provider._extract_cloud_formation_method(
+            stack_path="",
+            resources={},
+            logical_id="MyMethod",
+            method_resource=template["MyMethod"],
+            collector=mock_collector,
+            disable_authorizer=disable_authorizer,
+        )
+
+        route = mock_collector.add_routes.call_args.args[1][0]
+
+        if disable_authorizer:
+            self.assertIsNone(route.authorizer_name)
+        if not disable_authorizer:
+            self.assertEqual(route.authorizer_name, "AuthorizerId")
+
+
+class TestCollectLambdaAuthorizersWithApiGatewayV1Resources(TestCase):
+    @parameterized.expand(
+        [
+            (  # test token auth WITHOUT validation
+                {
+                    "Properties": {
+                        "Type": "TOKEN",
+                        "RestApiId": "my-rest-api",
+                        "Name": "my-auth-name",
+                        "AuthorizerUri": "arn",
+                        "IdentitySource": "method.request.header.auth",
+                    }
+                },
+                {
+                    "my-auth-id": LambdaAuthorizer(
+                        payload_version="1.0",
+                        authorizer_name="my-auth-name",
+                        type=LambdaAuthorizer.TOKEN,
+                        lambda_name="my-lambda",
+                        identity_sources=["method.request.header.auth"],
+                    )
+                },
+            ),
+            (  # test token auth WITH validation
+                {
+                    "Properties": {
+                        "Type": "TOKEN",
+                        "RestApiId": "my-rest-api",
+                        "Name": "my-auth-name",
+                        "AuthorizerUri": "arn",
+                        "IdentitySource": "method.request.header.auth",
+                        "IdentityValidationExpression": "*",
+                    }
+                },
+                {
+                    "my-auth-id": LambdaAuthorizer(
+                        payload_version="1.0",
+                        authorizer_name="my-auth-name",
+                        type=LambdaAuthorizer.TOKEN,
+                        lambda_name="my-lambda",
+                        identity_sources=["method.request.header.auth"],
+                        validation_string="*",
+                    )
+                },
+            ),
+            (  # test request auth
+                {
+                    "Properties": {
+                        "Type": "REQUEST",
+                        "RestApiId": "my-rest-api",
+                        "Name": "my-auth-name",
+                        "AuthorizerUri": "arn",
+                        "IdentitySource": "method.request.header.auth, method.request.querystring.abc",
+                    }
+                },
+                {
+                    "my-auth-id": LambdaAuthorizer(
+                        payload_version="1.0",
+                        authorizer_name="my-auth-name",
+                        type=LambdaAuthorizer.REQUEST,
+                        lambda_name="my-lambda",
+                        identity_sources=["method.request.header.auth", "method.request.querystring.abc"],
+                    )
+                },
+            ),
+        ]
+    )
+    @patch("samcli.commands.local.lib.swagger.integration_uri.LambdaUri.get_function_name")
+    @patch("samcli.commands.local.lib.validators.lambda_auth_props.LambdaAuthorizerV1Validator.validate")
+    def test_collect_v1_lambda_authorizer(self, resource, expected_authorizer, validator_mock, get_func_name_mock):
+        lambda_auth_logical_id = "my-auth-id"
+
+        # mock ARN resolving function
+        auth_lambda_func_name = "my-lambda"
+        get_func_name_mock.return_value = auth_lambda_func_name
+
+        validator_mock.return_value = True
+
+        mock_collector = Mock()
+        mock_collector.add_authorizers = Mock()
+
+        CfnApiProvider._extract_cloud_formation_authorizer(lambda_auth_logical_id, resource, mock_collector)
+
+        mock_collector.add_authorizers.assert_called_with("my-rest-api", expected_authorizer)
+
+
+class TestCollectLambdaAuthorizersWithApiGatewayV2Resources(TestCase):
+    @patch("samcli.commands.local.lib.swagger.integration_uri.LambdaUri.get_function_name")
+    @patch("samcli.commands.local.lib.validators.lambda_auth_props.LambdaAuthorizerV2Validator.validate")
+    def test_collect_v2_lambda_authorizer(self, validator_mock, get_func_name_mock):
+        identity_sources = ["$request.header.auth", "$context.something"]
+
+        properties = {
+            "Properties": {
+                "AuthorizerType": "REQUEST",
+                "ApiId": "my-rest-api",
+                "Name": "my-auth-name",
+                "AuthorizerUri": "arn",
+                "IdentitySource": identity_sources,
+                "AuthorizerPayloadFormatVersion": "2.0",
+            }
+        }
+
+        expected_authorizers = {
+            "my-auth-id": LambdaAuthorizer(
+                payload_version="2.0",
+                authorizer_name="my-auth-name",
+                type=LambdaAuthorizer.REQUEST,
+                lambda_name="my-lambda",
+                identity_sources=identity_sources,
+            )
+        }
+
+        lambda_auth_logical_id = "my-auth-id"
+
+        # mock ARN resolving function
+        auth_lambda_func_name = "my-lambda"
+        get_func_name_mock.return_value = auth_lambda_func_name
+
+        mock_collector = Mock()
+        mock_collector.add_authorizers = Mock()
+
+        validator_mock.return_value = True
+
+        CfnApiProvider._extract_cfn_gateway_v2_authorizer(lambda_auth_logical_id, properties, mock_collector)
+
+        mock_collector.add_authorizers.assert_called_with("my-rest-api", expected_authorizers)

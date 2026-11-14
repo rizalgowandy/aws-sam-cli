@@ -6,13 +6,14 @@ import threading
 from subprocess import Popen, PIPE
 import os
 import logging
-import random
 from pathlib import Path
 
-import docker
 from docker.errors import APIError
+from psutil import NoSuchProcess
 
-from tests.testing_utils import kill_process
+from samcli.local.docker.utils import get_validated_container_client
+from tests.integration.local.common_utils import InvalidAddressException, random_port, wait_for_local_process
+from tests.testing_utils import kill_process, get_sam_command
 from tests.testing_utils import SKIP_DOCKER_MESSAGE, SKIP_DOCKER_TESTS, run_command
 
 LOG = logging.getLogger(__name__)
@@ -27,9 +28,18 @@ class StartApiIntegBaseClass(TestCase):
     integration_dir = str(Path(__file__).resolve().parents[2])
     invoke_image: Optional[List] = None
     layer_cache_base_dir: Optional[str] = None
+    disable_authorizer: Optional[bool] = False
+    config_file: Optional[str] = None
+    container_host_interface: Optional[str] = None
+    # container_labels no longer needed - container IDs are parsed from output
 
     build_before_invoke = False
     build_overrides: Optional[Dict[str, str]] = None
+
+    do_collect_cmd_init_output: bool = False
+
+    command_list = None
+    project_directory = None
 
     @classmethod
     def setUpClass(cls):
@@ -43,21 +53,14 @@ class StartApiIntegBaseClass(TestCase):
         if cls.build_before_invoke:
             cls.build()
 
-        cls.port = str(StartApiIntegBaseClass.random_port())
-
-        cls.docker_client = docker.from_env()
-        for container in cls.docker_client.api.containers():
-            try:
-                cls.docker_client.api.remove_container(container, force=True)
-            except APIError as ex:
-                LOG.error("Failed to remove container %s", container, exc_info=ex)
-        cls.start_api()
+        cls.docker_client = get_validated_container_client()
+        # Snapshot existing container IDs so we only clean up containers created by this test class
+        cls._pre_existing_container_ids = cls._get_sam_container_ids(cls.docker_client)
+        cls.start_api_with_retry()
 
     @classmethod
     def build(cls):
-        command = "sam"
-        if os.getenv("SAM_CLI_DEV"):
-            command = "samdev"
+        command = get_sam_command()
         command_list = [command, "build"]
         if cls.build_overrides:
             overrides_arg = " ".join(
@@ -68,12 +71,26 @@ class StartApiIntegBaseClass(TestCase):
         run_command(command_list, cwd=working_dir)
 
     @classmethod
-    def start_api(cls):
-        command = "sam"
-        if os.getenv("SAM_CLI_DEV"):
-            command = "samdev"
+    def start_api_with_retry(cls, retries=3):
+        retry_count = 0
+        while retry_count < retries:
+            cls.port = str(random_port())
+            try:
+                cls.start_api()
+            except InvalidAddressException:
+                retry_count += 1
+                continue
+            break
 
-        command_list = [command, "local", "start-api", "-t", cls.template, "-p", cls.port]
+        if retry_count == retries:
+            raise ValueError("Ran out of retries attempting to start api")
+
+    @classmethod
+    def start_api(cls):
+        command = get_sam_command()
+
+        command_list = cls.command_list or [command, "local", "start-api", "-t", cls.template]
+        command_list.extend(["-p", cls.port])
 
         if cls.container_mode:
             command_list += ["--warm-containers", cls.container_mode]
@@ -88,38 +105,87 @@ class StartApiIntegBaseClass(TestCase):
             for image in cls.invoke_image:
                 command_list += ["--invoke-image", image]
 
-        cls.start_api_process = Popen(command_list, stderr=PIPE)
+        if cls.disable_authorizer:
+            command_list += ["--disable-authorizer"]
 
-        while True:
-            line = cls.start_api_process.stderr.readline()
-            line_as_str = str(line.decode("utf-8")).strip()
-            if line_as_str:
-                LOG.info(f"{line_as_str}")
-            if "(Press CTRL+C to quit)" in line_as_str:
-                break
+        if cls.container_host_interface:
+            command_list += ["--container-host-interface", cls.container_host_interface]
+
+        # Container labels are no longer needed - container IDs are parsed from output
+
+        if cls.config_file:
+            command_list += ["--config-file", cls.config_file]
+
+        cls.start_api_process = (
+            Popen(command_list, stderr=PIPE, stdout=PIPE)
+            if not cls.project_directory
+            else Popen(command_list, stderr=PIPE, stdout=PIPE, cwd=cls.project_directory)
+        )
+        cls.start_api_process_output = wait_for_local_process(
+            cls.start_api_process, cls.port, collect_output=cls.do_collect_cmd_init_output
+        )
 
         cls.stop_reading_thread = False
 
         def read_sub_process_stderr():
             while not cls.stop_reading_thread:
-                cls.start_api_process.stderr.readline()
+                line = cls.start_api_process.stderr.readline()
+                if line:
+                    line_str = line.decode("utf-8").strip()
+                    cls.start_api_process_output += line_str + "\n"
+                    if line.strip():
+                        LOG.info(line)
+
+        def read_sub_process_stdout():
+            while not cls.stop_reading_thread:
+                line = cls.start_api_process.stdout.readline()
+                if line:
+                    line_str = line.decode("utf-8").strip()
+                    cls.start_api_process_output += line_str + "\n"
+                    if line.strip():
+                        LOG.info(line)
 
         cls.read_threading = threading.Thread(target=read_sub_process_stderr, daemon=True)
         cls.read_threading.start()
+
+        cls.read_threading2 = threading.Thread(target=read_sub_process_stdout, daemon=True)
+        cls.read_threading2.start()
 
     @classmethod
     def _make_parameter_override_arg(self, overrides):
         return " ".join(["ParameterKey={},ParameterValue={}".format(key, value) for key, value in overrides.items()])
 
+    @staticmethod
+    def _get_sam_container_ids(docker_client):
+        """Get the set of SAM CLI container IDs currently running."""
+        try:
+            sam_containers = docker_client.containers.list(all=True, filters={"label": "sam.cli.container.type=lambda"})
+            return {container.id for container in sam_containers}
+        except Exception:
+            return set()
+
     @classmethod
     def tearDownClass(cls):
         # After all the tests run, we need to kill the start-api process.
         cls.stop_reading_thread = True
-        kill_process(cls.start_api_process)
+        try:
+            kill_process(cls.start_api_process)
+        except NoSuchProcess:
+            LOG.info("Process has already been terminated")
 
-    @staticmethod
-    def random_port():
-        return random.randint(30000, 40000)
+        # Only clean up containers created by this test class (not pre-existing ones)
+        try:
+            docker_client = get_validated_container_client()
+            sam_containers = docker_client.containers.list(all=True, filters={"label": "sam.cli.container.type=lambda"})
+            for container in sam_containers:
+                if container.id not in cls._pre_existing_container_ids:
+                    try:
+                        container.remove(force=True)
+                        LOG.info("Removed SAM CLI container %s", container.short_id)
+                    except APIError as ex:
+                        LOG.error("Failed to remove SAM CLI container %s", container.short_id, exc_info=ex)
+        except Exception as ex:
+            LOG.error("Failed to clean up SAM CLI containers", exc_info=ex)
 
     @staticmethod
     def get_binary_data(filename):
@@ -130,11 +196,15 @@ class StartApiIntegBaseClass(TestCase):
             return fp.read()
 
 
-class WatchWarmContainersIntegBaseClass(StartApiIntegBaseClass):
+class WritableStartApiIntegBaseClass(StartApiIntegBaseClass):
     temp_path: Optional[str] = None
     template_path: Optional[str] = None
     code_path: Optional[str] = None
     docker_file_path: Optional[str] = None
+
+    template_content: Optional[str] = None
+    code_content: Optional[str] = None
+    docker_file_content: Optional[str] = None
 
     @classmethod
     def setUpClass(cls):

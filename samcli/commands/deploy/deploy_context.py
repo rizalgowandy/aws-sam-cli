@@ -15,6 +15,7 @@ Deploy a SAM stack
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 
+import json
 import logging
 import os
 from typing import Dict, List, Optional
@@ -25,12 +26,15 @@ import click
 from samcli.commands.deploy import exceptions as deploy_exceptions
 from samcli.commands.deploy.auth_utils import auth_per_resource
 from samcli.commands.deploy.utils import (
-    sanitize_parameter_overrides,
-    print_deploy_args,
     hide_noecho_parameter_overrides,
+    print_deploy_args,
+    sanitize_parameter_overrides,
 )
+from samcli.lib.cfn_language_extensions.sam_integration import resolve_language_extensions_enabled
 from samcli.lib.deploy.deployer import Deployer
+from samcli.lib.deploy.utils import FailureMode
 from samcli.lib.intrinsic_resolver.intrinsics_symbol_table import IntrinsicsSymbolTable
+from samcli.lib.observability.util import OutputOption
 from samcli.lib.package.s3_uploader import S3Uploader
 from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
 from samcli.lib.utils.boto_utils import get_boto_config_with_user_agent
@@ -40,7 +44,6 @@ LOG = logging.getLogger(__name__)
 
 
 class DeployContext:
-
     MSG_SHOWCASE_CHANGESET = "\nChangeset created successfully. {changeset_id}\n"
 
     MSG_EXECUTE_SUCCESS = "\nSuccessfully created/updated stack - {stack_name} in {region}\n"
@@ -72,6 +75,12 @@ class DeployContext:
         signing_profiles,
         use_changeset,
         disable_rollback,
+        poll_delay,
+        on_failure,
+        max_wait_duration,
+        language_extensions: Optional[bool] = None,
+        express: bool = False,
+        output: str = "text",
     ):
         self.template_file = template_file
         self.stack_name = stack_name
@@ -96,11 +105,18 @@ class DeployContext:
         self.region = region
         self.profile = profile
         self.s3_uploader = None
-        self.deployer = None
+        self.deployer: Optional[Deployer] = None
         self.confirm_changeset = confirm_changeset
         self.signing_profiles = signing_profiles
         self.use_changeset = use_changeset
         self.disable_rollback = disable_rollback
+        self.poll_delay = poll_delay
+        self.on_failure = FailureMode(on_failure) if on_failure else FailureMode.ROLLBACK
+        self._max_template_size = 51200
+        self.max_wait_duration = max_wait_duration
+        self._language_extensions_enabled = resolve_language_extensions_enabled(language_extensions)
+        self.express = express
+        self._output_mode = OutputOption(output)
 
     def __enter__(self):
         return self
@@ -108,11 +124,14 @@ class DeployContext:
     def __exit__(self, *args):
         pass
 
+    @property
+    def language_extensions_enabled(self) -> bool:
+        return self._language_extensions_enabled
+
     def run(self):
         """
         Execute deployment based on the argument provided by customers and samconfig.toml.
         """
-
         # Parse parameters
         with open(self.template_file, "r") as handle:
             template_str = handle.read()
@@ -127,7 +146,7 @@ class DeployContext:
         parameters = self.merge_parameters(template_dict, self.parameter_overrides)
 
         template_size = os.path.getsize(self.template_file)
-        if template_size > 51200 and not self.s3_bucket:
+        if template_size > self._max_template_size and not self.s3_bucket:
             raise deploy_exceptions.DeployBucketRequiredError()
         boto_config = get_boto_config_with_user_agent()
         cloudformation_client = boto3.client(
@@ -139,25 +158,31 @@ class DeployContext:
             s3_client = boto3.client("s3", region_name=self.region if self.region else None, config=boto_config)
 
             self.s3_uploader = S3Uploader(
-                s3_client, self.s3_bucket, self.s3_prefix, self.kms_key_id, self.force_upload, self.no_progressbar
+                s3_client,
+                self.s3_bucket,
+                self.s3_prefix,
+                self.kms_key_id,
+                self.force_upload,
+                True if self._output_mode is OutputOption.json else self.no_progressbar,
             )
 
-        self.deployer = Deployer(cloudformation_client)
+        self.deployer = Deployer(cloudformation_client, client_sleep=self.poll_delay, output_mode=self._output_mode)
 
         region = s3_client._client_config.region_name if s3_client else self.region  # pylint: disable=W0212
-        display_parameter_overrides = hide_noecho_parameter_overrides(template_dict, self.parameter_overrides)
-        print_deploy_args(
-            self.stack_name,
-            self.s3_bucket,
-            self.image_repositories if isinstance(self.image_repositories, dict) else self.image_repository,
-            region,
-            self.capabilities,
-            display_parameter_overrides,
-            self.confirm_changeset,
-            self.signing_profiles,
-            self.use_changeset,
-            self.disable_rollback,
-        )
+        if self._output_mode is not OutputOption.json:
+            display_parameter_overrides = hide_noecho_parameter_overrides(template_dict, self.parameter_overrides)
+            print_deploy_args(
+                self.stack_name,
+                self.s3_bucket,
+                self.image_repositories if isinstance(self.image_repositories, dict) else self.image_repository,
+                region,
+                self.capabilities,
+                display_parameter_overrides,
+                self.confirm_changeset,
+                self.signing_profiles,
+                self.use_changeset,
+                self.disable_rollback,
+            )
         return self.deploy(
             self.stack_name,
             template_str,
@@ -177,20 +202,20 @@ class DeployContext:
 
     def deploy(
         self,
-        stack_name,
-        template_str,
-        parameters,
-        capabilities,
-        no_execute_changeset,
-        role_arn,
-        notification_arns,
-        s3_uploader,
-        tags,
-        region,
-        fail_on_empty_changeset=True,
-        confirm_changeset=False,
-        use_changeset=True,
-        disable_rollback=False,
+        stack_name: str,
+        template_str: str,
+        parameters: List[dict],
+        capabilities: List[str],
+        no_execute_changeset: bool,
+        role_arn: str,
+        notification_arns: List[str],
+        s3_uploader: S3Uploader,
+        tags: List[str],
+        region: str,
+        fail_on_empty_changeset: bool = True,
+        confirm_changeset: bool = False,
+        use_changeset: bool = True,
+        disable_rollback: bool = False,
     ):
         """
         Deploy the stack to cloudformation.
@@ -232,12 +257,22 @@ class DeployContext:
             self.template_file,
             parameter_overrides=sanitize_parameter_overrides(self.parameter_overrides),
             global_parameter_overrides=self.global_parameter_overrides,
+            language_extensions_enabled=self._language_extensions_enabled,
         )
         auth_required_per_resource = auth_per_resource(stacks)
 
         for resource, authorization_required in auth_required_per_resource:
             if not authorization_required:
-                click.secho(f"{resource} may not have authorization defined.", fg="yellow")
+                if self._output_mode is OutputOption.json:
+                    click.echo(json.dumps({"type": "warning", "message": "no authentication", "resource": resource}))
+                else:
+                    click.secho(f"{resource} has no authentication.", fg="yellow")
+
+        assert self.deployer is not None
+        if self.express:
+            deployment_config = {"Mode": "EXPRESS", "DisableRollback": disable_rollback}
+        else:
+            deployment_config = None
 
         if use_changeset:
             try:
@@ -250,26 +285,72 @@ class DeployContext:
                     notification_arns=notification_arns,
                     s3_uploader=s3_uploader,
                     tags=tags,
+                    deployment_config=deployment_config,
                 )
-                click.echo(self.MSG_SHOWCASE_CHANGESET.format(changeset_id=result["Id"]))
+                if self._output_mode is not OutputOption.json:
+                    click.echo(self.MSG_SHOWCASE_CHANGESET.format(changeset_id=result["Id"]))
 
                 if no_execute_changeset:
+                    if self._output_mode is OutputOption.json:
+                        click.echo(
+                            json.dumps({"type": "result", "status": "changeset_created", "changeset_id": result["Id"]})
+                        )
                     return
 
                 if confirm_changeset:
+                    # confirm_changeset cannot co-occur with JSON output: do_cli rejects that combo
+                    # up front with a UsageError, and sync (the only other DeployContext caller) never
+                    # enables JSON. So this interactive prompt is only ever reached in text mode.
                     click.secho(self.MSG_CONFIRM_CHANGESET_HEADER, fg="yellow")
                     click.secho("=" * len(self.MSG_CONFIRM_CHANGESET_HEADER), fg="yellow")
                     if not click.confirm(f"{self.MSG_CONFIRM_CHANGESET}", default=False):
                         return
 
-                self.deployer.execute_changeset(result["Id"], stack_name, disable_rollback)
-                self.deployer.wait_for_execute(stack_name, changeset_type, disable_rollback)
-                click.echo(self.MSG_EXECUTE_SUCCESS.format(stack_name=stack_name, region=region))
+                marker_time = self.deployer.get_last_event_time(stack_name, 0)
+                self.deployer.execute_changeset(result["Id"], stack_name, disable_rollback, express=self.express)
+                self.deployer.wait_for_execute(
+                    stack_name, changeset_type, disable_rollback, self.on_failure, marker_time, self.max_wait_duration
+                )
+                if self._output_mode is OutputOption.json:
+                    # Carry the express flag so a consumer can tell a settled deploy from an express
+                    # one whose resources may still be stabilizing (the text branch warns about this).
+                    # Include changeset_id so a consumer can link to / re-describe the changeset; text
+                    # mode always reports it via MSG_SHOWCASE_CHANGESET.
+                    click.echo(
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "status": "success",
+                                "stack_name": stack_name,
+                                "region": region,
+                                "changeset_id": result["Id"],
+                                "express": self.express,
+                            }
+                        )
+                    )
+                else:
+                    click.echo(self.MSG_EXECUTE_SUCCESS.format(stack_name=stack_name, region=region))
+                    if self.express:
+                        click.secho(
+                            "\nDeployed with CloudFormation Express mode. "
+                            "Resources may still be stabilizing in the background.",
+                            fg="yellow",
+                        )
 
             except deploy_exceptions.ChangeEmptyError as ex:
                 if fail_on_empty_changeset:
                     raise
-                click.echo(str(ex))
+                if self._output_mode is OutputOption.json:
+                    click.echo(json.dumps({"type": "result", "status": "no_changes", "message": str(ex)}))
+                else:
+                    click.echo(str(ex))
+            except deploy_exceptions.DeployFailedError:
+                # Failed to deploy, check for DELETE action otherwise skip. The terminal FAILED
+                # JSON line is emitted once by do_cli's handler as this propagates, so we do not
+                # emit it here too (that produced a duplicate result line).
+                if self.on_failure == FailureMode.DELETE:
+                    self.deployer.rollback_delete_stack(stack_name)
+                raise
 
         else:
             try:
@@ -281,9 +362,11 @@ class DeployContext:
                     role_arn=role_arn,
                     notification_arns=notification_arns,
                     s3_uploader=s3_uploader,
-                    tags=tags,
+                    tags=tags,  # type: ignore[arg-type]
+                    on_failure=self.on_failure,
+                    deployment_config=deployment_config,
                 )
-                LOG.info(result)
+                LOG.debug(result)
 
             except deploy_exceptions.DeployFailedError as ex:
                 LOG.error(str(ex))
@@ -308,7 +391,6 @@ class DeployContext:
             return parameter_values
 
         for key, _ in template_dict["Parameters"].items():
-
             obj = {"ParameterKey": key}
 
             if key in parameter_overrides:

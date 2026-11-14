@@ -1,31 +1,32 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: 'AWS::Serverless-2016-10-31'
-Description: A template to test for API condition handling with a mix of explicit and implicit api events.
+Transform: AWS::Serverless-2016-10-31
+Description: A template to test for API condition handling with a mix of explicit
+  and implicit api events.
 Conditions:
   implicithello1condition:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   implicithello2condition:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   explicithello1condition:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   explicithello2condition:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
 
 Resources:
   implicithello1:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: implicithello1condition
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -37,11 +38,11 @@ Resources:
             Path: /implicit/hello1
             Method: get
   implicithello2:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: implicithello2condition
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -54,15 +55,15 @@ Resources:
             Method: get
 
   explicitapi:
-    Type: 'AWS::Serverless::Api'
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
   explicithello1:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: explicithello1condition
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |
@@ -75,11 +76,11 @@ Resources:
             Path: /explicit/hello1
             Method: get
   explicithello2:
-    Type: 'AWS::Serverless::Function'
+    Type: AWS::Serverless::Function
     Condition: explicithello2condition
     Properties:
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       MemorySize: 128
       Timeout: 3
       InlineCode: |

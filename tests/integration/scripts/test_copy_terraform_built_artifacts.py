@@ -1,0 +1,350 @@
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
+import sys
+
+from unittest import TestCase
+
+TIMEOUT = 3
+
+
+import pytest
+
+
+@pytest.mark.pr_skip
+class TestCopyTerraformBuiltArtifacts(TestCase):
+    def setUp(self) -> None:
+        self.samcli_root_path = pathlib.Path(__file__).parents[3].joinpath("samcli")
+        self.script_dir = self.samcli_root_path.joinpath("hook_packages", "terraform")
+        self.working_dir = pathlib.Path(__file__).parents[0]
+        self.script_name = "copy_terraform_built_artifacts.py"
+        self.script_location = self.script_dir.joinpath(self.script_name)
+        self.testdata_directory = pathlib.Path(__file__).parent.joinpath("testdata")
+        self.input_file = self.testdata_directory.joinpath("build-output-path-dir.json")
+        self.expression = (
+            '|values|root_module|child_modules|[?address=="module_address"]|resources|['
+            '?address=="sam_metadata_address"]|values|triggers|built_output_path'
+        )
+        self.directory = pathlib.Path(tempfile.mkdtemp()).absolute()
+        self.artifact_name = "test_artifact"
+
+        self.zip_module_path = self.samcli_root_path.joinpath("local", "lambdafn", "zip.py")
+        shutil.copy(self.zip_module_path, self.script_dir)
+
+    def tearDown(self) -> None:
+        os.remove(os.path.join(self.script_dir, "zip.py"))
+
+    def test_script_output_path_directory(self):
+        with open(self.input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                str(self.directory),
+                "--expression",
+                self.expression,
+                "--json",
+                json_str,
+            ]
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+        self.assertEqual(os.listdir(self.directory), [self.artifact_name])
+
+    def test_script_output_path_directory_args_file(self):
+        # Verifies the producer/consumer contract for --args-file end-to-end: a valid args file
+        # actually supplies `expression` (and, if present, `target`) to the script, so a key
+        # rename or a precedence regression in file_args.get(...) would be caught here rather
+        # than only being exercised by the makefile_generator unit tests on the producer side.
+        # target is intentionally omitted from the args file: a non-empty target together with
+        # --json trips the existing "Provide either --target or --json" check.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".args.json", delete=False) as args_file:
+            json.dump({"expression": self.expression}, args_file)
+            args_file_path = args_file.name
+        try:
+            with open(self.input_file, "rb") as f:
+                json_str = f.read().decode("utf-8")
+                command = [
+                    f"{str(sys.executable)}",
+                    f"{str(self.script_location)}",
+                    "--directory",
+                    str(self.directory),
+                    "--args-file",
+                    args_file_path,
+                    "--json",
+                    json_str,
+                ]
+                subprocess.check_call(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    cwd=self.working_dir,
+                )
+            self.assertEqual(os.listdir(self.directory), [self.artifact_name])
+        finally:
+            os.remove(args_file_path)
+
+    def test_script_output_path_zip(self):
+        input_zip_file = self.testdata_directory.joinpath("build-output-path-zip.json")
+        with open(input_zip_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                str(self.directory),
+                "--expression",
+                self.expression,
+                "--json",
+                json_str,
+            ]
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+        self.assertEqual(os.listdir(self.directory), [self.artifact_name])
+
+    def test_script_output_path_directory_invalid_directory(self):
+        directory = "not-a-dir"
+        with open(self.input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                directory,
+                "--expression",
+                self.expression,
+                "--json",
+                json_str,
+            ]
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+
+    def test_script_output_path_directory_invalid_expression(self):
+        expression = (
+            '|values|root_module|child_modules|[?address=="module_address"]|resources'
+            '?address=="sam_metadata_address"]'
+        )
+        with open(self.input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                f"{str(self.directory)}",
+                "--expression",
+                expression,
+                "--json",
+                json_str,
+            ]
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+
+    def test_script_output_path_directory_missing_args_file(self):
+        with open(self.input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                str(self.directory),
+                "--args-file",
+                str(self.testdata_directory.joinpath("does-not-exist.args.json")),
+                "--json",
+                json_str,
+            ]
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+        # a missing/unreadable args file should be caught and reported with a clear message and
+        # a clean non-zero exit code (matching this script's existing error-handling convention
+        # for OSError-derived failures, e.g. create_backend_override), rather than propagating as
+        # an *uncaught* exception that aborts the process with an unhandled stack trace.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"Reading args file", result.stderr)
+
+    def test_script_output_path_directory_malformed_args_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".args.json", delete=False) as bad_args_file:
+            bad_args_file.write("not valid json")
+            bad_args_file_path = bad_args_file.name
+        try:
+            with open(self.input_file, "rb") as f:
+                json_str = f.read().decode("utf-8")
+                command = [
+                    f"{str(sys.executable)}",
+                    f"{str(self.script_location)}",
+                    "--directory",
+                    str(self.directory),
+                    "--args-file",
+                    bad_args_file_path,
+                    "--json",
+                    json_str,
+                ]
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    cwd=self.working_dir,
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"Reading args file", result.stderr)
+        finally:
+            os.remove(bad_args_file_path)
+
+    def test_script_output_path_directory_valid_expression_invalid_extracted_path(self):
+        expression = (
+            '|values|root_module|child_modules|[?address=="module_address"]|resources|['
+            '?address=="sam_metadata_address"]|values|triggers'
+        )
+        with open(self.input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                f"{str(self.directory)}",
+                "--expression",
+                expression,
+                "--json",
+                json_str,
+            ]
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+
+    def test_script_output_path_directory_same_directory_and_extracted_path(self):
+        directory = self.testdata_directory.joinpath("output_path_dir")
+        with open(self.input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                f"{str(directory)}",
+                "--expression",
+                self.expression,
+                "--json",
+                json_str,
+            ]
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+
+    def test_script_output_path_no_target_and_no_json(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                f"{str(self.directory)}",
+                "--expression",
+                self.expression,
+            ]
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+
+    def test_script_output_path_both_target_and_option(self):
+        with open(self.input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                f"{str(self.directory)}",
+                "--expression",
+                self.expression,
+                "--json",
+                json_str,
+                "--target",
+                "resource.path",
+            ]
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+
+    def test_script_output_path_invalid_json(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            command = [
+                f"{str(sys.executable)}",
+                f"{str(self.script_location)}",
+                "--directory",
+                f"{str(self.directory)}",
+                "--expression",
+                self.expression,
+                "--json",
+                "invalid_json",
+            ]
+            subprocess.check_call(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, cwd=self.working_dir
+            )
+
+    def test_script_zip_with_symlink_fails_without_mount_symlinks(self):
+        """Test that unzipping a zip with an absolute symlink fails by default."""
+        input_file = self.testdata_directory.joinpath("build-output-path-symlink-zip.json")
+        with open(input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+        command = [
+            str(sys.executable),
+            str(self.script_location),
+            "--directory",
+            str(self.directory),
+            "--expression",
+            self.expression,
+            "--json",
+            json_str,
+        ]
+        env = os.environ.copy()
+        with self.assertRaises(subprocess.CalledProcessError) as ctx:
+            subprocess.check_output(
+                command,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                cwd=self.working_dir,
+                env=env,
+            )
+        self.assertIn(
+            "Failed to extract file from the zip file. A symlink has an absolute target which is not allowed",
+            ctx.exception.output.decode("utf-8"),
+        )
+
+    def test_script_zip_with_symlink_succeeds_with_mount_symlinks(self):
+        """Test that unzipping a zip with an absolute symlink succeeds when --mount-symlinks is passed."""
+        input_file = self.testdata_directory.joinpath("build-output-path-symlink-zip.json")
+        with open(input_file, "rb") as f:
+            json_str = f.read().decode("utf-8")
+        command = [
+            str(sys.executable),
+            str(self.script_location),
+            "--directory",
+            str(self.directory),
+            "--expression",
+            self.expression,
+            "--json",
+            json_str,
+            "--mount-symlinks",
+        ]
+        subprocess.check_call(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            cwd=self.working_dir,
+        )
+        # Verify the symlink was created
+        link_path = os.path.join(self.directory, "external_link")
+        self.assertTrue(os.path.islink(link_path))
+        self.assertEqual(os.readlink(link_path), "/tmp/external_target")

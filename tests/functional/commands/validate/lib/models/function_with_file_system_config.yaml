@@ -43,11 +43,11 @@ Resources:
         }
       Handler: index.handler
       MemorySize: 128
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Timeout: 3
       VpcConfig:
         SecurityGroupIds: !Ref SecurityGroupIds
         SubnetIds: !Ref VpcSubnetIds
       FileSystemConfigs:
-        - Arn: !GetAtt AccessPoint.Arn
-          LocalMountPath: /mnt/EFS
+      - Arn: !GetAtt AccessPoint.Arn
+        LocalMountPath: /mnt/EFS

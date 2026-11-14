@@ -1,30 +1,38 @@
 """
 Unit test for Lambda Build Container management
 """
+
 import itertools
 import json
 import pathlib
 
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from parameterized import parameterized
 
 from samcli.lib.utils.architecture import X86_64, ARM64
-from samcli.local.docker.lambda_build_container import LambdaBuildContainer
+from samcli.local.docker.lambda_build_container import LambdaBuildContainer, InvalidArchitectureForImage
 
 
 class TestLambdaBuildContainer_init(TestCase):
+    @patch("samcli.local.docker.utils.get_validated_container_client")
     @patch.object(LambdaBuildContainer, "_make_request")
     @patch.object(LambdaBuildContainer, "_get_image")
     @patch.object(LambdaBuildContainer, "_get_entrypoint")
-    @patch.object(LambdaBuildContainer, "_get_container_dirs")
-    def test_must_init_class(self, get_container_dirs_mock, get_entrypoint_mock, get_image_mock, make_request_mock):
+    @patch.object(LambdaBuildContainer, "get_container_dirs")
+    def test_must_init_class(
+        self, get_container_dirs_mock, get_entrypoint_mock, get_image_mock, make_request_mock, mock_get_validated_client
+    ):
+        # Mock the docker client
+        docker_client_mock = Mock()
+        mock_get_validated_client.return_value = docker_client_mock
 
         request = make_request_mock.return_value = "somerequest"
         entry = get_entrypoint_mock.return_value = "entrypoint"
         image = get_image_mock.return_value = "imagename"
         container_dirs = get_container_dirs_mock.return_value = {
+            "base_dir": "/mybase",
             "source_dir": "/mysource",
             "manifest_dir": "/mymanifest",
             "artifacts_dir": "/myartifacts",
@@ -73,11 +81,16 @@ class TestLambdaBuildContainer_init(TestCase):
 
 class TestLambdaBuildContainer_make_request(TestCase):
     @parameterized.expand(itertools.product([True, False], [[], ["exp1", "exp2"]]))
+    @patch("samcli.local.docker.lambda_build_container.patch_runtime")
     @patch("samcli.local.docker.lambda_build_container.get_enabled_experimental_flags")
-    def test_must_make_request_object_string(self, is_building_layer, experimental_flags, patched_experimental_flags):
+    def test_must_make_request_object_string(
+        self, is_building_layer, experimental_flags, patched_experimental_flags, patch_runtime_mock
+    ):
         patched_experimental_flags.return_value = experimental_flags
+        patch_runtime_mock.return_value = "runtime"
 
         container_dirs = {
+            "base_dir": "base_dir",
             "source_dir": "source_dir",
             "artifacts_dir": "artifacts_dir",
             "scratch_dir": "scratch_dir",
@@ -98,6 +111,7 @@ class TestLambdaBuildContainer_make_request(TestCase):
             "mode",
             "architecture",
             is_building_layer,
+            build_in_source=False,
         )
 
         self.maxDiff = None  # Print whole json diff
@@ -126,9 +140,12 @@ class TestLambdaBuildContainer_make_request(TestCase):
                     "architecture": "architecture",
                     "is_building_layer": is_building_layer,
                     "experimental_flags": experimental_flags,
+                    "build_in_source": False,
                 },
             },
         )
+
+        patch_runtime_mock.assert_called_with("runtime")
 
 
 class TestLambdaBuildContainer_get_container_dirs(TestCase):
@@ -136,11 +153,12 @@ class TestLambdaBuildContainer_get_container_dirs(TestCase):
         source_dir = "source"
         manifest_dir = "manifest"
 
-        result = LambdaBuildContainer._get_container_dirs(source_dir, manifest_dir)
+        result = LambdaBuildContainer.get_container_dirs(source_dir, manifest_dir)
 
         self.assertEqual(
             result,
             {
+                "base_dir": "/tmp/samcli",
                 "source_dir": "/tmp/samcli/source",
                 "manifest_dir": "/tmp/samcli/manifest",
                 "artifacts_dir": "/tmp/samcli/artifacts",
@@ -152,11 +170,12 @@ class TestLambdaBuildContainer_get_container_dirs(TestCase):
         source_dir = "/home/source"
         manifest_dir = "/home/source"
 
-        result = LambdaBuildContainer._get_container_dirs(source_dir, manifest_dir)
+        result = LambdaBuildContainer.get_container_dirs(source_dir, manifest_dir)
 
         self.assertEqual(
             result,
             {
+                "base_dir": "/tmp/samcli",
                 # When source & manifest directories are the same, manifest_dir must be equal to source
                 "source_dir": "/tmp/samcli/source",
                 "manifest_dir": "/tmp/samcli/source",
@@ -170,11 +189,43 @@ class TestLambdaBuildContainer_get_image(TestCase):
     @parameterized.expand(
         [
             ("myruntime", ARM64, "public.ecr.aws/sam/build-myruntime:latest-arm64"),
-            ("nodejs14.x", X86_64, "public.ecr.aws/sam/build-nodejs14.x:latest-x86_64"),
+            ("nodejs20.x", X86_64, "public.ecr.aws/sam/build-nodejs20.x:latest-x86_64"),
         ]
     )
     def test_must_get_image_name(self, runtime, architecture, expected_image_name):
         self.assertEqual(expected_image_name, LambdaBuildContainer._get_image(runtime, architecture))
+
+    @patch("samcli.local.docker.utils.get_validated_container_client")
+    @patch("samcli.lib.build.workflow_config.supports_specified_workflow")
+    @patch.object(LambdaBuildContainer, "_get_image")
+    def test_get_image_by_specified_workflow_if_supported(
+        self, get_image_mock, supports_specified_workflow_mock, mock_get_validated_client
+    ):
+        architecture = "arm64"
+        specified_workflow = "specified_workflow"
+
+        # Mock the docker client
+        docker_client_mock = Mock()
+        mock_get_validated_client.return_value = docker_client_mock
+
+        supports_specified_workflow_mock.return_value = True
+
+        LambdaBuildContainer(
+            "protocol",
+            "language",
+            "dependency",
+            "application",
+            "/foo/source",
+            "/bar/manifest.txt",
+            "runtime",
+            optimizations="optimizations",
+            options="options",
+            log_level="log-level",
+            mode="mode",
+            architecture=architecture,
+            specified_workflow=specified_workflow,
+        )
+        get_image_mock.assert_called_once_with(specified_workflow, architecture)
 
 
 class TestLambdaBuildContainer_get_image_tag(TestCase):
@@ -187,6 +238,10 @@ class TestLambdaBuildContainer_get_image_tag(TestCase):
     def test_must_get_image_tag(self, architecture, expected_image_tag):
         self.assertEqual(expected_image_tag, LambdaBuildContainer.get_image_tag(architecture))
 
+    def test_must_raise_an_error_for_invalid_architecture(self):
+        with self.assertRaises(InvalidArchitectureForImage):
+            LambdaBuildContainer.get_image_tag("invalid-architecture")
+
 
 class TestLambdaBuildContainer_get_entrypoint(TestCase):
     def test_must_get_entrypoint(self):
@@ -195,7 +250,6 @@ class TestLambdaBuildContainer_get_entrypoint(TestCase):
 
 class TestLambdaBuildContainer_convert_to_container_dirs(TestCase):
     def test_must_work_on_abs_and_relative_paths(self):
-
         input = [".", "../foo", "/some/abs/path"]
         mapping = {str(pathlib.Path(".").resolve()): "/first", "../foo": "/second", "/some/abs/path": "/third"}
 
@@ -205,7 +259,6 @@ class TestLambdaBuildContainer_convert_to_container_dirs(TestCase):
         self.assertEqual(result, expected)
 
     def test_must_skip_unknown_paths(self):
-
         input = ["/known/path", "/unknown/path"]
         mapping = {"/known/path": "/first"}
 
@@ -215,7 +268,6 @@ class TestLambdaBuildContainer_convert_to_container_dirs(TestCase):
         self.assertEqual(result, expected)
 
     def test_must_skip_on_empty_input(self):
-
         input = None
         mapping = {"/known/path": "/first"}
 

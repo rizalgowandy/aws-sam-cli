@@ -4,7 +4,8 @@ from unittest import TestCase, skipIf
 from pathlib import Path
 from subprocess import Popen, PIPE, TimeoutExpired
 
-from tests.testing_utils import SKIP_DOCKER_MESSAGE, SKIP_DOCKER_TESTS
+
+from tests.testing_utils import SKIP_DOCKER_MESSAGE, SKIP_DOCKER_TESTS, get_sam_command, get_build_command_list
 
 TIMEOUT = 300
 
@@ -12,12 +13,14 @@ TIMEOUT = 300
 @skipIf(SKIP_DOCKER_TESTS, SKIP_DOCKER_MESSAGE)
 class InvokeIntegBase(TestCase):
     template: Optional[Path] = None
+    template_subdir: str = "invoke"
 
     @classmethod
     def setUpClass(cls):
-        cls.cmd = cls.base_command()
+        cls.cmd = get_sam_command()
         cls.test_data_path = cls.get_integ_dir().joinpath("testdata")
-        cls.template_path = str(cls.test_data_path.joinpath("invoke", cls.template))
+        if cls.template:
+            cls.template_path = str(cls.test_data_path.joinpath(cls.template_subdir, cls.template))
         cls.event_path = str(cls.test_data_path.joinpath("invoke", "event.json"))
         cls.event_utf8_path = str(cls.test_data_path.joinpath("invoke", "event_utf8.json"))
         cls.env_var_path = str(cls.test_data_path.joinpath("invoke", "vars.json"))
@@ -26,16 +29,8 @@ class InvokeIntegBase(TestCase):
     def get_integ_dir():
         return Path(__file__).resolve().parents[2]
 
-    @classmethod
-    def base_command(cls):
-        command = "sam"
-        if os.getenv("SAM_CLI_DEV"):
-            command = "samdev"
-
-        return command
-
+    @staticmethod
     def get_command_list(
-        self,
         function_to_invoke,
         template_path=None,
         event_path=None,
@@ -47,8 +42,15 @@ class InvokeIntegBase(TestCase):
         layer_cache=None,
         docker_network=None,
         invoke_image=None,
+        hook_name=None,
+        beta_features=None,
+        terraform_plan_file=None,
+        tenant_id=None,
+        container_host_interface=None,
+        durable_execution_name=None,
+        mount_symlinks=False,
     ):
-        command_list = [self.cmd, "local", "invoke", function_to_invoke]
+        command_list = [get_sam_command(), "local", "invoke", function_to_invoke]
 
         if template_path:
             command_list = command_list + ["-t", template_path]
@@ -61,6 +63,9 @@ class InvokeIntegBase(TestCase):
 
         if no_event:
             command_list = command_list + ["--no-event"]
+
+        if mount_symlinks:
+            command_list = command_list + ["--mount-symlinks"]
 
         if profile:
             command_list = command_list + ["--profile", profile]
@@ -83,36 +88,48 @@ class InvokeIntegBase(TestCase):
         if invoke_image:
             command_list = command_list + ["--invoke-image", invoke_image]
 
-        return command_list
+        if hook_name:
+            command_list = command_list + ["--hook-name", hook_name]
 
-    def get_build_command_list(
-        self,
-        template_path=None,
-        cached=None,
-        parallel=None,
-        use_container=None,
-    ):
-        command_list = [self.cmd, "build"]
+        if beta_features is not None:
+            command_list = command_list + ["--beta-features" if beta_features else "--no-beta-features"]
 
-        if template_path:
-            command_list = command_list + ["-t", template_path]
+        if terraform_plan_file:
+            command_list += ["--terraform-plan-file", terraform_plan_file]
 
-        if cached:
-            command_list = command_list + ["-c"]
+        if tenant_id:
+            command_list = command_list + ["--tenant-id", tenant_id]
 
-        if parallel:
-            command_list = command_list + ["-p"]
+        if container_host_interface:
+            command_list = command_list + ["--container-host-interface", container_host_interface]
 
-        if use_container:
-            command_list = command_list + ["-u"]
+        if durable_execution_name:
+            command_list = command_list + ["--durable-execution-name", durable_execution_name]
 
         return command_list
 
-    def run_command(self, command_list, env=None):
-        process = Popen(command_list, stdout=PIPE, env=env)
+    def run_command(self, command_list, env=None, cwd=None):
+        process = Popen(command_list, stdout=PIPE, env=env, cwd=cwd)
         try:
-            (stdout, stderr) = process.communicate(timeout=TIMEOUT)
+            stdout, stderr = process.communicate(timeout=TIMEOUT)
             return stdout, stderr, process.returncode
         except TimeoutExpired:
             process.kill()
+            # Close file handles to prevent resource warnings
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            process.wait()
             raise
+
+
+class IntegrationCliIntegBase(InvokeIntegBase):
+    def assert_is_account_id_valid(self, account_id: str):
+        try:
+            int(account_id)
+        except ValueError:
+            self.fail(f"Account ID '{account_id}' is not a valid number")
+
+        # AWS account IDs have length of 12
+        self.assertEqual(len(account_id), 12)

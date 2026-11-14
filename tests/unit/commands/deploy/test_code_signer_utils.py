@@ -17,7 +17,7 @@ class TestCodeSignerUtils(TestCase):
             given_function_name: {"profile_name": given_profile_name, "profile_owner": given_profile_owner}
         }
 
-        (profile_name, profile_owner) = extract_profile_name_and_owner_from_existing(
+        profile_name, profile_owner = extract_profile_name_and_owner_from_existing(
             given_function_name, given_code_signing_config
         )
 
@@ -46,7 +46,7 @@ class TestCodeSignerUtils(TestCase):
                                         [
                                             ("CodeUri", "HelloWorldFunction"),
                                             ("Handler", "app.lambda_handler"),
-                                            ("Runtime", "python3.7"),
+                                            ("Runtime", "python3.12"),
                                             ("CodeSigningConfigArn", "MyCodeSigningConfigArn"),
                                             (
                                                 "Layers",
@@ -71,7 +71,7 @@ class TestCodeSignerUtils(TestCase):
                                         [
                                             ("CodeUri", "HelloWorldFunction2"),
                                             ("Handler", "app.lambda_handler2"),
-                                            ("Runtime", "python3.7"),
+                                            ("Runtime", "python3.12"),
                                             ("CodeSigningConfigArn", "MyCodeSigningConfigArn"),
                                             (
                                                 "Layers",
@@ -96,7 +96,7 @@ class TestCodeSignerUtils(TestCase):
                                         [
                                             ("LayerName", "dependencies"),
                                             ("ContentUri", "dependencies/"),
-                                            ("CompatibleRuntimes", ["python3.7"]),
+                                            ("CompatibleRuntimes", ["python3.12"]),
                                         ]
                                     ),
                                 ),
@@ -106,7 +106,7 @@ class TestCodeSignerUtils(TestCase):
                 ]
             ),
         }
-        (functions_with_code_sign, layers_with_code_sign) = signer_config_per_function(
+        functions_with_code_sign, layers_with_code_sign = signer_config_per_function(
             [Stack("", "", "", {}, template_dict)]
         )
 

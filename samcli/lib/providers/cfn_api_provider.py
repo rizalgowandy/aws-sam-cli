@@ -1,24 +1,32 @@
 """Parses SAM given a template"""
+
 import logging
-from typing import Any, Dict, Optional, Tuple, List, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
-from samcli.commands.local.lib.swagger.integration_uri import LambdaUri
-from samcli.lib.providers.provider import Stack
-from samcli.local.apigw.local_apigw_service import Route
 from samcli.commands.local.cli_common.user_exceptions import InvalidSamTemplateException
-from samcli.lib.providers.cfn_base_api_provider import CfnBaseApiProvider
+from samcli.commands.local.lib.swagger.integration_uri import LambdaUri
+from samcli.commands.local.lib.validators.identity_source_validator import IdentitySourceValidator
+from samcli.commands.local.lib.validators.lambda_auth_props import (
+    LambdaAuthorizerV1Validator,
+    LambdaAuthorizerV2Validator,
+)
 from samcli.lib.providers.api_collector import ApiCollector
-
+from samcli.lib.providers.cfn_base_api_provider import CfnBaseApiProvider
+from samcli.lib.providers.provider import Stack
 from samcli.lib.utils.resources import (
+    AWS_APIGATEWAY_AUTHORIZER,
     AWS_APIGATEWAY_METHOD,
     AWS_APIGATEWAY_RESOURCE,
     AWS_APIGATEWAY_RESTAPI,
     AWS_APIGATEWAY_STAGE,
     AWS_APIGATEWAY_V2_API,
+    AWS_APIGATEWAY_V2_AUTHORIZER,
     AWS_APIGATEWAY_V2_INTEGRATION,
     AWS_APIGATEWAY_V2_ROUTE,
     AWS_APIGATEWAY_V2_STAGE,
 )
+from samcli.local.apigw.authorizers.lambda_authorizer import LambdaAuthorizer
+from samcli.local.apigw.route import Route
 
 LOG = logging.getLogger(__name__)
 
@@ -31,13 +39,24 @@ class CfnApiProvider(CfnBaseApiProvider):
         AWS_APIGATEWAY_STAGE,
         AWS_APIGATEWAY_RESOURCE,
         AWS_APIGATEWAY_METHOD,
+        AWS_APIGATEWAY_AUTHORIZER,
         AWS_APIGATEWAY_V2_API,
         AWS_APIGATEWAY_V2_INTEGRATION,
         AWS_APIGATEWAY_V2_ROUTE,
         AWS_APIGATEWAY_V2_STAGE,
+        AWS_APIGATEWAY_V2_AUTHORIZER,
     ]
 
-    def extract_resources(self, stacks: List[Stack], collector: ApiCollector, cwd: Optional[str] = None) -> None:
+    _METHOD_AUTHORIZER_ID = "AuthorizerId"
+    _ROUTE_AUTHORIZER_ID = "AuthorizerId"
+
+    def extract_resources(
+        self,
+        stacks: List[Stack],
+        collector: ApiCollector,
+        cwd: Optional[str] = None,
+        disable_authorizer: Optional[bool] = False,
+    ) -> None:
         """
         Extract the Route Object from a given resource and adds it to the RouteCollector.
 
@@ -51,6 +70,9 @@ class CfnApiProvider(CfnBaseApiProvider):
 
         cwd : str
             Optional working directory with respect to which we will resolve relative path to Swagger file
+
+        disable_authorizer : bool
+            Optional flag to disable collection of lambda authorizers
         """
 
         for stack in stacks:
@@ -64,16 +86,137 @@ class CfnApiProvider(CfnBaseApiProvider):
                     self._extract_cloud_formation_stage(resources, resource, collector)
 
                 if resource_type == AWS_APIGATEWAY_METHOD:
-                    self._extract_cloud_formation_method(stack.stack_path, resources, logical_id, resource, collector)
+                    self._extract_cloud_formation_method(
+                        stack.stack_path,
+                        resources,
+                        logical_id,
+                        resource,
+                        collector,
+                        disable_authorizer=disable_authorizer,
+                    )
+
+                if resource_type == AWS_APIGATEWAY_AUTHORIZER and not disable_authorizer:
+                    self._extract_cloud_formation_authorizer(logical_id, resource, collector)
 
                 if resource_type == AWS_APIGATEWAY_V2_API:
-                    self._extract_cfn_gateway_v2_api(stack.stack_path, logical_id, resource, collector, cwd=cwd)
+                    self._extract_cfn_gateway_v2_api(
+                        stack.stack_path,
+                        logical_id,
+                        resource,
+                        collector,
+                        cwd=cwd,
+                        disable_authorizer=disable_authorizer,
+                    )
 
                 if resource_type == AWS_APIGATEWAY_V2_ROUTE:
-                    self._extract_cfn_gateway_v2_route(stack.stack_path, resources, logical_id, resource, collector)
+                    self._extract_cfn_gateway_v2_route(
+                        stack.stack_path,
+                        resources,
+                        logical_id,
+                        resource,
+                        collector,
+                        disable_authorizer=disable_authorizer,
+                    )
 
                 if resource_type == AWS_APIGATEWAY_V2_STAGE:
                     self._extract_cfn_gateway_v2_stage(resources, resource, collector)
+
+                if resource_type == AWS_APIGATEWAY_V2_AUTHORIZER and not disable_authorizer:
+                    self._extract_cfn_gateway_v2_authorizer(logical_id, resource, collector)
+
+    @staticmethod
+    def _extract_cloud_formation_authorizer(logical_id: str, resource: dict, collector: ApiCollector) -> None:
+        """
+        Extract Authorizers from AWS::ApiGateway::Authorizer and add them to the collector.
+
+        Parameters
+        ----------
+        logical_id: str
+            The logical ID of the Authorizer
+        resource: dict
+            The attributes for the Authorizer
+        collector: ApiCollector
+            ApiCollector to save Authorizers into
+        """
+        if not LambdaAuthorizerV1Validator.validate(logical_id, resource):
+            return
+
+        properties = resource.get("Properties", {})
+        authorizer_type = properties.get(LambdaAuthorizerV1Validator.AUTHORIZER_TYPE, "").lower()
+        rest_api_id = properties.get(LambdaAuthorizerV1Validator.AUTHORIZER_REST_API)
+        name = properties.get(LambdaAuthorizerV1Validator.AUTHORIZER_NAME)
+        authorizer_uri = properties.get(LambdaAuthorizerV1Validator.AUTHORIZER_AUTHORIZER_URI)
+        identity_source_template = properties.get(LambdaAuthorizerV1Validator.AUTHORIZER_IDENTITY_SOURCE, "")
+
+        # this will always return a string since we have already validated above
+        function_name = cast(str, LambdaUri.get_function_name(authorizer_uri))
+
+        # split and parse out identity sources
+        identity_source_list = []
+
+        if identity_source_template:
+            for identity_source in identity_source_template.split(","):
+                trimmed_id_source = identity_source.strip()
+
+                if not IdentitySourceValidator.validate_identity_source(trimmed_id_source):
+                    raise InvalidSamTemplateException(
+                        f"Lambda Authorizer {logical_id} does not contain valid identity sources.", Route.API
+                    )
+
+                identity_source_list.append(trimmed_id_source)
+
+        validation_expression = properties.get(LambdaAuthorizerV1Validator.AUTHORIZER_VALIDATION)
+
+        lambda_authorizer = LambdaAuthorizer(
+            payload_version="1.0",
+            authorizer_name=name,
+            type=authorizer_type,
+            lambda_name=function_name,
+            identity_sources=identity_source_list,
+            validation_string=validation_expression,
+        )
+
+        collector.add_authorizers(rest_api_id, {logical_id: lambda_authorizer})
+
+    @staticmethod
+    def _extract_cfn_gateway_v2_authorizer(logical_id: str, resource: dict, collector: ApiCollector) -> None:
+        """
+        Extract Authorizers from AWS::ApiGatewayV2::Authorizer and add them to the collector.
+
+        Parameters
+        ----------
+        logical_id: str
+            The logical ID of the Authorizer
+        resource: dict
+            The attributes for the Authorizer
+        collector: ApiCollector
+            ApiCollector to save Authorizers into
+        """
+        if not LambdaAuthorizerV2Validator.validate(logical_id, resource):
+            return
+
+        properties = resource.get("Properties", {})
+        authorizer_type = properties.get(LambdaAuthorizerV2Validator.AUTHORIZER_V2_TYPE, "").lower()
+        api_id = properties.get(LambdaAuthorizerV2Validator.AUTHORIZER_V2_API)
+        name = properties.get(LambdaAuthorizerV2Validator.AUTHORIZER_NAME)
+        authorizer_uri = properties.get(LambdaAuthorizerV2Validator.AUTHORIZER_AUTHORIZER_URI)
+        identity_sources = properties.get(LambdaAuthorizerV2Validator.AUTHORIZER_IDENTITY_SOURCE, [])
+        payload_version = properties.get(LambdaAuthorizerV2Validator.AUTHORIZER_V2_PAYLOAD, LambdaAuthorizer.PAYLOAD_V2)
+        simple_responses = properties.get(LambdaAuthorizerV2Validator.AUTHORIZER_V2_SIMPLE_RESPONSE, False)
+
+        # this will always return a string since we have already validated above
+        function_name = cast(str, LambdaUri.get_function_name(authorizer_uri))
+
+        lambda_authorizer = LambdaAuthorizer(
+            payload_version=payload_version,
+            authorizer_name=name,
+            type=authorizer_type,
+            lambda_name=function_name,
+            identity_sources=identity_sources,
+            use_simple_response=simple_responses,
+        )
+
+        collector.add_authorizers(api_id, {logical_id: lambda_authorizer})
 
     @staticmethod
     def _extract_cloud_formation_route(
@@ -156,6 +299,7 @@ class CfnApiProvider(CfnBaseApiProvider):
         logical_id: str,
         method_resource: Dict,
         collector: ApiCollector,
+        disable_authorizer: Optional[bool] = False,
     ) -> None:
         """
         Extract APIs from AWS::ApiGateway::Method and work backwards up the tree to resolve and find the true path.
@@ -176,6 +320,9 @@ class CfnApiProvider(CfnBaseApiProvider):
 
         collector : ApiCollector
             Instance of the API collector that where we will save the API information
+
+        disable_authorizer bool
+            Flag to disable extraction of authorizer
         """
 
         properties = method_resource.get("Properties", {})
@@ -206,7 +353,14 @@ class CfnApiProvider(CfnBaseApiProvider):
                 response_parameters = responses.get("ResponseParameters")
                 if response_parameters:
                     cors = self.extract_cors_from_method(response_parameters)
-        if cors:
+
+        # If CORS is found and this is an OPTIONS method, attach it to the route
+        # Otherwise, set it globally on the collector for backward compatibility
+        if cors and method == "OPTIONS":
+            # Route-specific CORS for OPTIONS methods
+            pass  # Will be attached to the route below
+        elif cors:
+            # Global CORS for non-OPTIONS methods (backward compatibility)
             collector.cors = cors
 
         content_handling = integration.get("ContentHandling")
@@ -214,12 +368,16 @@ class CfnApiProvider(CfnBaseApiProvider):
         if content_handling == CfnApiProvider.METHOD_BINARY_TYPE and content_type:
             collector.add_binary_media_types(logical_id, [content_type])
 
+        authorizer_name = None if disable_authorizer else properties.get(CfnApiProvider._METHOD_AUTHORIZER_ID)
+
         routes = Route(
             methods=[method],
             function_name=self._get_integration_function_name(integration),
             path=resource_path,
             operation_name=operation_name,
             stack_path=stack_path,
+            authorizer_name=authorizer_name,
+            cors=cors if method == "OPTIONS" else None,
         )
         collector.add_routes(rest_api_id, [routes])
 
@@ -230,6 +388,7 @@ class CfnApiProvider(CfnBaseApiProvider):
         api_resource: Dict,
         collector: ApiCollector,
         cwd: Optional[str] = None,
+        disable_authorizer: Optional[bool] = False,
     ) -> None:
         """
         Extract APIs from AWS::ApiGatewayV2::Api resource by reading and parsing Swagger documents. The result is
@@ -249,6 +408,8 @@ class CfnApiProvider(CfnBaseApiProvider):
             Instance of the API collector that where we will save the API information
         cwd : Optional[str]
             An optional string to override the current working directory
+        disable_authorizer : Optional[bool]
+            Optional flag to disable collection of lambda authorizers
         """
         properties = api_resource.get("Properties", {})
         body = properties.get("Body")
@@ -275,7 +436,15 @@ class CfnApiProvider(CfnBaseApiProvider):
             return
 
         CfnBaseApiProvider.extract_swagger_route(
-            stack_path, logical_id, body, body_s3_location, None, collector, cwd, Route.HTTP
+            stack_path,
+            logical_id,
+            body,
+            body_s3_location,
+            None,
+            collector,
+            cwd,
+            Route.HTTP,
+            disable_authorizer=disable_authorizer,
         )
 
     def _extract_cfn_gateway_v2_route(
@@ -285,6 +454,7 @@ class CfnApiProvider(CfnBaseApiProvider):
         logical_id: str,
         route_resource: Dict,
         collector: ApiCollector,
+        disable_authorizer: Optional[bool] = False,
     ) -> None:
         """
         Extract APIs from AWS::ApiGatewayV2::Route, and link it with the integration resource to get the lambda
@@ -306,6 +476,9 @@ class CfnApiProvider(CfnBaseApiProvider):
 
         collector : ApiCollector
             Instance of the API collector that where we will save the API information
+
+        disable_authorizer : Optional[bool]
+            Optional flag to disable collection of lambda authorizers
         """
 
         properties = route_resource.get("Properties", {})
@@ -332,6 +505,8 @@ class CfnApiProvider(CfnBaseApiProvider):
                 "The AWS::ApiGatewayV2::Route {} does not have a correct route key {}".format(logical_id, route_key)
             )
 
+        authorizer_name = None if disable_authorizer else properties.get(CfnApiProvider._ROUTE_AUTHORIZER_ID)
+
         routes = Route(
             methods=[method],
             path=path,
@@ -340,6 +515,7 @@ class CfnApiProvider(CfnBaseApiProvider):
             payload_format_version=payload_format_version,
             operation_name=operation_name,
             stack_path=stack_path,
+            authorizer_name=authorizer_name,
         )
         collector.add_routes(api_id, [routes])
 
@@ -404,7 +580,7 @@ class CfnApiProvider(CfnBaseApiProvider):
         api_resource_type = resources.get(api_id, {}).get("Type")
         if api_resource_type != AWS_APIGATEWAY_V2_API:
             raise InvalidSamTemplateException(
-                "The AWS::ApiGatewayV2::Stag must have a valid ApiId that points to Api resource {}".format(api_id)
+                "The AWS::ApiGatewayV2::Stage must have a valid ApiId that points to Api resource {}".format(api_id)
             )
 
         collector.stage_name = stage_name

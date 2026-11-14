@@ -1,16 +1,20 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Parameters: 
+Parameters:
   AuthorizationTypeRef:
-      Type: String
-      Default: NONE
+    Type: String
+    Default: NONE
 
   AllowOriginsRef:
-      Type: CommaDelimitedList
-      Default: "https://example.com"
+    Type: CommaDelimitedList
+    Default: https://example.com
 
   AllowMethodsRef:
-      Type: CommaDelimitedList
-      Default: "GET"
+    Type: CommaDelimitedList
+    Default: GET
+
+  InvokeModeRef:
+    Type: String
+    Default: BUFFERED
 
 Resources:
   MyFunction:
@@ -20,12 +24,11 @@ Resources:
       Description: Created by SAM
       Handler: index.handler
       MemorySize: 1024
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Timeout: 3
       FunctionUrlConfig:
         AuthType: !Ref AuthorizationTypeRef
         Cors:
-            AllowOrigins: !Ref AllowOriginsRef
-            AllowMethods: !Ref AllowMethodsRef
-            
-
+          AllowOrigins: !Ref AllowOriginsRef
+          AllowMethods: !Ref AllowMethodsRef
+        InvokeMode: !Ref InvokeModeRef

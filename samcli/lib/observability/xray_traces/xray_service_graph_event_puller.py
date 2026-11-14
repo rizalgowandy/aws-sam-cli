@@ -1,9 +1,10 @@
 """
 This file contains puller implementations for XRay
 """
+
 import logging
 from datetime import datetime
-from typing import Optional, Any, List, Set
+from typing import Any, Dict, List, Optional, Set, Union
 
 from samcli.lib.observability.observability_info_puller import ObservabilityEventConsumer
 from samcli.lib.observability.xray_traces.xray_event_puller import AbstractXRayPuller
@@ -68,5 +69,5 @@ class XRayServiceGraphPuller(AbstractXRayPuller):
                     self.consumer.consume(xray_service_graph_event)
                 self._previous_xray_service_graphs.add(xray_service_graph_event.get_hash())
 
-    def load_events(self, event_ids: List[str]):
+    def load_events(self, event_ids: Union[List[Any], Dict]):
         LOG.debug("Loading specific service graph events are not supported via XRay Service Graph")

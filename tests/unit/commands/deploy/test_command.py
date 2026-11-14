@@ -1,5 +1,11 @@
+import json
+import os
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest import TestCase
 from unittest.mock import ANY, MagicMock, Mock, call, patch
+
+import click
 
 from samcli.commands.deploy.command import do_cli
 from samcli.commands.deploy.exceptions import GuidedDeployFailedError
@@ -20,7 +26,6 @@ MOCK_SAM_CONFIG = get_mock_sam_config()
 
 class TestDeployCliCommand(TestCase):
     def setUp(self):
-
         self.template_file = "input-template-file"
         self.stack_name = "stack-name"
         self.s3_bucket = "s3-bucket"
@@ -50,6 +55,9 @@ class TestDeployCliCommand(TestCase):
         self.use_changeset = True
         self.resolve_image_repos = False
         self.disable_rollback = False
+        self.on_failure = None
+        self.max_wait_duration = 480
+        self.express = False
         MOCK_SAM_CONFIG.reset_mock()
 
         self.companion_stack_manager_patch = patch("samcli.commands.deploy.guided_context.CompanionStackManager")
@@ -63,12 +71,12 @@ class TestDeployCliCommand(TestCase):
     def tearDown(self):
         self.companion_stack_manager_patch.stop()
 
+    @patch("os.environ", {**os.environ, "SAM_CLI_POLL_DELAY": 10})  # type: ignore
     @patch("samcli.commands.package.command.click")
     @patch("samcli.commands.package.package_context.PackageContext")
     @patch("samcli.commands.deploy.command.click")
     @patch("samcli.commands.deploy.deploy_context.DeployContext")
     def test_all_args(self, mock_deploy_context, mock_deploy_click, mock_package_context, mock_package_click):
-
         context_mock = Mock()
         mock_deploy_context.return_value.__enter__.return_value = context_mock
 
@@ -100,7 +108,12 @@ class TestDeployCliCommand(TestCase):
             config_env=self.config_env,
             config_file=self.config_file,
             resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
             disable_rollback=self.disable_rollback,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            output="text",
         )
 
         mock_deploy_context.assert_called_with(
@@ -126,10 +139,127 @@ class TestDeployCliCommand(TestCase):
             signing_profiles=self.signing_profiles,
             use_changeset=self.use_changeset,
             disable_rollback=self.disable_rollback,
+            poll_delay=os.getenv("SAM_CLI_POLL_DELAY"),
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            language_extensions=None,
+            output="text",
         )
 
         context_mock.run.assert_called_with()
         self.assertEqual(context_mock.run.call_count, 1)
+
+    def _do_cli_with(self, **overrides):
+        # Invoke do_cli with the setUp defaults, overriding only the fields a test cares about.
+        kwargs = dict(
+            template_file=self.template_file,
+            stack_name=self.stack_name,
+            s3_bucket=self.s3_bucket,
+            image_repository=self.image_repository,
+            image_repositories=None,
+            force_upload=self.force_upload,
+            no_progressbar=self.no_progressbar,
+            s3_prefix=self.s3_prefix,
+            kms_key_id=self.kms_key_id,
+            parameter_overrides=self.parameter_overrides,
+            capabilities=self.capabilities,
+            no_execute_changeset=self.no_execute_changeset,
+            role_arn=self.role_arn,
+            notification_arns=self.notification_arns,
+            fail_on_empty_changeset=self.fail_on_empty_changset,
+            tags=self.tags,
+            region=self.region,
+            profile=self.profile,
+            use_json=self.use_json,
+            metadata=self.metadata,
+            guided=self.guided,
+            confirm_changeset=self.confirm_changeset,
+            signing_profiles=self.signing_profiles,
+            resolve_s3=self.resolve_s3,
+            config_env=self.config_env,
+            config_file=self.config_file,
+            resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
+            disable_rollback=self.disable_rollback,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            output="text",
+        )
+        kwargs.update(overrides)
+        do_cli(**kwargs)
+
+    def test_interactive_flags_are_rejected_with_json_output(self):
+        # Both --confirm-changeset and --guided need interactive answers a JSON consumer cannot give,
+        # so do_cli must reject either combined with --output json up front (rather than, for
+        # confirm-changeset, emitting CONFIRMATION_REQUIRED and exiting 0 without deploying).
+        with self.assertRaises(click.UsageError):
+            self._do_cli_with(confirm_changeset=True, output="json")
+        with self.assertRaises(click.UsageError):
+            self._do_cli_with(guided=True, output="json")
+
+    @patch("samcli.commands.package.package_context.PackageContext")
+    def test_json_output_emits_terminal_failed_on_unhandled_failure(self, mock_package_context):
+        # A failure the package/deploy steps do not emit their own result for (here a packaging
+        # error) must still terminate the JSON stream with a FAILED result so a consumer can tell
+        # failure from a truncated stream.
+        mock_package_context.return_value.__enter__.return_value.run.side_effect = RuntimeError("boom")
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            with self.assertRaises(RuntimeError):
+                self._do_cli_with(output="json")
+
+        emitted = json.loads(stdout.getvalue().strip().splitlines()[-1])
+        # Matches build's failure shape: status "failure" + structured error {type, message, resources}.
+        # resources is null for deploy (failures are not attributed to specific resources) but the key
+        # is present so a consumer can read error.resources uniformly across commands.
+        self.assertEqual(emitted["type"], "result")
+        self.assertEqual(emitted["status"], "failure")
+        self.assertEqual(emitted["error"]["type"], "RuntimeError")
+        self.assertEqual(emitted["error"]["message"], "boom")
+        self.assertIsNone(emitted["error"]["resources"])
+
+    @patch("samcli.commands.deploy.command.manage_stack")
+    def test_json_output_emits_terminal_failed_when_resolve_s3_fails(self, mock_manage_stack):
+        # --resolve-s3 bucket resolution runs before the package/deploy steps. A failure there must
+        # still terminate the JSON stream with a failure result (regression: the handler used to open
+        # after this block, so a resolve-s3 failure emitted zero JSON lines). --resolve-s3 is common in CI.
+        mock_manage_stack.side_effect = RuntimeError("bucket boom")
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            with self.assertRaises(RuntimeError):
+                self._do_cli_with(output="json", resolve_s3=True, s3_bucket=None)
+
+        emitted = json.loads(stdout.getvalue().strip().splitlines()[-1])
+        self.assertEqual(emitted["type"], "result")
+        self.assertEqual(emitted["status"], "failure")
+        self.assertEqual(emitted["error"]["type"], "RuntimeError")
+        self.assertEqual(emitted["error"]["message"], "bucket boom")
+
+    @patch("samcli.commands.deploy.deploy_context.DeployContext")
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.deploy.command.manage_stack")
+    def test_json_output_resolve_s3_emits_managed_bucket_info_line(
+        self, mock_manage_stack, mock_package_context, mock_deploy_context
+    ):
+        # With --resolve-s3 --output json the resolved bucket name would otherwise be discarded
+        # (manage_stack progress is redirected to devnull). It must surface as a JSON info line so a
+        # CI consumer can learn where its artifacts went.
+        mock_manage_stack.return_value = "sam-managed-bucket-123"
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self._do_cli_with(output="json", resolve_s3=True, s3_bucket=None)
+
+        info_lines = [
+            json.loads(line)
+            for line in stdout.getvalue().strip().splitlines()
+            if json.loads(line).get("type") == "info"
+        ]
+        self.assertEqual(info_lines, [{"type": "info", "managed_s3_bucket": "sam-managed-bucket-123"}])
 
     @patch("samcli.commands.package.command.click")
     @patch("samcli.commands.package.package_context.PackageContext")
@@ -213,8 +343,171 @@ class TestDeployCliCommand(TestCase):
                     config_env=self.config_env,
                     config_file=self.config_file,
                     resolve_image_repos=self.resolve_image_repos,
+                    language_extensions=None,
                     disable_rollback=self.disable_rollback,
+                    on_failure=self.on_failure,
+                    max_wait_duration=self.max_wait_duration,
+                    express=self.express,
+                    output="text",
                 )
+
+    @patch("samcli.commands.package.command.click")
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.deploy.command.click")
+    @patch("samcli.commands.deploy.deploy_context.DeployContext")
+    @patch("samcli.commands.deploy.guided_context.manage_stack")
+    @patch("samcli.commands.deploy.guided_context.auth_per_resource")
+    @patch("samcli.commands.deploy.guided_context.get_template_parameters")
+    @patch("samcli.commands.deploy.guided_context.SamLocalStackProvider.get_stacks")
+    @patch("samcli.commands.deploy.guided_context.SamFunctionProvider")
+    @patch("samcli.commands.deploy.guided_context.signer_config_per_function")
+    @patch.object(GuidedConfig, "get_config_ctx", MagicMock(return_value=(None, get_mock_sam_config())))
+    @patch("samcli.commands.deploy.guided_context.prompt")
+    @patch("samcli.commands.deploy.guided_context.confirm")
+    @patch("samcli.commands.deploy.guided_context.tag_translation")
+    @patch("samcli.commands.deploy.guided_context.sync_ecr_stack")
+    def test_all_args_guided_use_defaults(
+        self,
+        mock_sync_ecr_stack,
+        mock_tag_translation,
+        mock_confirm,
+        mock_prompt,
+        mock_signer_config_per_function,
+        mock_sam_function_provider,
+        mock_get_buildable_stacks,
+        mock_get_template_parameters,
+        mockauth_per_resource,
+        mock_managed_stack,
+        mock_deploy_context,
+        mock_deploy_click,
+        mock_package_context,
+        mock_package_click,
+    ):
+        mock_get_buildable_stacks.return_value = (Mock(), [])
+        mock_tag_translation.return_value = "helloworld-123456-v1"
+
+        context_mock = Mock()
+        function_mock = MagicMock()
+        function_mock.packagetype = IMAGE
+        function_mock.imageuri = "helloworld:v1"
+        function_mock.full_path = "HelloWorldFunction"
+        mock_sam_function_provider.return_value.get_all.return_value = [function_mock]
+        mockauth_per_resource.return_value = [("HelloWorldResource", False)]
+        mock_deploy_context.return_value.__enter__.return_value = context_mock
+        mock_confirm.side_effect = [True, False, True, True, True, True, True]
+        mock_prompt.side_effect = [
+            "sam-app",
+            "us-east-1",
+            "guidedParameter",
+            "secure",
+            ("CAPABILITY_IAM",),
+            "testconfig.toml",
+            "test-env",
+        ]
+
+        mock_get_template_parameters.return_value = {
+            "Myparameter": {"Type": "String"},
+            "MyNoEchoParameter": {"Type": "String", "NoEcho": True},
+        }
+
+        mock_managed_stack.return_value = "managed-s3-bucket"
+        mock_sync_ecr_stack.return_value = {
+            "HelloWorldFunction": "123456789012.dkr.ecr.us-east-1.amazonaws.com/managed-ecr"
+        }
+
+        mock_signer_config_per_function.return_value = ({}, {})
+
+        self.resolve_s3 = True
+        self.resolve_image_repos = True
+        with patch.object(GuidedConfig, "save_config", MagicMock(return_value=True)) as mock_save_config:
+            do_cli(
+                template_file=self.template_file,
+                stack_name=self.stack_name,
+                s3_bucket=None,
+                image_repository=None,
+                image_repositories=None,
+                force_upload=self.force_upload,
+                no_progressbar=self.no_progressbar,
+                s3_prefix=self.s3_prefix,
+                kms_key_id=self.kms_key_id,
+                parameter_overrides=self.parameter_overrides,
+                capabilities=self.capabilities,
+                no_execute_changeset=self.no_execute_changeset,
+                role_arn=self.role_arn,
+                notification_arns=self.notification_arns,
+                fail_on_empty_changeset=self.fail_on_empty_changset,
+                tags=self.tags,
+                region=self.region,
+                profile=self.profile,
+                use_json=self.use_json,
+                metadata=self.metadata,
+                guided=True,
+                confirm_changeset=True,
+                signing_profiles=self.signing_profiles,
+                resolve_s3=self.resolve_s3,
+                config_env=self.config_env,
+                config_file=self.config_file,
+                resolve_image_repos=self.resolve_image_repos,
+                language_extensions=None,
+                disable_rollback=self.disable_rollback,
+                on_failure=self.on_failure,
+                max_wait_duration=self.max_wait_duration,
+                express=self.express,
+            )
+
+            mock_deploy_context.assert_called_with(
+                template_file=ANY,
+                stack_name="sam-app",
+                s3_bucket="managed-s3-bucket",
+                image_repository=None,
+                image_repositories={"HelloWorldFunction": "123456789012.dkr.ecr.us-east-1.amazonaws.com/managed-ecr"},
+                force_upload=self.force_upload,
+                no_progressbar=self.no_progressbar,
+                s3_prefix="sam-app",
+                kms_key_id=self.kms_key_id,
+                parameter_overrides={"Myparameter": "guidedParameter", "MyNoEchoParameter": "secure"},
+                capabilities=self.capabilities,
+                no_execute_changeset=self.no_execute_changeset,
+                role_arn=self.role_arn,
+                notification_arns=self.notification_arns,
+                fail_on_empty_changeset=self.fail_on_empty_changset,
+                tags=self.tags,
+                region="us-east-1",
+                profile=self.profile,
+                confirm_changeset=True,
+                signing_profiles=self.signing_profiles,
+                use_changeset=self.use_changeset,
+                disable_rollback=True,
+                poll_delay=5.0,
+                on_failure=self.on_failure,
+                max_wait_duration=self.max_wait_duration,
+                express=self.express,
+                language_extensions=None,
+                output="text",
+            )
+
+            context_mock.run.assert_called_with()
+            mock_save_config.assert_called_with(
+                {
+                    "Myparameter": {"Value": "guidedParameter", "Hidden": False},
+                    "MyNoEchoParameter": {"Value": "secure", "Hidden": True},
+                },
+                "test-env",
+                "testconfig.toml",
+                capabilities=("CAPABILITY_IAM",),
+                confirm_changeset=True,
+                profile=self.profile,
+                region="us-east-1",
+                resolve_s3=True,
+                resolve_image_repos=True,
+                image_repositories=None,
+                stack_name="sam-app",
+                s3_prefix="sam-app",
+                signing_profiles=self.signing_profiles,
+                disable_rollback=True,
+            )
+            mock_managed_stack.assert_called_with(profile=self.profile, region="us-east-1")
+            self.assertEqual(context_mock.run.call_count, 1)
 
     @patch("samcli.commands.package.command.click")
     @patch("samcli.commands.package.package_context.PackageContext")
@@ -306,7 +599,11 @@ class TestDeployCliCommand(TestCase):
                 config_env=self.config_env,
                 config_file=self.config_file,
                 resolve_image_repos=self.resolve_image_repos,
+                language_extensions=None,
                 disable_rollback=self.disable_rollback,
+                on_failure=self.on_failure,
+                max_wait_duration=self.max_wait_duration,
+                express=self.express,
             )
 
             mock_deploy_context.assert_called_with(
@@ -332,9 +629,17 @@ class TestDeployCliCommand(TestCase):
                 signing_profiles=self.signing_profiles,
                 use_changeset=self.use_changeset,
                 disable_rollback=True,
+                poll_delay=5.0,
+                on_failure=self.on_failure,
+                max_wait_duration=self.max_wait_duration,
+                express=self.express,
+                language_extensions=None,
+                output="text",
             )
 
             context_mock.run.assert_called_with()
+            # The code bucket uses the prompted stack name, not --stack-name
+            self.assertEqual(mock_package_context.call_args.kwargs["web_function_stack_name"], "sam-app")
             mock_save_config.assert_called_with(
                 {
                     "Myparameter": {"Value": "guidedParameter", "Hidden": False},
@@ -346,7 +651,8 @@ class TestDeployCliCommand(TestCase):
                 confirm_changeset=True,
                 profile=self.profile,
                 region="us-east-1",
-                s3_bucket="managed-s3-bucket",
+                resolve_s3=True,
+                resolve_image_repos=False,
                 image_repositories={"HelloWorldFunction": "123456789012.dkr.ecr.us-east-1.amazonaws.com/test1"},
                 stack_name="sam-app",
                 s3_prefix="sam-app",
@@ -449,7 +755,12 @@ class TestDeployCliCommand(TestCase):
             config_env=self.config_env,
             config_file=self.config_file,
             resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
             disable_rollback=self.disable_rollback,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            output="text",
         )
 
         mock_deploy_context.assert_called_with(
@@ -479,20 +790,27 @@ class TestDeployCliCommand(TestCase):
             signing_profiles=self.signing_profiles,
             use_changeset=self.use_changeset,
             disable_rollback=True,
+            poll_delay=5.0,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            language_extensions=None,
+            output="text",
         )
 
         context_mock.run.assert_called_with()
         mock_managed_stack.assert_called_with(profile=self.profile, region="us-east-1")
         self.assertEqual(context_mock.run.call_count, 1)
 
-        self.assertEqual(MOCK_SAM_CONFIG.put.call_count, 9)
+        self.assertEqual(MOCK_SAM_CONFIG.put.call_count, 10)
         self.assertEqual(
             MOCK_SAM_CONFIG.put.call_args_list,
             [
                 call(["deploy"], "parameters", "stack_name", "sam-app", env="test-env"),
-                call(["deploy"], "parameters", "s3_bucket", "managed-s3-bucket", env="test-env"),
+                call(["deploy"], "parameters", "resolve_s3", True, env="test-env"),
                 call(["deploy"], "parameters", "s3_prefix", "sam-app", env="test-env"),
                 call(["deploy"], "parameters", "region", "us-east-1", env="test-env"),
+                call(["global"], "parameters", "region", "us-east-1", env="test-env"),
                 call(["deploy"], "parameters", "confirm_changeset", True, env="test-env"),
                 call(["deploy"], "parameters", "capabilities", "CAPABILITY_IAM", env="test-env"),
                 call(["deploy"], "parameters", "disable_rollback", True, env="test-env"),
@@ -604,7 +922,12 @@ class TestDeployCliCommand(TestCase):
             config_file=self.config_file,
             signing_profiles=self.signing_profiles,
             resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
             disable_rollback=self.disable_rollback,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            output="text",
         )
 
         mock_deploy_context.assert_called_with(
@@ -630,20 +953,27 @@ class TestDeployCliCommand(TestCase):
             signing_profiles=self.signing_profiles,
             use_changeset=self.use_changeset,
             disable_rollback=True,
+            poll_delay=5.0,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            language_extensions=None,
+            output="text",
         )
 
         context_mock.run.assert_called_with()
         mock_managed_stack.assert_called_with(profile=self.profile, region="us-east-1")
         self.assertEqual(context_mock.run.call_count, 1)
 
-        self.assertEqual(MOCK_SAM_CONFIG.put.call_count, 9)
+        self.assertEqual(MOCK_SAM_CONFIG.put.call_count, 10)
         self.assertEqual(
             MOCK_SAM_CONFIG.put.call_args_list,
             [
                 call(["deploy"], "parameters", "stack_name", "sam-app", env="test-env"),
-                call(["deploy"], "parameters", "s3_bucket", "managed-s3-bucket", env="test-env"),
+                call(["deploy"], "parameters", "resolve_s3", True, env="test-env"),
                 call(["deploy"], "parameters", "s3_prefix", "sam-app", env="test-env"),
                 call(["deploy"], "parameters", "region", "us-east-1", env="test-env"),
+                call(["global"], "parameters", "region", "us-east-1", env="test-env"),
                 call(["deploy"], "parameters", "confirm_changeset", True, env="test-env"),
                 call(["deploy"], "parameters", "capabilities", "CAPABILITY_IAM", env="test-env"),
                 call(["deploy"], "parameters", "disable_rollback", True, env="test-env"),
@@ -711,7 +1041,6 @@ class TestDeployCliCommand(TestCase):
         mock_signer_config_per_function.return_value = ({}, {})
 
         with patch.object(GuidedConfig, "save_config", MagicMock(return_value=False)) as mock_save_config:
-
             do_cli(
                 template_file=self.template_file,
                 stack_name=self.stack_name,
@@ -740,7 +1069,11 @@ class TestDeployCliCommand(TestCase):
                 config_env=self.config_env,
                 signing_profiles=self.signing_profiles,
                 resolve_image_repos=self.resolve_image_repos,
+                language_extensions=None,
                 disable_rollback=self.disable_rollback,
+                on_failure=self.on_failure,
+                max_wait_duration=self.max_wait_duration,
+                express=self.express,
             )
 
             mock_deploy_context.assert_called_with(
@@ -766,6 +1099,12 @@ class TestDeployCliCommand(TestCase):
                 signing_profiles=self.signing_profiles,
                 use_changeset=self.use_changeset,
                 disable_rollback=self.disable_rollback,
+                poll_delay=5.0,
+                on_failure=self.on_failure,
+                max_wait_duration=self.max_wait_duration,
+                express=self.express,
+                language_extensions=None,
+                output="text",
             )
 
             context_mock.run.assert_called_with()
@@ -813,7 +1152,12 @@ class TestDeployCliCommand(TestCase):
             config_env=self.config_env,
             signing_profiles=self.signing_profiles,
             resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
             disable_rollback=self.disable_rollback,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            output="text",
         )
 
         mock_deploy_context.assert_called_with(
@@ -839,6 +1183,12 @@ class TestDeployCliCommand(TestCase):
             signing_profiles=self.signing_profiles,
             use_changeset=self.use_changeset,
             disable_rollback=self.disable_rollback,
+            poll_delay=5,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            language_extensions=None,
+            output="text",
         )
 
         context_mock.run.assert_called_with()
@@ -874,7 +1224,11 @@ class TestDeployCliCommand(TestCase):
                 config_env=self.config_env,
                 signing_profiles=self.signing_profiles,
                 resolve_image_repos=self.resolve_image_repos,
+                language_extensions=None,
                 disable_rollback=self.disable_rollback,
+                on_failure=self.on_failure,
+                max_wait_duration=self.max_wait_duration,
+                express=self.express,
             )
 
     @patch("samcli.commands.package.command.click")
@@ -924,7 +1278,12 @@ class TestDeployCliCommand(TestCase):
             config_env=self.config_env,
             signing_profiles=self.signing_profiles,
             resolve_image_repos=True,
+            language_extensions=None,
             disable_rollback=self.disable_rollback,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            output="text",
         )
 
         mock_deploy_context.assert_called_with(
@@ -950,6 +1309,115 @@ class TestDeployCliCommand(TestCase):
             signing_profiles=self.signing_profiles,
             use_changeset=True,
             disable_rollback=self.disable_rollback,
+            poll_delay=5.0,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            language_extensions=None,
+            output="text",
+        )
+
+        context_mock.run.assert_called_with()
+        self.assertEqual(context_mock.run.call_count, 1)
+
+    @patch("os.environ", {**os.environ, "SAM_CLI_POLL_DELAY": 10})  # type: ignore
+    @patch("samcli.commands.package.command.click")
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.deploy.command.click")
+    @patch("samcli.commands.deploy.deploy_context.DeployContext")
+    def test_passing_parameter_overrides_to_context(
+        self, mock_deploy_context, mock_deploy_click, mock_package_context, mock_package_click
+    ):
+        context_mock = Mock()
+        mock_deploy_context.return_value.__enter__.return_value = context_mock
+
+        do_cli(
+            template_file=self.template_file,
+            stack_name=self.stack_name,
+            s3_bucket=self.s3_bucket,
+            image_repository=self.image_repository,
+            image_repositories=None,
+            force_upload=self.force_upload,
+            no_progressbar=self.no_progressbar,
+            s3_prefix=self.s3_prefix,
+            kms_key_id=self.kms_key_id,
+            parameter_overrides=self.parameter_overrides,
+            capabilities=self.capabilities,
+            no_execute_changeset=self.no_execute_changeset,
+            role_arn=self.role_arn,
+            notification_arns=self.notification_arns,
+            fail_on_empty_changeset=self.fail_on_empty_changset,
+            tags=self.tags,
+            region=self.region,
+            profile=self.profile,
+            use_json=self.use_json,
+            metadata=self.metadata,
+            guided=self.guided,
+            confirm_changeset=self.confirm_changeset,
+            signing_profiles=self.signing_profiles,
+            resolve_s3=self.resolve_s3,
+            config_env=self.config_env,
+            config_file=self.config_file,
+            resolve_image_repos=self.resolve_image_repos,
+            language_extensions=None,
+            disable_rollback=self.disable_rollback,
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            output="text",
+        )
+
+        mock_deploy_context.assert_called_with(
+            template_file=ANY,
+            stack_name=self.stack_name,
+            s3_bucket=self.s3_bucket,
+            image_repository=self.image_repository,
+            image_repositories=None,
+            force_upload=self.force_upload,
+            no_progressbar=self.no_progressbar,
+            s3_prefix=self.s3_prefix,
+            kms_key_id=self.kms_key_id,
+            parameter_overrides=self.parameter_overrides,
+            capabilities=self.capabilities,
+            no_execute_changeset=self.no_execute_changeset,
+            role_arn=self.role_arn,
+            notification_arns=self.notification_arns,
+            fail_on_empty_changeset=self.fail_on_empty_changset,
+            tags=self.tags,
+            region=self.region,
+            profile=self.profile,
+            confirm_changeset=self.confirm_changeset,
+            signing_profiles=self.signing_profiles,
+            use_changeset=self.use_changeset,
+            disable_rollback=self.disable_rollback,
+            poll_delay=os.getenv("SAM_CLI_POLL_DELAY"),
+            on_failure=self.on_failure,
+            max_wait_duration=self.max_wait_duration,
+            express=self.express,
+            language_extensions=None,
+            output="text",
+        )
+
+        mock_package_context.assert_called_with(
+            template_file=ANY,
+            s3_bucket=self.s3_bucket,
+            s3_prefix=self.s3_prefix,
+            image_repository=self.image_repository,
+            image_repositories=None,
+            output_template_file=ANY,
+            kms_key_id=self.kms_key_id,
+            use_json=self.use_json,
+            force_upload=self.force_upload,
+            no_progressbar=self.no_progressbar,
+            metadata=self.metadata,
+            on_deploy=True,
+            region=self.region,
+            profile=self.profile,
+            signing_profiles=self.signing_profiles,
+            parameter_overrides=self.parameter_overrides,
+            language_extensions=None,
+            output="text",
+            web_function_stack_name=None,
         )
 
         context_mock.run.assert_called_with()

@@ -241,6 +241,10 @@
           "type": "string",
           "default": "path/to/resource"
         },
+        "querystringparameters": {
+          "type": "dict",
+          "default": "{\"foo\": \"bar\"}"
+        },
         "account-id": {
           "default": "123456789012"
         },
@@ -917,6 +921,19 @@
     }
   },
   "s3": {
+    "batch-invocation": {
+      "filename": "S3BatchInvocation",
+      "help": "Generates an Amazon S3 Batch Operations Invocation Event",
+      "tags": {
+        "bucket-arn": {
+          "default": "arn:aws:s3:::examplebucket"
+        },
+        "key": {
+          "default": "test/key",
+          "encoding": "url"
+        }
+      }
+    },
     "delete": {
       "filename": "S3Delete",
       "help": "Generates an Amazon S3 Delete Event",

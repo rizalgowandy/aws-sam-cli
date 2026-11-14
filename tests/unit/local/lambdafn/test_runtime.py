@@ -2,19 +2,31 @@
 Unit tests for Lambda runtime
 """
 
+import threading
+import time
 from unittest import TestCase
-from unittest.mock import Mock, patch, MagicMock, ANY, call
+from unittest.mock import Mock, patch, MagicMock, ANY, call, PropertyMock
 from parameterized import parameterized
 
 from samcli.lib.utils.packagetype import ZIP, IMAGE
 from samcli.lib.providers.provider import LayerVersion
 from samcli.local.lambdafn.env_vars import EnvironmentVariables
-from samcli.local.lambdafn.runtime import LambdaRuntime, _unzip_file, WarmLambdaRuntime, _require_container_reloading
+from samcli.local.lambdafn.runtime import (
+    LambdaRuntime,
+    _unzip_file,
+    WarmLambdaRuntime,
+    _require_container_reloading,
+    _should_reload_container,
+)
 from samcli.local.lambdafn.config import FunctionConfig
+from samcli.local.docker.container import ContainerContext
+from samcli.commands.local.lib.debug_context import DebugContext
+from samcli.local.docker.durable_lambda_container import DurableLambdaContainer
+from samcli.local.docker.exceptions import ContainerCreationFailedException, ContainerFailureError
+from samcli.local.lambdafn.exceptions import UnsupportedInvocationType
 
 
 class LambdaRuntime_create(TestCase):
-
     DEFAULT_MEMORY = 128
     DEFAULT_TIMEOUT = 3
 
@@ -49,8 +61,9 @@ class LambdaRuntime_create(TestCase):
         self.env_var_value = {"a": "b"}
         self.env_vars.resolve.return_value = self.env_var_value
 
+    @patch("samcli.local.lambdafn.runtime.LOG")
     @patch("samcli.local.lambdafn.runtime.LambdaContainer")
-    def test_must_create_lambda_container(self, LambdaContainerMock):
+    def test_must_create_lambda_container(self, LambdaContainerMock, LogMock):
         code_dir = "some code dir"
 
         container = Mock()
@@ -66,6 +79,8 @@ class LambdaRuntime_create(TestCase):
         LambdaContainerMock.return_value = container
 
         self.runtime.create(self.func_config, debug_context=debug_options)
+
+        LogMock.assert_not_called()
 
         # Make sure env-vars get resolved
         self.env_vars.resolve.assert_called_with()
@@ -89,10 +104,132 @@ class LambdaRuntime_create(TestCase):
             memory_mb=self.DEFAULT_MEMORY,
             container_host=None,
             container_host_interface=None,
+            extra_hosts=None,
             function_full_path=self.full_path,
+            mount_symlinks=False,
+            container_dns=None,
         )
         # Run the container and get results
-        self.manager_mock.create.assert_called_with(container)
+        self.manager_mock.create.assert_called_with(container, ContainerContext.INVOKE)
+
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    @patch("samcli.local.lambdafn.runtime.DurableLambdaContainer")
+    def test_must_create_durable_lambda_container_when_durable_config_present(
+        self, DurableLambdaContainerMock, LogMock
+    ):
+        code_dir = "some code dir"
+
+        container = Mock()
+        debug_options = Mock()
+        lambda_image_mock = Mock()
+        durable_config = {"ExecutionTimeout": 300, "RetentionPeriodInDays": 7}
+
+        # Create function config with durable config
+        func_config_with_durable = FunctionConfig(
+            self.name,
+            self.full_path,
+            self.lang,
+            self.handler,
+            self.imageuri,
+            self.imageconfig,
+            self.packagetype,
+            self.code_path,
+            self.layers,
+            self.architecture,
+            durable_config=durable_config,
+        )
+        func_config_with_durable.env_vars = self.env_vars
+
+        self.runtime = LambdaRuntime(self.manager_mock, lambda_image_mock)
+
+        mock_emulator = Mock()
+        self.runtime.get_or_create_emulator_container = Mock(return_value=mock_emulator)
+
+        # Using MagicMock to mock the context manager
+        self.runtime._get_code_dir = MagicMock()
+        self.runtime._get_code_dir.return_value = code_dir
+
+        DurableLambdaContainerMock.return_value = container
+
+        self.runtime.create(func_config_with_durable, debug_context=debug_options)
+
+        # Make sure DurableLambdaContainer is created with proper values
+        DurableLambdaContainerMock.assert_called_once_with(
+            self.lang,
+            self.imageuri,
+            self.handler,
+            self.packagetype,
+            self.imageconfig,
+            code_dir,
+            self.layers,
+            lambda_image_mock,
+            self.architecture,
+            emulator_container=mock_emulator,
+            durable_config=durable_config,
+            is_warm_runtime=False,
+            memory_mb=self.DEFAULT_MEMORY,
+            env_vars=self.env_var_value,
+            debug_options=debug_options,
+            container_host=None,
+            container_host_interface=None,
+            extra_hosts=None,
+            function_full_path=self.full_path,
+            mount_symlinks=False,
+            container_dns=None,
+        )
+        # Run the container and get results
+        self.manager_mock.create.assert_called_with(container, ContainerContext.INVOKE)
+
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    @patch("samcli.local.lambdafn.runtime.LambdaContainer")
+    def test_must_create_lambda_container_without_mem_limit(self, LambdaContainerMock, LogMock):
+        code_dir = "some code dir"
+
+        container = Mock()
+        debug_options = Mock()
+        lambda_image_mock = Mock()
+
+        self.runtime = LambdaRuntime(self.manager_mock, lambda_image_mock, no_mem_limit=True)
+
+        # Using MagicMock to mock the context manager
+        self.runtime._get_code_dir = MagicMock()
+        self.runtime._get_code_dir.return_value = code_dir
+
+        LambdaContainerMock.return_value = container
+
+        self.runtime.create(self.func_config, debug_context=debug_options)
+
+        LogMock.assert_not_called()
+
+        # Make sure env-vars get resolved
+        self.env_vars.resolve.assert_called_with()
+
+        # Make sure the context manager is called to return the code directory
+        self.runtime._get_code_dir.assert_called_with(self.code_path)
+
+        # Make sure the container is created with proper values
+        LambdaContainerMock.assert_called_with(
+            self.lang,
+            self.imageuri,
+            self.handler,
+            self.packagetype,
+            self.imageconfig,
+            code_dir,
+            self.layers,
+            lambda_image_mock,
+            self.architecture,
+            debug_options=debug_options,
+            env_vars=self.env_var_value,
+            memory_mb=None,  # No memory limit
+            container_host=None,
+            container_host_interface=None,
+            extra_hosts=None,
+            function_full_path=self.full_path,
+            mount_symlinks=False,
+            container_dns=None,
+        )
+        # Run the container and get results
+        self.manager_mock.create.assert_called_with(container, ContainerContext.INVOKE)
 
     @patch("samcli.local.lambdafn.runtime.LambdaContainer")
     def test_keyboard_interrupt_must_raise(self, LambdaContainerMock):
@@ -115,9 +252,60 @@ class LambdaRuntime_create(TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.runtime.create(self.func_config, debug_context=debug_options)
 
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    @patch("samcli.local.lambdafn.runtime.LambdaContainer")
+    def test_must_log_if_template_has_runtime_version(self, LambdaContainerMock, LogMock):
+        code_dir = "some code dir"
+
+        container = Mock()
+        debug_options = Mock()
+        lambda_image_mock = Mock()
+
+        self.runtime = LambdaRuntime(self.manager_mock, lambda_image_mock, mount_symlinks=True)
+
+        # Using MagicMock to mock the context manager
+        self.runtime._get_code_dir = MagicMock()
+        self.runtime._get_code_dir.return_value = code_dir
+
+        LambdaContainerMock.return_value = container
+        self.func_config.runtime_management_config = dict(RuntimeVersionArn="runtime_version")
+        self.runtime.create(self.func_config, debug_context=debug_options)
+        LogMock.info.assert_called_once()
+        # It shows a warning
+        self.assertIn("This function will be invoked using the latest available runtime", LogMock.info.call_args[0][0])
+
+        # Make sure env-vars get resolved
+        self.env_vars.resolve.assert_called_with()
+
+        # Make sure the context manager is called to return the code directory
+        self.runtime._get_code_dir.assert_called_with(self.code_path)
+
+        # Make sure the container is created with proper values
+        LambdaContainerMock.assert_called_with(
+            self.lang,
+            self.imageuri,
+            self.handler,
+            self.packagetype,
+            self.imageconfig,
+            code_dir,
+            self.layers,
+            lambda_image_mock,
+            self.architecture,
+            debug_options=debug_options,
+            env_vars=self.env_var_value,
+            memory_mb=self.DEFAULT_MEMORY,
+            container_host=None,
+            container_host_interface=None,
+            extra_hosts=None,
+            function_full_path=self.full_path,
+            mount_symlinks=True,
+            container_dns=None,
+        )
+        # Run the container and get results
+        self.manager_mock.create.assert_called_with(container, ContainerContext.INVOKE)
+
 
 class LambdaRuntime_run(TestCase):
-
     DEFAULT_MEMORY = 128
     DEFAULT_TIMEOUT = 3
 
@@ -160,7 +348,7 @@ class LambdaRuntime_run(TestCase):
         self.runtime = LambdaRuntime(self.manager_mock, lambda_image_mock)
 
         self.runtime.run(container, self.func_config, debug_context=debug_options)
-        self.manager_mock.run.assert_called_with(container)
+        self.manager_mock.run.assert_called_with(container, ContainerContext.INVOKE)
 
     def test_must_create_container_first_if_passed_container_is_none(self):
         container = Mock()
@@ -174,8 +362,15 @@ class LambdaRuntime_run(TestCase):
         create_mock.return_value = container
 
         self.runtime.run(None, self.func_config, debug_context=debug_options)
-        create_mock.assert_called_with(self.func_config, debug_options, None, None)
-        self.manager_mock.run.assert_called_with(container)
+        create_mock.assert_called_with(
+            function_config=self.func_config,
+            debug_context=debug_options,
+            container_host=None,
+            container_host_interface=None,
+            extra_hosts=None,
+            container_dns=None,
+        )
+        self.manager_mock.run.assert_called_with(container, ContainerContext.INVOKE)
 
     def test_must_skip_run_running_container(self):
         container = Mock()
@@ -203,12 +398,10 @@ class LambdaRuntime_run(TestCase):
 
 
 class LambdaRuntime_invoke(TestCase):
-
     DEFAULT_MEMORY = 128
     DEFAULT_TIMEOUT = 3
 
     def setUp(self):
-
         self.manager_mock = Mock()
 
         self.name = "name"
@@ -246,7 +439,7 @@ class LambdaRuntime_invoke(TestCase):
         stdout = "stdout"
         stderr = "stderr"
         container = Mock()
-        timer = Mock()
+        start_timer = Mock()
         debug_options = Mock()
         lambda_image_mock = Mock()
 
@@ -260,7 +453,9 @@ class LambdaRuntime_invoke(TestCase):
 
         # Configure interrupt handler
         self.runtime._configure_interrupt = Mock()
-        self.runtime._configure_interrupt.return_value = timer
+        self.runtime._configure_interrupt.return_value = start_timer
+
+        self.runtime._check_exit_state = Mock()
 
         LambdaContainerMock.return_value = container
         container.is_running.return_value = False
@@ -289,18 +484,20 @@ class LambdaRuntime_invoke(TestCase):
             memory_mb=self.DEFAULT_MEMORY,
             container_host=None,
             container_host_interface=None,
+            extra_hosts=None,
             function_full_path=self.full_path,
+            mount_symlinks=False,
+            container_dns=None,
         )
 
         # Run the container and get results
-        self.manager_mock.run.assert_called_with(container)
+        self.manager_mock.run.assert_called_with(container, ContainerContext.INVOKE)
         self.runtime._configure_interrupt.assert_called_with(self.full_path, self.DEFAULT_TIMEOUT, container, True)
         container.wait_for_result.assert_called_with(
-            event=event, full_path=self.full_path, stdout=stdout, stderr=stderr
+            event=event, full_path=self.full_path, stdout=stdout, stderr=stderr, start_timer=start_timer, tenant_id=None
         )
 
         # Finally block
-        timer.cancel.assert_called_with()
         self.manager_mock.stop.assert_called_with(container)
         self.runtime._clean_decompressed_paths.assert_called_with()
 
@@ -311,7 +508,7 @@ class LambdaRuntime_invoke(TestCase):
         stdout = "stdout"
         stderr = "stderr"
         container = Mock()
-        timer = Mock()
+        start_timer = Mock()
         layer_downloader = Mock()
 
         self.runtime = LambdaRuntime(self.manager_mock, layer_downloader)
@@ -320,7 +517,10 @@ class LambdaRuntime_invoke(TestCase):
         self.runtime._get_code_dir = MagicMock()
         self.runtime._get_code_dir.return_value = code_dir
         self.runtime._configure_interrupt = Mock()
-        self.runtime._configure_interrupt.return_value = timer
+        self.runtime._configure_interrupt.return_value = start_timer
+        self.runtime._lock = MagicMock()
+
+        self.runtime._check_exit_state = Mock()
 
         LambdaContainerMock.return_value = container
         container.is_running.return_value = False
@@ -331,13 +531,11 @@ class LambdaRuntime_invoke(TestCase):
             self.runtime.invoke(self.func_config, event, debug_context=None, stdout=stdout, stderr=stderr)
 
         # Run the container and get results
-        self.manager_mock.run.assert_called_with(container)
+        self.manager_mock.run.assert_called_with(container, ContainerContext.INVOKE)
 
         self.runtime._configure_interrupt.assert_not_called()
 
         # Finally block must be called
-        # But timer was not yet created. It should not be called
-        timer.cancel.assert_not_called()
         # In any case, stop the container
         self.manager_mock.stop.assert_called_with(container)
 
@@ -359,6 +557,8 @@ class LambdaRuntime_invoke(TestCase):
         self.runtime._get_code_dir.return_value = code_dir
         self.runtime._configure_interrupt = Mock()
         self.runtime._configure_interrupt.return_value = timer
+        self.runtime._check_exit_state = Mock()
+        self.runtime._lock = MagicMock()
 
         LambdaContainerMock.return_value = container
         container.is_running.return_value = False
@@ -369,13 +569,11 @@ class LambdaRuntime_invoke(TestCase):
             self.runtime.invoke(self.func_config, event, debug_context=debug_options, stdout=stdout, stderr=stderr)
 
         # Run the container and get results
-        self.manager_mock.run.assert_called_with(container)
+        self.manager_mock.run.assert_called_with(container, ContainerContext.INVOKE)
 
         self.runtime._configure_interrupt.assert_called_with(self.full_path, self.DEFAULT_TIMEOUT, container, True)
 
         # Finally block must be called
-        # Timer was created. So it must be cancelled
-        timer.cancel.assert_called_with()
         # In any case, stop the container
         self.manager_mock.stop.assert_called_with(container)
 
@@ -394,6 +592,8 @@ class LambdaRuntime_invoke(TestCase):
         self.runtime._get_code_dir = MagicMock()
         self.runtime._get_code_dir.return_value = code_dir
         self.runtime._configure_interrupt = Mock()
+        self.runtime._check_exit_state = Mock()
+        self.runtime._lock = MagicMock()
 
         LambdaContainerMock.return_value = container
         container.is_running.return_value = False
@@ -403,12 +603,132 @@ class LambdaRuntime_invoke(TestCase):
         self.runtime.invoke(self.func_config, event, stdout=stdout, stderr=stderr)
 
         # Run the container and get results
-        self.manager_mock.run.assert_called_with(container)
+        self.manager_mock.run.assert_called_with(container, ContainerContext.INVOKE)
 
         self.runtime._configure_interrupt.assert_not_called()
 
         # Finally block must be called
         self.manager_mock.stop.assert_called_with(container)
+
+    def test_durable_execution_calls_wait_for_result_and_skips_cleanup(self):
+        """Test that durable execution passes correct arguments to wait_for_result and skips container cleanup"""
+        event = "event"
+        code_dir = "some code dir"
+        stdout = "stdout"
+        stderr = "stderr"
+        container = Mock(spec=DurableLambdaContainer)
+        start_timer = Mock()
+        lambda_image_mock = Mock()
+        durable_execution_name = "test-execution"
+        invocation_type = "RequestResponse"
+
+        durable_config = {"ExecutionTimeout": 300, "RetentionPeriodInDays": 7}
+        func_config_with_durable = FunctionConfig(
+            self.name,
+            self.full_path,
+            self.lang,
+            self.handler,
+            self.imageuri,
+            self.imageconfig,
+            self.packagetype,
+            self.code_path,
+            self.layers,
+            self.architecture,
+            durable_config=durable_config,
+        )
+        func_config_with_durable.env_vars = self.env_vars
+
+        self.runtime = LambdaRuntime(self.manager_mock, lambda_image_mock)
+        self.runtime._get_code_dir = MagicMock(return_value=code_dir)
+        self.runtime._configure_interrupt = Mock(return_value=start_timer)
+        self.runtime._check_exit_state = Mock()
+        self.runtime._clean_decompressed_paths = MagicMock()
+
+        mock_emulator = Mock()
+        self.runtime.get_or_create_emulator_container = Mock(return_value=mock_emulator)
+        self.runtime.create = Mock(return_value=container)
+        self.runtime.run = Mock(return_value=container)
+
+        container.is_running.return_value = False
+        container.wait_for_result.return_value = {"X-Amz-Durable-Execution-Arn": "test-arn"}
+
+        headers = self.runtime.invoke(
+            func_config_with_durable,
+            event,
+            invocation_type=invocation_type,
+            durable_execution_name=durable_execution_name,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        container.wait_for_result.assert_called_with(
+            event=event,
+            full_path=self.full_path,
+            stdout=stdout,
+            stderr=stderr,
+            start_timer=start_timer,
+            durable_execution_name=durable_execution_name,
+            invocation_type=invocation_type,
+        )
+        self.assertIsNotNone(headers)
+        self.assertEqual(headers["X-Amz-Durable-Execution-Arn"], "test-arn")
+        self.runtime._check_exit_state.assert_called_with(container)
+
+    @patch("samcli.local.lambdafn.runtime.LambdaContainer")
+    def test_unsupported_invocation_type_raises_exception(self, LambdaContainerMock):
+        """Test that unsupported invocation types raise UnsupportedInvocationType for regular Lambda functions"""
+        event = "event"
+        code_dir = "some code dir"
+        stdout = "stdout"
+        stderr = "stderr"
+        container = Mock()
+        start_timer = Mock()
+        debug_options = Mock()
+        lambda_image_mock = Mock()
+        unsupported_invocation_type = "DryRun"  # An unsupported invocation type
+
+        self.runtime = LambdaRuntime(self.manager_mock, lambda_image_mock)
+
+        # Using MagicMock to mock the context manager
+        self.runtime._get_code_dir = MagicMock()
+        self.runtime._get_code_dir.return_value = code_dir
+
+        self.runtime._clean_decompressed_paths = MagicMock()
+
+        # Configure interrupt handler
+        self.runtime._configure_interrupt = Mock()
+        self.runtime._configure_interrupt.return_value = start_timer
+
+        self.runtime._check_exit_state = Mock()
+
+        # Mock create and run to return the container
+        self.runtime.create = Mock(return_value=container)
+        self.runtime.run = Mock(return_value=container)
+
+        LambdaContainerMock.return_value = container
+        container.is_running.return_value = False
+
+        # Regular LambdaContainer (not DurableLambdaContainer) should raise exception for unsupported types
+        with self.assertRaises(UnsupportedInvocationType) as context:
+            self.runtime.invoke(
+                self.func_config,
+                event,
+                debug_context=debug_options,
+                stdout=stdout,
+                stderr=stderr,
+                invocation_type=unsupported_invocation_type,
+            )
+
+        # Verify the exception message
+        self.assertIn("invocation-type: DryRun is not supported", str(context.exception))
+        self.assertIn("Only Event and RequestResponse are supported", str(context.exception))
+
+        # Verify that wait_for_result was not called due to the exception
+        container.wait_for_result.assert_not_called()
+
+        # Verify cleanup was still called
+        self.manager_mock.stop.assert_called_with(container)
+        self.runtime._clean_decompressed_paths.assert_called_with()
 
 
 class TestLambdaRuntime_configure_interrupt(TestCase):
@@ -428,9 +748,10 @@ class TestLambdaRuntime_configure_interrupt(TestCase):
         timer_obj = Mock()
         ThreadingMock.Timer.return_value = timer_obj
 
-        result = self.runtime._configure_interrupt(self.name, self.timeout, self.container, is_debugging)
+        result_start_timer = self.runtime._configure_interrupt(self.name, self.timeout, self.container, is_debugging)
+        result_timer = result_start_timer()
 
-        self.assertEqual(result, timer_obj)
+        self.assertEqual(result_timer, timer_obj)
 
         ThreadingMock.Timer.assert_called_with(self.timeout, ANY, ())
         timer_obj.start.assert_called_with()
@@ -482,7 +803,8 @@ class TestLambdaRuntime_configure_interrupt(TestCase):
         # Fake the real method with a Lambda. Also run the handler immediately.
         ThreadingMock.Timer = fake_timer
 
-        self.runtime._configure_interrupt(self.name, self.timeout, self.container, is_debugging)
+        start_timer = self.runtime._configure_interrupt(self.name, self.timeout, self.container, is_debugging)
+        start_timer()
 
         # This method should be called from within the Timer Handler
         self.manager_mock.stop.assert_called_with(self.container)
@@ -508,7 +830,7 @@ class TestLambdaRuntime_get_code_dir(TestCase):
         result = self.runtime._get_code_dir(code_path)
         self.assertEqual(result, decompressed_dir)
 
-        unzip_file_mock.assert_called_with(code_path)
+        unzip_file_mock.assert_called_with(code_path, mount_symlinks=False)
         os_mock.path.isfile.assert_called_with(code_path)
 
     @patch("samcli.local.lambdafn.runtime.os")
@@ -531,6 +853,46 @@ class TestLambdaRuntime_get_code_dir(TestCase):
 
         # Because we never unzipped anything, we should never delete
         shutil_mock.rmtree.assert_not_called()
+
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    @patch("samcli.local.lambdafn.runtime.os")
+    @patch("samcli.local.lambdafn.runtime.shutil")
+    @patch("samcli.local.lambdafn.runtime._unzip_file")
+    def test_must_warn_when_code_path_does_not_exist(self, unzip_file_mock, shutil_mock, os_mock, log_mock):
+        """
+        Input is a path that does not exist on the local machine
+        """
+        code_path = "/nonexistent/path"
+
+        os_mock.path.exists.return_value = False
+        os_mock.path.isfile.return_value = False
+
+        result = self.runtime._get_code_dir(code_path)
+        # code path must still be returned as is
+        self.assertEqual(result, code_path)
+
+        unzip_file_mock.assert_not_called()
+        log_mock.warning.assert_called_once()
+        # The warning must include the offending path
+        self.assertIn(code_path, log_mock.warning.call_args[0])
+
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    @patch("samcli.local.lambdafn.runtime.os")
+    @patch("samcli.local.lambdafn.runtime.shutil")
+    @patch("samcli.local.lambdafn.runtime._unzip_file")
+    def test_must_not_warn_when_code_path_exists(self, unzip_file_mock, shutil_mock, os_mock, log_mock):
+        """
+        Input is a directory that exists, no warning must be logged
+        """
+        code_path = "codedir"
+
+        os_mock.path.exists.return_value = True
+        os_mock.path.isfile.return_value = False
+
+        result = self.runtime._get_code_dir(code_path)
+        self.assertEqual(result, code_path)
+
+        log_mock.warning.assert_not_called()
 
 
 class TestLambdaRuntime_unarchived_layer(TestCase):
@@ -556,12 +918,10 @@ class TestLambdaRuntime_unarchived_layer(TestCase):
 
 
 class TestWarmLambdaRuntime_invoke(TestCase):
-
     DEFAULT_MEMORY = 128
     DEFAULT_TIMEOUT = 3
 
     def setUp(self):
-
         self.manager_mock = Mock()
 
         self.name = "name"
@@ -602,7 +962,7 @@ class TestWarmLambdaRuntime_invoke(TestCase):
         stdout = "stdout"
         stderr = "stderr"
         container = Mock()
-        timer = Mock()
+        start_timer = Mock()
         debug_options = Mock()
         debug_options.debug_function = self.name
         lambda_image_mock = Mock()
@@ -615,7 +975,7 @@ class TestWarmLambdaRuntime_invoke(TestCase):
 
         # Configure interrupt handler
         self.runtime._configure_interrupt = Mock()
-        self.runtime._configure_interrupt.return_value = timer
+        self.runtime._configure_interrupt.return_value = start_timer
 
         LambdaContainerMock.return_value = container
         container.is_running.return_value = False
@@ -647,18 +1007,20 @@ class TestWarmLambdaRuntime_invoke(TestCase):
             memory_mb=self.DEFAULT_MEMORY,
             container_host=None,
             container_host_interface=None,
+            extra_hosts=None,
             function_full_path=self.full_path,
+            mount_symlinks=False,
+            container_dns=None,
         )
 
         # Run the container and get results
-        self.manager_mock.run.assert_called_with(container)
+        self.manager_mock.run.assert_called_with(container, ContainerContext.INVOKE)
         self.runtime._configure_interrupt.assert_called_with(self.full_path, self.DEFAULT_TIMEOUT, container, True)
         container.wait_for_result.assert_called_with(
-            event=event, full_path=self.full_path, stdout=stdout, stderr=stderr
+            event=event, full_path=self.full_path, stdout=stdout, stderr=stderr, start_timer=start_timer, tenant_id=None
         )
 
         # Finally block
-        timer.cancel.assert_called_with()
         self.manager_mock.stop.assert_not_called()
 
 
@@ -749,10 +1111,13 @@ class TestWarmLambdaRuntime_create(TestCase):
             memory_mb=self.DEFAULT_MEMORY,
             container_host=None,
             container_host_interface=None,
+            extra_hosts=None,
             function_full_path=self.full_path,
+            mount_symlinks=False,
+            container_dns=None,
         )
 
-        self.manager_mock.create.assert_called_with(container)
+        self.manager_mock.create.assert_called_with(container, ContainerContext.INVOKE)
         # validate that the created container got cached
         self.assertEqual(self.runtime._containers[self.full_path], container)
         lambda_function_observer_mock.watch.assert_called_with(self.func_config)
@@ -795,7 +1160,10 @@ class TestWarmLambdaRuntime_create(TestCase):
                     memory_mb=self.DEFAULT_MEMORY,
                     container_host=None,
                     container_host_interface=None,
+                    extra_hosts=None,
                     function_full_path=self.full_path,
+                    mount_symlinks=False,
+                    container_dns=None,
                 ),
                 call(
                     self.lang,
@@ -812,12 +1180,17 @@ class TestWarmLambdaRuntime_create(TestCase):
                     memory_mb=self.DEFAULT_MEMORY,
                     container_host=None,
                     container_host_interface=None,
+                    extra_hosts=None,
                     function_full_path=self.full_path,
+                    mount_symlinks=False,
+                    container_dns=None,
                 ),
             ]
         )
 
-        self.manager_mock.create.assert_has_calls([call(container), call(container2)])
+        self.manager_mock.create.assert_has_calls(
+            [call(container, ContainerContext.INVOKE), call(container2, ContainerContext.INVOKE)]
+        )
         self.manager_mock.stop.assert_called_with(container)
         # validate that the created container got cached
         self.assertEqual(self.runtime._containers[self.full_path], container2)
@@ -839,11 +1212,19 @@ class TestWarmLambdaRuntime_create(TestCase):
         self.runtime._get_code_dir.return_value = code_dir
 
         LambdaContainerMock.return_value = container
-        self.runtime.create(self.func_config, debug_context=debug_options)
+
+        # Mock the container's is_created method and debug_options property
+        container.is_created.return_value = True
+        container.debug_options = debug_options
+
+        # First call - creates container
+        first_result = self.runtime.create(self.func_config, debug_context=debug_options)
+
+        # Second call - should reuse existing container since debug_context matches
         result = self.runtime.create(self.func_config, debug_context=debug_options)
 
         # validate that the manager.create method got called only one time
-        self.manager_mock.create.assert_called_once_with(container)
+        self.manager_mock.create.assert_called_once_with(container, ContainerContext.INVOKE)
         self.assertEqual(result, container)
 
     @patch("samcli.local.lambdafn.runtime.LambdaFunctionObserver")
@@ -883,11 +1264,62 @@ class TestWarmLambdaRuntime_create(TestCase):
             memory_mb=self.DEFAULT_MEMORY,
             container_host=None,
             container_host_interface=None,
+            extra_hosts=None,
             function_full_path=self.full_path,
+            mount_symlinks=False,
+            container_dns=None,
         )
-        self.manager_mock.create.assert_called_with(container)
+        self.manager_mock.create.assert_called_with(container, ContainerContext.INVOKE)
         # validate that the created container got cached
         self.assertEqual(self.runtime._containers[self.full_path], container)
+
+
+class TestWarmLambdaRuntime_no_watch(TestCase):
+    """Tests that verify --no-watch suppresses observer setup and lifecycle calls."""
+
+    def setUp(self):
+        self.manager_mock = Mock()
+        self.lambda_image_mock = Mock()
+        self.name = "name"
+        self.full_path = "stack/name"
+        self.func_config = FunctionConfig(
+            self.name,
+            self.full_path,
+            "runtime",
+            "handler",
+            None,
+            None,
+            ZIP,
+            "code-path",
+            [],
+            "arm64",
+        )
+        self.func_config.env_vars = Mock()
+        self.func_config.env_vars.resolve.return_value = {}
+
+    @patch("samcli.local.lambdafn.runtime.LambdaFunctionObserver")
+    def test_observer_is_not_created_when_no_watch_is_true(self, LambdaFunctionObserverMock):
+        runtime = WarmLambdaRuntime(self.manager_mock, self.lambda_image_mock, no_watch=True)
+
+        LambdaFunctionObserverMock.assert_not_called()
+        self.assertIsNone(runtime._observer)
+
+    @patch("samcli.local.lambdafn.runtime.LambdaContainer")
+    def test_create_does_not_call_watch_or_start_when_no_watch_is_true(self, LambdaContainerMock):
+        runtime = WarmLambdaRuntime(self.manager_mock, self.lambda_image_mock, no_watch=True)
+        runtime._get_code_dir = MagicMock(return_value="code-dir")
+        LambdaContainerMock.return_value = Mock()
+
+        # Should not raise even though _observer is None
+        runtime.create(self.func_config, debug_context=None)
+        # Container is still created and tracked
+        self.assertIn(self.full_path, runtime._containers)
+
+    def test_clean_warm_containers_does_not_call_observer_stop_when_no_watch_is_true(self):
+        runtime = WarmLambdaRuntime(self.manager_mock, self.lambda_image_mock, no_watch=True)
+        runtime._containers = {}
+        # Should be a no-op; should not raise
+        runtime.clean_running_containers_and_related_resources()
 
 
 class TestWarmLambdaRuntime_get_code_dir(TestCase):
@@ -897,10 +1329,11 @@ class TestWarmLambdaRuntime_get_code_dir(TestCase):
     @patch("samcli.local.lambdafn.runtime.os")
     def test_must_return_same_path_if_path_is_not_compressed_file(self, os_mock):
         lambda_image_mock = Mock()
+        observer_mock = Mock()
         os_mock.path.isfile.return_value = False
         code_path = "path"
 
-        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock)
+        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock, observer_mock)
         res = self.runtime._get_code_dir(code_path)
         self.assertEqual(self.runtime._temp_uncompressed_paths_to_be_cleaned, [])
         self.assertEqual(res, code_path)
@@ -909,12 +1342,13 @@ class TestWarmLambdaRuntime_get_code_dir(TestCase):
     @patch("samcli.local.lambdafn.runtime.os")
     def test_must_cache_temp_uncompressed_dirs_to_be_cleared_later(self, os_mock, _unzip_file_mock):
         lambda_image_mock = Mock()
+        observer_mock = Mock()
         os_mock.path.isfile.return_value = True
         uncompressed_dir_mock = Mock()
         _unzip_file_mock.return_value = uncompressed_dir_mock
         code_path = "path.zip"
 
-        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock)
+        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock, observer_mock)
         res = self.runtime._get_code_dir(code_path)
         self.assertEqual(self.runtime._temp_uncompressed_paths_to_be_cleaned, [uncompressed_dir_mock])
         self.assertEqual(res, uncompressed_dir_mock)
@@ -924,21 +1358,21 @@ class TestWarmLambdaRuntime_clean_warm_containers_related_resources(TestCase):
     def setUp(self):
         self.manager_mock = Mock()
         lambda_image_mock = Mock()
-        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock)
         self.observer_mock = Mock()
+        self.observer_mock.is_alive.return_value = True
+        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock, self.observer_mock)
+
         self.func1_container_mock = Mock()
         self.func2_container_mock = Mock()
         self.runtime._containers = {
             "func_name1": self.func1_container_mock,
             "func_name2": self.func2_container_mock,
         }
-        self.runtime._observer = self.observer_mock
-        self.runtime._observer.is_alive.return_value = True
         self.runtime._temp_uncompressed_paths_to_be_cleaned = ["path1", "path2"]
+        self.runtime._lock = MagicMock()
 
     @patch("samcli.local.lambdafn.runtime.shutil")
     def test_must_container_stopped_when_its_code_dir_got_changed(self, shutil_mock):
-
         self.runtime.clean_running_containers_and_related_resources()
         self.assertEqual(
             self.runtime._container_manager.stop.call_args_list,
@@ -961,10 +1395,8 @@ class TestWarmLambdaRuntime_on_code_change(TestCase):
     def setUp(self):
         self.manager_mock = Mock()
         lambda_image_mock = Mock()
-        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock)
-
         self.observer_mock = Mock()
-        self.runtime._observer = self.observer_mock
+        self.runtime = WarmLambdaRuntime(self.manager_mock, lambda_image_mock, self.observer_mock)
 
         self.lang = "runtime"
         self.handler = "handler"
@@ -1069,7 +1501,7 @@ class TestUnzipFile(TestCase):
         self.assertEqual(output, realpath)
 
         tempfile_mock.mkdtemp.assert_called_with()
-        unzip_mock.assert_called_with(inputpath, tmpdir)  # unzip files to temporary directory
+        unzip_mock.assert_called_with(inputpath, tmpdir, mount_symlinks=False)  # unzip files to temporary directory
         os_mock.path.realpath(tmpdir)  # Return the real path of temporary directory
         os_mock.chmod.assert_not_called()  # Assert we do not chmod the temporary directory
 
@@ -1089,7 +1521,7 @@ class TestUnzipFile(TestCase):
         self.assertEqual(output, realpath)
 
         tempfile_mock.mkdtemp.assert_called_with()
-        unzip_mock.assert_called_with(inputpath, tmpdir)  # unzip files to temporary directory
+        unzip_mock.assert_called_with(inputpath, tmpdir, mount_symlinks=False)  # unzip files to temporary directory
         os_mock.path.realpath(tmpdir)  # Return the real path of temporary directory
         os_mock.chmod.assert_called_with(tmpdir, 0o755)  # Assert we do chmod the temporary directory
 
@@ -1099,7 +1531,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1127,7 +1559,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1140,7 +1572,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler1",
             None,
             None,
@@ -1155,7 +1587,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             "imageUri",
             None,
@@ -1168,7 +1600,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1183,7 +1615,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             "imageUri",
             None,
@@ -1196,7 +1628,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             "imageUri1",
             None,
@@ -1211,7 +1643,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             "imageUri",
             {"WorkingDirectory": "/opt"},
@@ -1224,7 +1656,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             "imageUri",
             {"WorkingDirectory": "/var"},
@@ -1239,7 +1671,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1252,7 +1684,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1267,7 +1699,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1286,7 +1718,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1306,7 +1738,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1323,7 +1755,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1341,7 +1773,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1357,7 +1789,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1375,7 +1807,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1391,7 +1823,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1409,7 +1841,7 @@ class TestRequireContainerReloading(TestCase):
         func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1426,7 +1858,7 @@ class TestRequireContainerReloading(TestCase):
         updated_func = FunctionConfig(
             "name",
             "stack/name",
-            "python3.7",
+            "python3.12",
             "app.handler",
             None,
             None,
@@ -1440,3 +1872,617 @@ class TestRequireContainerReloading(TestCase):
             "x86_64",
         )
         self.assertFalse(_require_container_reloading(func, updated_func))
+
+
+class TestLambdaRuntime_create_exceptions(TestCase):
+    """Test exception handling in LambdaRuntime.create method"""
+
+    def setUp(self):
+        self.manager_mock = Mock()
+        self.name = "name"
+        self.full_path = "stack/name"
+        self.lang = "runtime"
+        self.handler = "handler"
+        self.code_path = "code-path"
+        self.layers = []
+        self.imageuri = None
+        self.packagetype = ZIP
+        self.imageconfig = None
+        self.architecture = "x86_64"
+        self.func_config = FunctionConfig(
+            self.name,
+            self.full_path,
+            self.lang,
+            self.handler,
+            self.imageuri,
+            self.imageconfig,
+            self.packagetype,
+            self.code_path,
+            self.layers,
+            self.architecture,
+        )
+
+        self.env_vars = Mock()
+        self.func_config.env_vars = self.env_vars
+        self.env_var_value = {"a": "b"}
+        self.env_vars.resolve.return_value = self.env_var_value
+
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    @patch("samcli.local.lambdafn.runtime.LambdaContainer")
+    def test_docker_container_creation_failed_exception_must_raise_and_log(self, LambdaContainerMock, LogMock):
+        """Test ContainerCreationFailedException handling - lines 130-131"""
+        code_dir = "some code dir"
+        container = Mock()
+        debug_options = Mock()
+        lambda_image_mock = Mock()
+
+        self.runtime = LambdaRuntime(self.manager_mock, lambda_image_mock)
+        self.runtime._get_code_dir = MagicMock()
+        self.runtime._get_code_dir.return_value = code_dir
+
+        LambdaContainerMock.return_value = container
+        self.manager_mock.create.side_effect = ContainerCreationFailedException("Container creation failed")
+
+        with self.assertRaises(ContainerCreationFailedException):
+            self.runtime.create(self.func_config, debug_context=debug_options)
+
+        # Verify the warning log was called
+        LogMock.warning.assert_called_once_with("Failed to create container for function %s", self.full_path)
+
+
+class TestLambdaRuntime_get_or_create_emulator_container(TestCase):
+    def setUp(self):
+        self.runtime = LambdaRuntime(Mock(), Mock())
+
+    @patch("samcli.local.lambdafn.runtime.DurableFunctionsEmulatorContainer")
+    def test_concurrent_callers_start_one_emulator(self, emulator_class_mock):
+        """EAGER warm containers are created in parallel; only one may create the named emulator container"""
+        callers = 8
+        all_waiting = threading.Barrier(callers)
+        start_calls = []
+
+        def slow_start():
+            start_calls.append(threading.get_ident())
+            time.sleep(0.05)  # hold the window between "no emulator yet" and "emulator started" open
+
+        emulator_class_mock.return_value.start_or_attach.side_effect = slow_start
+        results = []
+
+        def get_emulator():
+            all_waiting.wait()
+            results.append(self.runtime.get_or_create_emulator_container())
+
+        threads = [threading.Thread(target=get_emulator) for _ in range(callers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(start_calls), 1)
+        emulator_class_mock.assert_called_once()
+        self.assertEqual(results, [emulator_class_mock.return_value] * callers)
+
+    @patch("samcli.local.lambdafn.runtime.DurableFunctionsEmulatorContainer")
+    def test_failed_start_is_retried_by_next_caller(self, emulator_class_mock):
+        failed, started = Mock(), Mock()
+        failed.start_or_attach.side_effect = RuntimeError("start failed")
+        emulator_class_mock.side_effect = [failed, started]
+
+        with self.assertRaises(RuntimeError):
+            self.runtime.get_or_create_emulator_container()
+
+        self.assertIs(self.runtime.get_or_create_emulator_container(), started)
+
+
+class TestLambdaRuntime_check_exit_state(TestCase):
+    """Test _check_exit_state method - lines 299-302"""
+
+    def setUp(self):
+        self.manager_mock = Mock()
+        self.lambda_image_mock = Mock()
+        self.runtime = LambdaRuntime(self.manager_mock, self.lambda_image_mock)
+
+    @patch("samcli.local.lambdafn.runtime.ContainerAnalyzer")
+    def test_check_exit_state_out_of_memory_raises_exception(self, ContainerAnalyzerMock):
+        """Test that out of memory condition raises ContainerFailureError"""
+        container = Mock()
+        analyzer_mock = Mock()
+        exit_state_mock = Mock()
+        exit_state_mock.out_of_memory = True
+
+        ContainerAnalyzerMock.return_value = analyzer_mock
+        analyzer_mock.inspect.return_value = exit_state_mock
+
+        with self.assertRaises(ContainerFailureError) as context:
+            self.runtime._check_exit_state(container)
+
+        self.assertEqual(str(context.exception), "Container invocation failed due to maximum memory usage")
+        ContainerAnalyzerMock.assert_called_once_with(self.manager_mock, container)
+        analyzer_mock.inspect.assert_called_once()
+
+    @patch("samcli.local.lambdafn.runtime.ContainerAnalyzer")
+    def test_check_exit_state_normal_exit_no_exception(self, ContainerAnalyzerMock):
+        """Test that normal exit doesn't raise exception"""
+        container = Mock()
+        analyzer_mock = Mock()
+        exit_state_mock = Mock()
+        exit_state_mock.out_of_memory = False
+
+        ContainerAnalyzerMock.return_value = analyzer_mock
+        analyzer_mock.inspect.return_value = exit_state_mock
+
+        # Should not raise any exception
+        self.runtime._check_exit_state(container)
+
+        ContainerAnalyzerMock.assert_called_once_with(self.manager_mock, container)
+        analyzer_mock.inspect.assert_called_once()
+
+
+class TestLambdaRuntime_on_invoke_done_with_container(TestCase):
+    """Test _on_invoke_done method when container is provided - lines 279->282"""
+
+    def setUp(self):
+        self.manager_mock = Mock()
+        self.lambda_image_mock = Mock()
+        self.runtime = LambdaRuntime(self.manager_mock, self.lambda_image_mock)
+
+    def test_on_invoke_done_with_container_calls_check_exit_state_and_stop(self):
+        """Test that _on_invoke_done calls _check_exit_state and stops container when container is provided"""
+        container = Mock()
+
+        # Mock the _check_exit_state method
+        self.runtime._check_exit_state = Mock()
+        self.runtime._clean_decompressed_paths = Mock()
+
+        self.runtime._on_invoke_done(container)
+
+        # Verify _check_exit_state was called
+        self.runtime._check_exit_state.assert_called_once_with(container)
+        # Verify container was stopped
+        self.manager_mock.stop.assert_called_once_with(container)
+        # Verify cleanup was called
+        self.runtime._clean_decompressed_paths.assert_called_once()
+
+    def test_on_invoke_done_with_none_container_only_cleans_paths(self):
+        """Test that _on_invoke_done only cleans paths when container is None"""
+        self.runtime._check_exit_state = Mock()
+        self.runtime._clean_decompressed_paths = Mock()
+
+        self.runtime._on_invoke_done(None)
+
+        # Verify _check_exit_state was not called
+        self.runtime._check_exit_state.assert_not_called()
+        # Verify container stop was not called
+        self.manager_mock.stop.assert_not_called()
+        # Verify cleanup was called
+        self.runtime._clean_decompressed_paths.assert_called_once()
+
+
+class TestWarmLambdaRuntime_create_container_branch(TestCase):
+    """Test WarmLambdaRuntime.create method container branch - lines 470->473"""
+
+    def setUp(self):
+        self.manager_mock = Mock()
+        self.lambda_image_mock = Mock()
+        self.observer_mock = Mock()
+        self.runtime = WarmLambdaRuntime(self.manager_mock, self.lambda_image_mock, observer=self.observer_mock)
+
+        self.name = "name"
+        self.full_path = "stack/name"
+        self.lang = "runtime"
+        self.handler = "handler"
+        self.code_path = "code-path"
+        self.layers = []
+        self.imageuri = None
+        self.packagetype = ZIP
+        self.imageconfig = None
+        self.architecture = "x86_64"
+        self.func_config = FunctionConfig(
+            self.name,
+            self.full_path,
+            self.lang,
+            self.handler,
+            self.imageuri,
+            self.imageconfig,
+            self.packagetype,
+            self.code_path,
+            self.layers,
+            self.architecture,
+        )
+
+        self.env_vars = Mock()
+        self.func_config.env_vars = self.env_vars
+        self.env_var_value = {"a": "b"}
+        self.env_vars.resolve.return_value = self.env_var_value
+
+    @patch("samcli.local.lambdafn.runtime.LambdaContainer")
+    def test_create_with_existing_config_and_no_container_stops_none_container(self, LambdaContainerMock):
+        """Test create method when existing config requires reloading but container is None - lines 470->473"""
+        # Setup existing function config that requires reloading
+        existing_config = FunctionConfig(
+            self.name,
+            self.full_path,
+            "different_runtime",  # Different runtime to trigger reloading
+            self.handler,
+            self.imageuri,
+            self.imageconfig,
+            self.packagetype,
+            self.code_path,
+            self.layers,
+            self.architecture,
+        )
+        existing_config.env_vars = self.env_vars
+
+        # Set up existing config but no container
+        self.runtime._function_configs[self.full_path] = existing_config
+        self.runtime._containers[self.full_path] = None  # No container
+
+        container = Mock()
+        LambdaContainerMock.return_value = container
+
+        # Mock parent create method
+        with patch.object(LambdaRuntime, "create", return_value=container) as parent_create_mock:
+            result = self.runtime.create(self.func_config)
+
+        # Verify container stop was not called (since container was None)
+        self.manager_mock.stop.assert_not_called()
+        # Verify observer unwatch was called
+        self.observer_mock.unwatch.assert_called_once_with(existing_config)
+        # Verify new container was created and stored
+        self.assertEqual(result, container)
+        self.assertEqual(self.runtime._containers[self.full_path], container)
+        # Verify new function config was stored (the old one was replaced)
+        self.assertIn(self.full_path, self.runtime._function_configs)
+        self.assertEqual(self.runtime._function_configs[self.full_path], self.func_config)
+
+
+class TestWarmLambdaRuntime_configure_interrupt(TestCase):
+    """Test WarmLambdaRuntime._configure_interrupt method - lines 534-554"""
+
+    @patch("samcli.local.lambdafn.runtime.LambdaFunctionObserver")
+    def setUp(self, LambdaFunctionObserverMock):
+        self.manager_mock = Mock()
+        self.lambda_image_mock = Mock()
+        self.observer_mock = Mock()
+        LambdaFunctionObserverMock.return_value = self.observer_mock
+        self.runtime = WarmLambdaRuntime(self.manager_mock, self.lambda_image_mock)
+
+    @patch("samcli.local.lambdafn.runtime.threading")
+    @patch("samcli.local.lambdafn.runtime.signal")
+    def test_configure_interrupt_debugging_mode_returns_none(self, SignalMock, ThreadingMock):
+        """Test _configure_interrupt in debugging mode returns None and sets up signal handler"""
+        function_full_path = "test/function"
+        timeout = 30
+        container = Mock()
+        is_debugging = True
+
+        SignalMock.SIGTERM = "sigterm"
+
+        result = self.runtime._configure_interrupt(function_full_path, timeout, container, is_debugging)
+
+        self.assertIsNone(result)
+        SignalMock.signal.assert_called_once_with("sigterm", ANY)
+        ThreadingMock.Timer.assert_not_called()
+
+    @patch("samcli.local.lambdafn.runtime.threading")
+    @patch("samcli.local.lambdafn.runtime.signal")
+    def test_configure_interrupt_non_debugging_mode_returns_start_timer(self, SignalMock, ThreadingMock):
+        """Test _configure_interrupt in non-debugging mode returns start_timer function"""
+        function_full_path = "test/function"
+        timeout = 30
+        container = Mock()
+        is_debugging = False
+
+        result = self.runtime._configure_interrupt(function_full_path, timeout, container, is_debugging)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(callable(result))
+        SignalMock.signal.assert_not_called()
+
+    @patch("samcli.local.lambdafn.runtime.threading")
+    @patch("samcli.local.lambdafn.runtime.signal")
+    def test_configure_interrupt_timer_handler_logs_timeout(self, SignalMock, ThreadingMock):
+        """Test that timer handler logs timeout message but doesn't stop container in WarmLambdaRuntime"""
+        function_full_path = "test/function"
+        timeout = 30
+        container = Mock()
+        is_debugging = False
+
+        def fake_timer(timeout_val, handler, args):
+            # Execute the handler immediately to test it
+            handler()
+            return Mock()
+
+        ThreadingMock.Timer = fake_timer
+
+        with patch("samcli.local.lambdafn.runtime.LOG") as LogMock:
+            start_timer = self.runtime._configure_interrupt(function_full_path, timeout, container, is_debugging)
+            start_timer()
+
+            # Verify timeout message was logged
+            LogMock.info.assert_called_once_with(
+                "Function '%s' timed out after %d seconds", function_full_path, timeout
+            )
+            # Verify container was NOT stopped (different from regular LambdaRuntime)
+            self.manager_mock.stop.assert_not_called()
+
+    @patch("samcli.local.lambdafn.runtime.threading")
+    @patch("samcli.local.lambdafn.runtime.signal")
+    def test_configure_interrupt_signal_handler_logs_interruption(self, SignalMock, ThreadingMock):
+        """Test that signal handler logs interruption message but doesn't stop container in WarmLambdaRuntime"""
+        function_full_path = "test/function"
+        timeout = 30
+        container = Mock()
+        is_debugging = True
+
+        SignalMock.SIGTERM = "sigterm"
+
+        # Fake the signal.signal method to execute handler immediately
+        def fake_signal(term, handler):
+            handler("sig", "frame")
+
+        SignalMock.signal = fake_signal
+
+        with patch("samcli.local.lambdafn.runtime.LOG") as LogMock:
+            self.runtime._configure_interrupt(function_full_path, timeout, container, is_debugging)
+
+            # Verify interruption message was logged
+            LogMock.info.assert_called_once_with("Execution of function %s was interrupted", function_full_path)
+            # Verify container was NOT stopped (different from regular LambdaRuntime)
+            self.manager_mock.stop.assert_not_called()
+
+
+class TestWarmLambdaRuntime_on_code_change_container_branch(TestCase):
+    """Test WarmLambdaRuntime._on_code_change method container branch - lines 589->577"""
+
+    def setUp(self):
+        self.manager_mock = Mock()
+        self.lambda_image_mock = Mock()
+        self.observer_mock = Mock()
+        self.runtime = WarmLambdaRuntime(self.manager_mock, self.lambda_image_mock, observer=self.observer_mock)
+
+        self.func_config = FunctionConfig(
+            "name",
+            "stack/function",
+            "python3.9",
+            "handler",
+            None,
+            None,
+            ZIP,
+            "code-path",
+            [],
+            "x86_64",
+        )
+
+    def test_on_code_change_with_no_container_doesnt_stop_container(self):
+        """Test _on_code_change when no container exists for the function - lines 589->577"""
+        # Set up function config but no container
+        self.runtime._function_configs[self.func_config.full_path] = self.func_config
+        self.runtime._containers[self.func_config.full_path] = None  # No container
+
+        with patch("samcli.local.lambdafn.runtime.LOG") as LogMock:
+            self.runtime._on_code_change([self.func_config])
+
+        # Verify function config was removed
+        self.assertNotIn(self.func_config.full_path, self.runtime._function_configs)
+        # Verify container stop was not called (since container was None)
+        self.manager_mock.stop.assert_not_called()
+        # Verify observer unwatch was called
+        self.observer_mock.unwatch.assert_called_once_with(self.func_config)
+        # Verify log message was called
+        LogMock.info.assert_called_once()
+
+    def test_on_code_change_with_container_stops_container(self):
+        """Test _on_code_change when container exists for the function"""
+        container = Mock()
+
+        # Set up function config and container
+        self.runtime._function_configs[self.func_config.full_path] = self.func_config
+        self.runtime._containers[self.func_config.full_path] = container
+
+        with patch("samcli.local.lambdafn.runtime.LOG") as LogMock:
+            self.runtime._on_code_change([self.func_config])
+
+        # Verify function config was removed
+        self.assertNotIn(self.func_config.full_path, self.runtime._function_configs)
+        # Verify container was removed
+        self.assertNotIn(self.func_config.full_path, self.runtime._containers)
+        # Verify container stop was called
+        self.manager_mock.stop.assert_called_once_with(container)
+        # Verify observer unwatch was called
+        self.observer_mock.unwatch.assert_called_once_with(self.func_config)
+        # Verify log message was called
+        LogMock.info.assert_called_once()
+
+    def test_on_code_change_with_image_package_type_logs_image_resource(self):
+        """Test _on_code_change logs correct resource type for IMAGE package type"""
+        # Create function config with IMAGE package type
+        image_func_config = FunctionConfig(
+            "name",
+            "stack/function",
+            "python3.9",
+            "handler",
+            "my-image:latest",
+            None,
+            IMAGE,
+            "code-path",
+            [],
+            "x86_64",
+        )
+
+        container = Mock()
+        self.runtime._function_configs[image_func_config.full_path] = image_func_config
+        self.runtime._containers[image_func_config.full_path] = container
+
+        with patch("samcli.local.lambdafn.runtime.LOG") as LogMock:
+            self.runtime._on_code_change([image_func_config])
+
+        # Verify log message contains image reference
+        LogMock.info.assert_called_once()
+        log_call_args = LogMock.info.call_args[0]
+        # The log format is: "Lambda Function '%s' %s has been changed..."
+        # where %s is function_full_path and %s is resource (imageuri + " image")
+        self.assertIn("my-image:latest image", log_call_args[2])
+
+
+class TestShouldReloadContainer(TestCase):
+    """Test _should_reload_container function"""
+
+    def setUp(self):
+        """Set up test fixtures"""
+        self.base_config = FunctionConfig(
+            name="test_func",
+            full_path="stack/test_func",
+            runtime="python3.9",
+            handler="app.handler",
+            imageuri=None,
+            imageconfig=None,
+            packagetype=ZIP,
+            code_abs_path="/tmp/code",
+            layers=[],
+            architecture="x86_64",
+            memory=128,
+            timeout=30,
+            env_vars=EnvironmentVariables(),
+        )
+
+        self.different_config = FunctionConfig(
+            name="test_func",
+            full_path="stack/test_func",
+            runtime="python3.11",  # Different runtime
+            handler="app.handler",
+            imageuri=None,
+            imageconfig=None,
+            packagetype=ZIP,
+            code_abs_path="/tmp/code",
+            layers=[],
+            architecture="x86_64",
+            memory=128,
+            timeout=30,
+            env_vars=EnvironmentVariables(),
+        )
+
+    def test_should_not_reload_when_no_existing_config_and_no_container(self):
+        """Test that reload is not needed when there's no existing config and no container"""
+        result = _should_reload_container(None, self.base_config, None, None)
+        self.assertFalse(result)
+
+    def test_should_not_reload_when_same_config_and_same_debug_context(self):
+        """Test that reload is not needed when config and debug context are the same"""
+
+        debug_context = DebugContext(
+            debug_ports=[5858], debugger_path="/path/to/debugger", debug_args="--debug-args", debug_function="test_func"
+        )
+
+        container = Mock()
+        container.debug_options = debug_context
+
+        result = _should_reload_container(self.base_config, self.base_config, container, debug_context)
+        self.assertFalse(result)
+
+    def test_should_reload_when_function_config_changed(self):
+        """Test that reload is needed when function configuration changes"""
+        container = Mock()
+        container.debug_options = None
+
+        result = _should_reload_container(self.base_config, self.different_config, container, None)
+        self.assertTrue(result)
+
+    def test_should_reload_when_debug_context_changed(self):
+        """Test that reload is needed when debug context changes"""
+
+        debug_context1 = DebugContext(
+            debug_ports=[5858], debugger_path="/path/to/debugger", debug_args="--debug-args", debug_function="test_func"
+        )
+
+        debug_context2 = DebugContext(
+            debug_ports=[9229], debugger_path="/new/path", debug_args="--new-args", debug_function="test_func"
+        )
+
+        container = Mock()
+        container.debug_options = debug_context1
+
+        result = _should_reload_container(self.base_config, self.base_config, container, debug_context2)
+        self.assertTrue(result)
+
+    def test_should_reload_when_debug_context_changes_to_none(self):
+        """Test that reload is needed when debug context changes from something to None"""
+
+        debug_context = DebugContext(
+            debug_ports=[5858], debugger_path="/path/to/debugger", debug_args="--debug-args", debug_function="test_func"
+        )
+
+        container = Mock()
+        container.debug_options = debug_context
+
+        result = _should_reload_container(self.base_config, self.base_config, container, None)
+        self.assertTrue(result)
+
+    def test_should_reload_when_debug_context_changes_from_none(self):
+        """Test that reload is needed when debug context changes from None to something"""
+
+        debug_context = DebugContext(
+            debug_ports=[5858], debugger_path="/path/to/debugger", debug_args="--debug-args", debug_function="test_func"
+        )
+
+        container = Mock()
+        container.debug_options = None
+
+        result = _should_reload_container(self.base_config, self.base_config, container, debug_context)
+        self.assertTrue(result)
+
+    def test_should_not_reload_when_no_container(self):
+        """Test that reload is not needed when there's no container and no config changes"""
+        result = _should_reload_container(self.base_config, self.base_config, None, None)
+        self.assertFalse(result)
+
+    def test_should_reload_when_both_config_and_debug_context_changed(self):
+        """Test that reload is needed when both config and debug context change"""
+
+        debug_context1 = DebugContext(
+            debug_ports=[5858], debugger_path="/path/to/debugger", debug_args="--debug-args", debug_function="test_func"
+        )
+
+        debug_context2 = DebugContext(
+            debug_ports=[9229], debugger_path="/new/path", debug_args="--new-args", debug_function="test_func"
+        )
+
+        container = Mock()
+        container.debug_options = debug_context1
+
+        result = _should_reload_container(self.base_config, self.different_config, container, debug_context2)
+        self.assertTrue(result)
+
+
+class TestLambdaRuntime_clean_runtime_containers(TestCase):
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    def test_clean_runtime_containers_stops_and_deletes_durable_container(self, log_mock):
+        """Test that clean_runtime_containers stops and deletes durable lambda container"""
+        manager_mock = Mock()
+        lambda_image_mock = Mock()
+        runtime = LambdaRuntime(manager_mock, lambda_image_mock)
+
+        container = Mock(spec=DurableLambdaContainer)
+        runtime._container = container
+
+        runtime.clean_runtime_containers()
+
+        container._stop.assert_called_once()
+        container._delete.assert_called_once()
+        self.assertIsNone(runtime._container)
+
+    @patch("samcli.local.lambdafn.runtime.LOG")
+    def test_clean_runtime_containers_stops_emulator_container(self, log_mock):
+        """Test that clean_runtime_containers stops and cleans up emulator container"""
+        manager_mock = Mock()
+        lambda_image_mock = Mock()
+        runtime = LambdaRuntime(manager_mock, lambda_image_mock)
+
+        emulator_container = Mock()
+        runtime._durable_execution_emulator_container = emulator_container
+
+        runtime.clean_runtime_containers()
+
+        emulator_container.stop.assert_called_once()
+        log_mock.debug.assert_called_with("Stopping durable functions emulator container")
+        self.assertIsNone(runtime._durable_execution_emulator_container)

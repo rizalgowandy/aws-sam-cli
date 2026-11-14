@@ -1,0 +1,1983 @@
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import MagicMock, patch, call
+from samcli.lib.providers.provider import ResourceIdentifier
+from samcli.lib.sync.infra_sync_executor import datetime, InfraSyncExecutor
+from botocore.exceptions import ClientError
+from parameterized import parameterized
+from samcli.lib.telemetry.event import Event, EventTracker
+
+
+class TestInfraSyncExecutor(TestCase):
+    def setUp(self):
+        self.build_context = MagicMock()
+        self.package_context = MagicMock()
+        self.deploy_context = MagicMock()
+        self.sync_context = MagicMock()
+        EventTracker.clear_trackers()
+
+    @parameterized.expand([(True,), (False,)])
+    @patch("samcli.lib.sync.infra_sync_executor.InfraSyncExecutor._auto_skip_infra_sync")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    @patch("samcli.lib.sync.infra_sync_executor.datetime")
+    def test_execute_infra_sync(self, auto_skip_infra_sync, datetime_mock, session_mock, auto_skip_infra_sync_mock):
+        datetime_mock.now.return_value = datetime(2023, 2, 8, 12, 12, 12)
+        last_infra_sync_time = datetime(2023, 2, 4, 12, 12, 12)
+        self.sync_context.skip_deploy_sync = True
+        self.sync_context.get_latest_infra_sync_time.return_value = last_infra_sync_time
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        auto_skip_infra_sync_mock.return_value = auto_skip_infra_sync
+
+        infra_sync_result = infra_sync_executor.execute_infra_sync(True)
+
+        executed = infra_sync_result.infra_sync_executed
+        code_sync_resources = infra_sync_result.code_sync_resources
+
+        self.build_context.set_up.assert_called_once()
+        self.build_context.run.assert_called_once()
+        self.package_context.run.assert_called_once()
+
+        if not auto_skip_infra_sync:
+            self.deploy_context.run.assert_called_once()
+            self.sync_context.update_infra_sync_time.assert_called_once()
+            self.assertEqual(code_sync_resources, set())
+            self.assertEqual(len(EventTracker.get_tracked_events()), 3)
+            self.assertIn(Event("SyncFlowStart", "SkipInfraSyncExecute"), EventTracker.get_tracked_events())
+            self.assertIn(Event("SyncFlowStart", "InfraSyncExecute"), EventTracker.get_tracked_events())
+            self.assertIn(Event("SyncFlowEnd", "InfraSyncExecute"), EventTracker.get_tracked_events())
+        else:
+            self.assertEqual(len(EventTracker.get_tracked_events()), 2)
+            self.assertIn(Event("SyncFlowStart", "SkipInfraSyncExecute"), EventTracker.get_tracked_events())
+            self.assertIn(Event("SyncFlowEnd", "SkipInfraSyncExecute"), EventTracker.get_tracked_events())
+
+        self.assertEqual(executed, not auto_skip_infra_sync)
+
+    @patch("samcli.lib.sync.infra_sync_executor.InfraSyncExecutor._auto_skip_infra_sync")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    @patch("samcli.lib.sync.infra_sync_executor.datetime")
+    def test_7_days_auto_execute_infra_sync(self, datetime_mock, session_mock, auto_skip_infra_sync_mock):
+        datetime_mock.now.return_value = datetime(2023, 2, 8, 12, 12, 12)
+        last_infra_sync_time = datetime(2023, 1, 31, 12, 12, 12)
+        self.sync_context.skip_deploy_sync = True
+        self.sync_context.get_latest_infra_sync_time.return_value = last_infra_sync_time
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_result = infra_sync_executor.execute_infra_sync(True)
+
+        executed = infra_sync_result.infra_sync_executed
+        code_sync_resources = infra_sync_result.code_sync_resources
+
+        self.build_context.set_up.assert_called_once()
+        self.build_context.run.assert_called_once()
+        self.package_context.run.assert_called_once()
+
+        self.deploy_context.run.assert_called_once()
+
+        self.sync_context.update_infra_sync_time.assert_called_once()
+        self.assertEqual(code_sync_resources, set())
+
+        self.assertEqual(len(EventTracker.get_tracked_events()), 2)
+        self.assertIn(Event("SyncFlowStart", "InfraSyncExecute"), EventTracker.get_tracked_events())
+        self.assertIn(Event("SyncFlowEnd", "InfraSyncExecute"), EventTracker.get_tracked_events())
+
+    @patch("samcli.lib.sync.infra_sync_executor.SYNC_FLOW_THRESHOLD", 1)
+    @patch("samcli.lib.sync.infra_sync_executor.InfraSyncExecutor._auto_skip_infra_sync")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    @patch("samcli.lib.sync.infra_sync_executor.datetime")
+    def test_execute_infra_sync_exceed_threshold(self, datetime_mock, session_mock, auto_skip_infra_sync_mock):
+        datetime_mock.now.return_value = datetime(2023, 2, 8, 12, 12, 12)
+        last_infra_sync_time = datetime(2023, 2, 4, 12, 12, 12)
+        self.sync_context.skip_deploy_sync = True
+        self.sync_context.get_latest_infra_sync_time.return_value = last_infra_sync_time
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        auto_skip_infra_sync_mock.return_value = True
+        infra_sync_executor._code_sync_resources = {"Function"}
+
+        infra_sync_result = infra_sync_executor.execute_infra_sync(True)
+
+        executed = infra_sync_result.infra_sync_executed
+        code_sync_resources = infra_sync_result.code_sync_resources
+
+        self.build_context.set_up.assert_called_once()
+        self.build_context.run.assert_called_once()
+        self.package_context.run.assert_called_once()
+
+        self.deploy_context.run.assert_called_once()
+        self.assertEqual(code_sync_resources, set())
+
+        self.assertEqual(executed, True)
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_basic(self, session_mock, get_template_mock, local_path_mock):
+        built_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "local/"}}
+            }
+        }
+        packaged_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "https://s3_new"}}
+            }
+        }
+
+        get_template_mock.side_effect = [packaged_template_dict, built_template_dict]
+        local_path_mock.return_value = True
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._cfn_client.get_template.return_value = {"TemplateBody": """{
+                "Resources": {
+                    "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "https://s3"}}
+                }
+            }"""}
+
+        self.assertTrue(infra_sync_executor._auto_skip_infra_sync("path", "path2", "stack_name"))
+        self.assertEqual(infra_sync_executor.code_sync_resources, {ResourceIdentifier("ServerlessFunction")})
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_all_resources(self, session_mock, get_template_mock, local_path_mock):
+        built_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "local/", "ImageUri": "image"},
+                },
+                "LambdaFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Code": {
+                            "ImageUri": "image",
+                            "S3Bucket": "bucket",
+                            "S3Key": "key",
+                            "S3ObjectVersion": "version",
+                        }
+                    },
+                },
+                "ServerlessLayer": {"Type": "AWS::Serverless::LayerVersion", "Properties": {"ContentUri": "local/"}},
+                "LambdaLayer": {"Type": "AWS::Lambda::LayerVersion", "Properties": {"Content": "local/"}},
+                "ServerlessApi": {"Type": "AWS::Serverless::Api", "Properties": {"DefinitionUri": "definition"}},
+                "RestApi": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"BodyS3Location": "definiton"}},
+                "ServerlessHttpApi": {"Type": "AWS::Serverless::HttpApi", "Properties": {"DefinitionUri": "definiton"}},
+                "HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"BodyS3Location": "definiton"}},
+                "ServerlessStateMachine": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {"DefinitionUri": "definiton"},
+                },
+                "StateMachine": {
+                    "Type": "AWS::StepFunctions::StateMachine",
+                    "Properties": {"DefinitionS3Location": "definiton"},
+                },
+            }
+        }
+
+        packaged_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://location2", "ImageUri": "s3://location2"},
+                },
+                "LambdaFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Code": {
+                            "ImageUri": "s3://location2",
+                            "S3Bucket": "s3://location2",
+                            "S3Key": "s3://location2",
+                            "S3ObjectVersion": "s3://location2",
+                        }
+                    },
+                },
+                "ServerlessLayer": {
+                    "Type": "AWS::Serverless::LayerVersion",
+                    "Properties": {"ContentUri": "s3://location2"},
+                },
+                "LambdaLayer": {"Type": "AWS::Lambda::LayerVersion", "Properties": {"Content": "s3://location2"}},
+                "ServerlessApi": {"Type": "AWS::Serverless::Api", "Properties": {"DefinitionUri": "s3://location2"}},
+                "RestApi": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"BodyS3Location": "s3://location2"}},
+                "ServerlessHttpApi": {
+                    "Type": "AWS::Serverless::HttpApi",
+                    "Properties": {"DefinitionUri": "s3://location2"},
+                },
+                "HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"BodyS3Location": "s3://location2"}},
+                "ServerlessStateMachine": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {"DefinitionUri": "s3://location2"},
+                },
+                "StateMachine": {
+                    "Type": "AWS::StepFunctions::StateMachine",
+                    "Properties": {"DefinitionS3Location": "s3://location2"},
+                },
+            }
+        }
+
+        get_template_mock.side_effect = [
+            packaged_template_dict,
+            built_template_dict,
+            packaged_template_dict,
+            built_template_dict,
+        ]
+        local_path_mock.return_value = True
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._cfn_client.get_template.return_value = {"TemplateBody": """{
+                "Resources": {
+                    "ServerlessFunction": {
+                        "Type": "AWS::Serverless::Function",
+                        "Properties": {"CodeUri": "s3://location", "ImageUri": "s3://location"},
+                    },
+                    "LambdaFunction": {
+                        "Type": "AWS::Lambda::Function",
+                        "Properties": {
+                            "Code": {
+                                "ImageUri": "s3://location",
+                                "S3Bucket": "s3://location",
+                                "S3Key": "s3://location",
+                                "S3ObjectVersion": "s3://location",
+                            }
+                        },
+                    },
+                    "ServerlessLayer": {
+                        "Type": "AWS::Serverless::LayerVersion",
+                        "Properties": {"ContentUri": "s3://location"},
+                    },
+                    "LambdaLayer": {"Type": "AWS::Lambda::LayerVersion", "Properties": {"Content": "s3://location"}},
+                    "ServerlessApi": {"Type": "AWS::Serverless::Api", "Properties": {"DefinitionUri": "s3://location"}},
+                    "RestApi": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"BodyS3Location": "s3://location"}},
+                    "ServerlessHttpApi": {
+                        "Type": "AWS::Serverless::HttpApi",
+                        "Properties": {"DefinitionUri": "s3://location"},
+                    },
+                    "HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"BodyS3Location": "s3://location"}},
+                    "ServerlessStateMachine": {
+                        "Type": "AWS::Serverless::StateMachine",
+                        "Properties": {"DefinitionUri": "s3://location"},
+                    },
+                    "StateMachine": {
+                        "Type": "AWS::StepFunctions::StateMachine",
+                        "Properties": {"DefinitionS3Location": "s3://location"},
+                    },
+                }
+            }"""}
+
+        self.assertTrue(infra_sync_executor._auto_skip_infra_sync("path", "path2", "stack_name"))
+        self.assertEqual(
+            infra_sync_executor.code_sync_resources,
+            {
+                ResourceIdentifier("HttpApi"),
+                ResourceIdentifier("LambdaFunction"),
+                ResourceIdentifier("LambdaLayer"),
+                ResourceIdentifier("RestApi"),
+                ResourceIdentifier("ServerlessApi"),
+                ResourceIdentifier("ServerlessFunction"),
+                ResourceIdentifier("ServerlessHttpApi"),
+                ResourceIdentifier("ServerlessLayer"),
+                ResourceIdentifier("ServerlessStateMachine"),
+                ResourceIdentifier("StateMachine"),
+            },
+        )
+
+        local_path_mock.return_value = False
+        self.assertFalse(infra_sync_executor._auto_skip_infra_sync("path", "path2", "stack_name"))
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_nested_stack(self, session_mock, get_template_mock, local_path_mock):
+        built_template_dict = {
+            "Resources": {
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": str(Path("local") / "template.yaml")},
+                },
+            }
+        }
+
+        packaged_template_dict = {
+            "Resources": {
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": "https://s3.com/bucket/key"},
+                },
+            }
+        }
+
+        built_nested_dict = {
+            "Resources": {
+                "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "function/"}}
+            }
+        }
+
+        packaged_nested_dict = """{
+            "Resources": {
+                "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "https://s3.com/bucket/key"}}
+            }
+        }"""
+
+        get_template_mock.side_effect = [packaged_template_dict, built_template_dict, built_nested_dict]
+        local_path_mock.return_value = True
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._cfn_client.get_template.side_effect = [
+            {"TemplateBody": f"""{{
+                    "Resources": {{
+                        "ServerlessApplication": {{
+                            "Type": "AWS::Serverless::Application", 
+                            "Properties": {{"Location": "{str(Path("local") / "template.yaml")}"}} }}
+                    }}
+                }}"""},
+            {"TemplateBody": """{
+                    "Resources": {
+                        "ServerlessFunction": {
+                            "Type": "AWS::Serverless::Function", 
+                            "Properties": {"CodeUri": "function/"}}
+                    }
+                }"""},
+        ]
+
+        infra_sync_executor._cfn_client.describe_stack_resource.return_value = {
+            "StackResourceDetails": {"PhysicalResourceId": "id"}
+        }
+
+        with patch("botocore.response.StreamingBody") as stream_mock:
+            stream_mock.read.return_value = packaged_nested_dict.encode("utf-8")
+            infra_sync_executor._s3_client.get_object.return_value = {"Body": stream_mock}
+            self.assertTrue(
+                infra_sync_executor._auto_skip_infra_sync(
+                    str(Path("path") / "packaged-template.yaml"),
+                    str(Path("path") / "built-template.yaml"),
+                    "stack_name",
+                )
+            )
+            get_template_mock.assert_has_calls(
+                [
+                    call(str(Path("path") / "packaged-template.yaml")),
+                    call(str(Path("path") / "built-template.yaml")),
+                    call(str(Path("path") / "local/template.yaml")),
+                ]
+            )
+            self.assertEqual(
+                infra_sync_executor.code_sync_resources,
+                {ResourceIdentifier("ServerlessApplication/ServerlessFunction")},
+            )
+
+    @parameterized.expand([(True, "sar_id"), (False, "sar_id_2")])
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_nested_stack_with_sar(
+        self, expected_result, sar_id, session_mock, get_template_mock, local_path_mock
+    ):
+        built_template_dict = {
+            "Resources": {
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": {"ApplicationId": sar_id, "SemanticVersion": "version"}},
+                }
+            }
+        }
+
+        packaged_template_dict = {
+            "Resources": {
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": {"ApplicationId": sar_id, "SemanticVersion": "version"}},
+                }
+            }
+        }
+
+        get_template_mock.side_effect = [packaged_template_dict, built_template_dict]
+        local_path_mock.return_value = True
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._cfn_client.get_template.side_effect = [
+            {"TemplateBody": """{
+                    "Resources": {
+                        "ServerlessApplication": {
+                            "Type": "AWS::Serverless::Application",
+                            "Properties": {"Location": {"ApplicationId": "sar_id", "SemanticVersion": "version"}},
+                        }
+                    }
+                }"""},
+        ]
+
+        infra_sync_executor._cfn_client.describe_stack_resource.return_value = {
+            "StackResourceDetails": {"PhysicalResourceId": "id"}
+        }
+
+        self.assertEqual(infra_sync_executor._auto_skip_infra_sync("path", "path2", "stack_name"), expected_result)
+        self.assertEqual(infra_sync_executor.code_sync_resources, set())
+
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_http_template_location(self, session_mock, get_template_mock):
+        built_template_dict = {
+            "Resources": {
+                "NestedStack": {
+                    "Type": "AWS::CloudFormation::Stack",
+                    "Properties": {"TemplateURL": "https://s3.com/bucket/key"},
+                }
+            }
+        }
+
+        packaged_template_dict = {
+            "Resources": {
+                "NestedStack": {
+                    "Type": "AWS::CloudFormation::Stack",
+                    "Properties": {"TemplateURL": "https://s3.com/bucket/key"},
+                }
+            }
+        }
+
+        nested_dict = """{
+            "Resources": {
+                "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "local/"}}
+            }
+        }"""
+
+        get_template_mock.side_effect = [packaged_template_dict, built_template_dict]
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._cfn_client.get_template.side_effect = [
+            {"TemplateBody": """{
+                    Resources: {
+                        "NestedStack": {
+                            "Type": "AWS::CloudFormation::Stack",
+                            "Properties": {"TemplateURL": "https://s3.com/bucket/key"}
+                        }
+                    }
+                }"""},
+            {"TemplateBody": """{
+                    "Resources": {
+                        "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "local/"}}
+                    }
+                }"""},
+        ]
+
+        infra_sync_executor._cfn_client.describe_stack_resource.return_value = {
+            "StackResourceDetails": {"PhysicalResourceId": "id"}
+        }
+
+        with patch("botocore.response.StreamingBody") as stream_mock:
+            stream_mock.read.return_value = nested_dict.encode("utf-8")
+            infra_sync_executor._s3_client.get_object.return_value = {"Body": stream_mock}
+            self.assertTrue(infra_sync_executor._auto_skip_infra_sync("path", "path2", "stack_name"))
+            self.assertEqual(infra_sync_executor.code_sync_resources, set())
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_exception(self, session_mock, get_template_mock, local_path_mock):
+        template_dict = {
+            "Resources": {
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": "https://s3.com/bucket/key"},
+                }
+            }
+        }
+
+        get_template_mock.return_value = template_dict
+        local_path_mock.return_value = True
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._cfn_client.get_template.side_effect = [ClientError({"Error": {"Code": "404"}}, "Error")]
+
+        self.assertFalse(infra_sync_executor._auto_skip_infra_sync("path", "path2", "stack_name"))
+
+    # Test stack parameters are { 'Foo' : 'Bar', 'Apples' : 'Oranges' }
+    @parameterized.expand(
+        [
+            ({"Foo": "Bar"}, True),  # Subset
+            ({"Foo": "Bar", "Apples": "Oranges"}, True),  # Equal
+            ({"Apples": "Oranges", "Foo": "Bar"}, True),  # Equal, different order
+            ({"Foo": "Bar", "Apples": "Grapes"}, False),  # One pair matches the other does not
+            (
+                {"Foo": "Bar", "Apples": "Oranges", "Red": "Blue"},
+                False,
+            ),  # Overrides is a superset of current parameters
+        ]
+    )
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_param_overrides(
+        self, param_overrides, expect_skip_infra_sync, session_mock, get_template_mock, local_path_mock
+    ):
+        built_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "local/"}}
+            }
+        }
+        packaged_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "https://s3_new"}}
+            }
+        }
+
+        get_template_mock.side_effect = [packaged_template_dict, built_template_dict]
+        local_path_mock.return_value = True
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._cfn_client.get_template.return_value = {"TemplateBody": """{
+                "Resources": {
+                    "ServerlessFunction": {"Type": "AWS::Serverless::Function", "Properties": {"CodeUri": "https://s3"}}
+                }
+            }"""}
+
+        infra_sync_executor._get_stack_parameters = MagicMock()
+
+        infra_sync_executor._get_stack_parameters.return_value = [
+            {"ParameterKey": "Foo", "ParameterValue": "Bar"},
+            {"ParameterKey": "Apples", "ParameterValue": "Oranges"},
+        ]
+
+        self.assertEqual(
+            infra_sync_executor._auto_skip_infra_sync("path", "path2", "stack_name", param_overrides),
+            expect_skip_infra_sync,
+        )
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_template(self, session_mock, local_path_mock):
+        built_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "local/", "ImageUri": "image"},
+                },
+                "LambdaFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Code": {
+                            "ImageUri": "image",
+                            "S3Bucket": "bucket",
+                            "S3Key": "key",
+                            "S3ObjectVersion": "version",
+                        }
+                    },
+                },
+                "ServerlessLayer": {"Type": "AWS::Serverless::LayerVersion", "Properties": {"ContentUri": "local/"}},
+                "LambdaLayer": {"Type": "AWS::Lambda::LayerVersion", "Properties": {"Content": "local/"}},
+                "ServerlessApi": {"Type": "AWS::Serverless::Api", "Properties": {"DefinitionUri": "definition"}},
+                "RestApi": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"BodyS3Location": "definiton"}},
+                "ServerlessHttpApi": {"Type": "AWS::Serverless::HttpApi", "Properties": {"DefinitionUri": "definiton"}},
+                "HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"BodyS3Location": "definiton"}},
+                "ServerlessStateMachine": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {"DefinitionUri": "definiton"},
+                },
+                "StateMachine": {
+                    "Type": "AWS::StepFunctions::StateMachine",
+                    "Properties": {"DefinitionS3Location": "definiton"},
+                },
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": "template"},
+                },
+                "NestedStack": {"Type": "AWS::CloudFormation::Stack", "Properties": {"TemplateURL": "http://s3"}},
+            }
+        }
+
+        packaged_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://location", "ImageUri": "s3://location"},
+                },
+                "LambdaFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Code": {
+                            "ImageUri": "s3://location",
+                            "S3Bucket": "s3://location",
+                            "S3Key": "s3://location",
+                            "S3ObjectVersion": "s3://location",
+                        }
+                    },
+                },
+                "ServerlessLayer": {
+                    "Type": "AWS::Serverless::LayerVersion",
+                    "Properties": {"ContentUri": "s3://location"},
+                },
+                "LambdaLayer": {"Type": "AWS::Lambda::LayerVersion", "Properties": {"Content": "s3://location"}},
+                "ServerlessApi": {"Type": "AWS::Serverless::Api", "Properties": {"DefinitionUri": "s3://location"}},
+                "RestApi": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"BodyS3Location": "s3://location"}},
+                "ServerlessHttpApi": {
+                    "Type": "AWS::Serverless::HttpApi",
+                    "Properties": {"DefinitionUri": "s3://location"},
+                },
+                "HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"BodyS3Location": "s3://location"}},
+                "ServerlessStateMachine": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {"DefinitionUri": "s3://location"},
+                },
+                "StateMachine": {
+                    "Type": "AWS::StepFunctions::StateMachine",
+                    "Properties": {"DefinitionS3Location": "s3://location"},
+                },
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": "https://s3"},
+                },
+                "NestedStack": {"Type": "AWS::CloudFormation::Stack", "Properties": {"TemplateURL": "https://s3"}},
+            }
+        }
+
+        expected_resources = {
+            "ServerlessFunction",
+            "LambdaFunction",
+            "ServerlessLayer",
+            "LambdaLayer",
+            "ServerlessApi",
+            "RestApi",
+            "ServerlessHttpApi",
+            "HttpApi",
+            "ServerlessStateMachine",
+            "StateMachine",
+            "ServerlessApplication",
+            "NestedStack",
+        }
+
+        local_path_mock.return_value = True
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        processed_resources = infra_sync_executor._sanitize_template(packaged_template_dict, set(), built_template_dict)
+
+        self.assertEqual(processed_resources, expected_resources)
+
+        expected_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {},
+                },
+                "LambdaFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {"Code": {}},
+                },
+                "ServerlessLayer": {
+                    "Type": "AWS::Serverless::LayerVersion",
+                    "Properties": {},
+                },
+                "LambdaLayer": {"Type": "AWS::Lambda::LayerVersion", "Properties": {}},
+                "ServerlessApi": {"Type": "AWS::Serverless::Api", "Properties": {}},
+                "RestApi": {"Type": "AWS::ApiGateway::RestApi", "Properties": {}},
+                "ServerlessHttpApi": {
+                    "Type": "AWS::Serverless::HttpApi",
+                    "Properties": {},
+                },
+                "HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {}},
+                "ServerlessStateMachine": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {},
+                },
+                "StateMachine": {
+                    "Type": "AWS::StepFunctions::StateMachine",
+                    "Properties": {},
+                },
+                "ServerlessApplication": {"Type": "AWS::Serverless::Application", "Properties": {}},
+                "NestedStack": {"Type": "AWS::CloudFormation::Stack", "Properties": {}},
+            }
+        }
+
+        self.assertEqual(packaged_template_dict, expected_dict)
+
+        downloaded_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://location", "ImageUri": "s3://location"},
+                },
+                "LambdaFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Code": {
+                            "ImageUri": "s3://location",
+                            "S3Bucket": "s3://location",
+                            "S3Key": "s3://location",
+                            "S3ObjectVersion": "s3://location",
+                        }
+                    },
+                },
+                "ServerlessLayer": {
+                    "Type": "AWS::Serverless::LayerVersion",
+                    "Properties": {"ContentUri": "s3://location"},
+                },
+                "LambdaLayer": {"Type": "AWS::Lambda::LayerVersion", "Properties": {"Content": "s3://location"}},
+                "ServerlessApi": {"Type": "AWS::Serverless::Api", "Properties": {"DefinitionUri": "s3://location"}},
+                "RestApi": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"BodyS3Location": "s3://location"}},
+                "ServerlessHttpApi": {
+                    "Type": "AWS::Serverless::HttpApi",
+                    "Properties": {"DefinitionUri": "s3://location"},
+                },
+                "HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"BodyS3Location": "s3://location"}},
+                "ServerlessStateMachine": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {"DefinitionUri": "s3://location"},
+                },
+                "StateMachine": {
+                    "Type": "AWS::StepFunctions::StateMachine",
+                    "Properties": {"DefinitionS3Location": "s3://location"},
+                },
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": "https://s3"},
+                },
+                "NestedStack": {"Type": "AWS::CloudFormation::Stack", "Properties": {"TemplateURL": "https://s3"}},
+            }
+        }
+
+        processed_resources = infra_sync_executor._sanitize_template(downloaded_template_dict, expected_resources)
+        self.assertEqual(processed_resources, expected_resources)
+
+        self.assertEqual(downloaded_template_dict, expected_dict)
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_remove_metadata(self, session_mock, local_path_mock):
+        template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "https://s3", "ImageUri": "https://s3"},
+                    "Metadata": {"SamResourceId": "Id"},
+                }
+            }
+        }
+
+        expected_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "https://s3", "ImageUri": "https://s3"},
+                }
+            }
+        }
+
+        local_path_mock.return_value = True
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        infra_sync_executor._sanitize_template(template_dict, set())
+
+        self.assertEqual(template_dict, expected_dict)
+
+    @parameterized.expand([(True, []), (False, ["ServerlessFunction"])])
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_remove_resource_field(self, is_local_path, linked_resources, session_mock, local_path_mock):
+        built_resource_dict = {
+            "Type": "AWS::Serverless::Function",
+            "Properties": {"CodeUri": "local/", "ImageUri": "image"},
+        }
+
+        resource_dict = {
+            "Type": "AWS::Serverless::Function",
+            "Properties": {"CodeUri": "https://s3", "ImageUri": "https://s3"},
+        }
+
+        expected_dict = {
+            "Type": "AWS::Serverless::Function",
+            "Properties": {},
+        }
+
+        resource_type = "AWS::Serverless::Function"
+        serverless_resource_id = "ServerlessFunction"
+
+        local_path_mock.return_value = is_local_path
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        processed_resource = infra_sync_executor._remove_resource_field(
+            serverless_resource_id, resource_type, resource_dict, linked_resources, built_resource_dict
+        )
+
+        self.assertEqual(processed_resource, serverless_resource_id)
+        self.assertEqual(resource_dict, expected_dict)
+
+    @parameterized.expand([(True, []), (False, ["LambdaFunction"])])
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_remove_resource_field_lambda_function(
+        self, is_local_path, linked_resources, session_mock, local_path_mock
+    ):
+        resource_dict = {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Code": {
+                    "ZipFile": "inline code",
+                    "ImageUri": "s3://location",
+                    "S3Bucket": "s3://location",
+                    "S3Key": "s3://location",
+                    "S3ObjectVersion": "s3://location",
+                }
+            },
+        }
+
+        expected_dict = {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {"Code": {"ZipFile": "inline code"}},
+        }
+
+        resource_type = "AWS::Lambda::Function"
+        lambda_resource_id = "LambdaFunction"
+
+        local_path_mock.return_value = is_local_path
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        processed_resource = infra_sync_executor._remove_resource_field(
+            lambda_resource_id, resource_type, resource_dict, linked_resources, resource_dict
+        )
+
+        self.assertEqual(processed_resource, lambda_resource_id)
+        self.assertEqual(resource_dict, expected_dict)
+
+    @parameterized.expand([(True, []), (False, ["LambdaFunction"])])
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_remove_resource_field_lambda_function_code_string(
+        self, is_local_path, linked_resources, session_mock, local_path_mock
+    ):
+        built_resource_dict = {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {"Code": "local"},
+        }
+
+        packaged_resource_dict = {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {"Code": {"S3Bucket": "bucket", "S3Key": "key"}},
+        }
+
+        expected_dict = {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {"Code": {}},
+        }
+
+        resource_type = "AWS::Lambda::Function"
+        lambda_resource_id = "LambdaFunction"
+
+        local_path_mock.return_value = is_local_path
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        processed_resource = infra_sync_executor._remove_resource_field(
+            lambda_resource_id, resource_type, packaged_resource_dict, linked_resources, built_resource_dict
+        )
+
+        self.assertEqual(processed_resource, lambda_resource_id)
+        self.assertEqual(packaged_resource_dict, expected_dict)
+
+    @patch("samcli.lib.sync.infra_sync_executor.get_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.InfraSyncExecutor._get_remote_template_data")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_get_templates(self, session_mock, get_remote_template_mock, get_template_mock):
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        infra_sync_executor.get_template("local")
+        get_template_mock.assert_called_once_with("local")
+
+        infra_sync_executor.get_template("https://s3.com/key/value")
+        get_remote_template_mock.assert_called_once_with("https://s3.com/key/value")
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_get_remote_template(self, sessiion_mock):
+        self.template_dict = {
+            "Resources": {
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": "https://s3.com/bucket/key"},
+                }
+            }
+        }
+
+        s3_string = """{
+            "Resources": {
+                "ServerlessApplication": {
+                    "Type": "AWS::Serverless::Application",
+                    "Properties": {"Location": "https://s3.com/bucket/key"},
+                }
+            }
+        }"""
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        with patch("botocore.response.StreamingBody") as stream_mock:
+            stream_mock.read.return_value = s3_string.encode("utf-8")
+            infra_sync_executor._s3_client.get_object.return_value = {"Body": stream_mock}
+
+            self.assertEqual(
+                infra_sync_executor._get_remote_template_data("https://s3.com/key/value"), self.template_dict
+            )
+
+
+class TestSanitizeTemplateForEachExploration(TestCase):
+    """
+    Bug condition exploration tests for _sanitize_template and _auto_skip_infra_sync
+    with Fn::ForEach keys in the Resources section.
+
+    These tests encode the EXPECTED (correct) behavior. They may fail or produce
+    incorrect results on unfixed code.
+
+    Validates: Requirements 1.3
+    """
+
+    def setUp(self):
+        self.build_context = MagicMock()
+        self.package_context = MagicMock()
+        self.deploy_context = MagicMock()
+        self.sync_context = MagicMock()
+        EventTracker.clear_trackers()
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_template_handles_foreach_keys(self, session_mock, local_path_mock):
+        """
+        Test 1c: When a template contains Fn::ForEach::Functions key (value is a list)
+        alongside regular resources, _sanitize_template must:
+        - Not raise an error
+        - Correctly sanitize regular resources
+        - Preserve the Fn::ForEach::Functions key in the output
+
+        EXPECTED: May fail or produce incorrect results on unfixed code because
+        _sanitize_template iterates over resource keys and calls .get("Type") on
+        the ForEach value (a list), which returns None silently. The method also
+        tries to call .get("Metadata", {}).pop("SamResourceId", None) on the list,
+        which will raise AttributeError.
+
+        Validates: Requirements 1.3
+        """
+        local_path_mock.return_value = True
+
+        # Template with both regular resources and Fn::ForEach keys
+        template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://location"},
+                    "Metadata": {"SamResourceId": "ServerlessFunction"},
+                },
+                "Fn::ForEach::Functions": [
+                    "FunctionName",
+                    {"Ref": "FunctionNames"},
+                    {
+                        "${FunctionName}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "Handler": "index.handler",
+                                "Runtime": "python3.12",
+                                "CodeUri": "./src",
+                            },
+                        }
+                    },
+                ],
+            }
+        }
+
+        built_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "local/"},
+                },
+            }
+        }
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        # The method must not raise an error
+        processed_resources = infra_sync_executor._sanitize_template(template_dict, set(), built_template_dict)
+
+        # Regular resources must be sanitized correctly
+        self.assertIn("ServerlessFunction", processed_resources)
+
+        # The Fn::ForEach::Functions key must be preserved in the output
+        self.assertIn(
+            "Fn::ForEach::Functions",
+            template_dict.get("Resources", {}),
+            "Fn::ForEach::Functions key must be preserved in the template after sanitization",
+        )
+
+        # The ForEach value must still be a list (not corrupted)
+        foreach_value = template_dict["Resources"]["Fn::ForEach::Functions"]
+        self.assertIsInstance(
+            foreach_value,
+            list,
+            "Fn::ForEach::Functions value must remain a list after sanitization",
+        )
+
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_auto_skip_infra_sync_handles_foreach_keys(self, session_mock, local_path_mock):
+        """
+        Test 1d: When _auto_skip_infra_sync processes templates containing
+        Fn::ForEach::* keys, it must not raise an error and must handle
+        ForEach keys gracefully.
+
+        EXPECTED: May fail or produce incorrect results on unfixed code because
+        the resource iteration loop calls .get("Type") on ForEach values (lists),
+        which returns None, and then tries to access properties on the list.
+
+        Validates: Requirements 1.3
+        """
+        local_path_mock.return_value = True
+
+        # Template with Fn::ForEach keys alongside regular resources
+        packaged_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://location"},
+                },
+                "Fn::ForEach::Functions": [
+                    "FunctionName",
+                    {"Ref": "FunctionNames"},
+                    {
+                        "${FunctionName}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "Handler": "index.handler",
+                                "Runtime": "python3.12",
+                                "CodeUri": "./src",
+                            },
+                        }
+                    },
+                ],
+            }
+        }
+
+        built_template_dict = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "local/"},
+                },
+                "Fn::ForEach::Functions": [
+                    "FunctionName",
+                    {"Ref": "FunctionNames"},
+                    {
+                        "${FunctionName}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "Handler": "index.handler",
+                                "Runtime": "python3.12",
+                                "CodeUri": "./src",
+                            },
+                        }
+                    },
+                ],
+            }
+        }
+
+        # Last deployed template matches (same structure)
+        last_deployed_template = {
+            "Resources": {
+                "ServerlessFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://location_old"},
+                },
+                "Fn::ForEach::Functions": [
+                    "FunctionName",
+                    {"Ref": "FunctionNames"},
+                    {
+                        "${FunctionName}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "Handler": "index.handler",
+                                "Runtime": "python3.12",
+                                "CodeUri": "s3://location_old",
+                            },
+                        }
+                    },
+                ],
+            }
+        }
+
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        with patch.object(infra_sync_executor, "get_template") as get_template_mock:
+            get_template_mock.side_effect = [packaged_template_dict, built_template_dict]
+
+            infra_sync_executor._cfn_client.get_template.return_value = {"TemplateBody": str(last_deployed_template)}
+
+            # Mock yaml_parse to return the last deployed template
+            with patch("samcli.lib.sync.infra_sync_executor.yaml_parse") as yaml_parse_mock:
+                yaml_parse_mock.return_value = last_deployed_template
+
+                # The method must not raise an error when encountering Fn::ForEach keys
+                try:
+                    result = infra_sync_executor._auto_skip_infra_sync("packaged_path", "built_path", "stack_name")
+                    # If it returns without error, the test passes for graceful handling
+                    # (the actual return value may vary depending on template comparison)
+                except (AttributeError, TypeError) as e:
+                    self.fail(
+                        f"_auto_skip_infra_sync raised {type(e).__name__} when processing "
+                        f"templates with Fn::ForEach keys: {e}"
+                    )
+
+
+class TestSanitizeTemplatePreservation(TestCase):
+    """
+    Preservation tests for _sanitize_template with regular resources (no Fn::ForEach keys).
+
+    These tests verify that sanitization produces the same result as current code
+    for templates without Fn::ForEach::* keys. They MUST PASS on both unfixed and fixed code.
+
+    Validates: Requirements 3.1, 3.4
+    """
+
+    def setUp(self):
+        self.build_context = MagicMock()
+        self.package_context = MagicMock()
+        self.deploy_context = MagicMock()
+        self.sync_context = MagicMock()
+        EventTracker.clear_trackers()
+
+    @parameterized.expand(
+        [
+            (
+                "single_serverless_function",
+                {
+                    "Resources": {
+                        "MyFunction": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/code.zip"},
+                            "Metadata": {"SamResourceId": "MyFunction"},
+                        },
+                    }
+                },
+                {
+                    "Resources": {
+                        "MyFunction": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "local/"},
+                        },
+                    }
+                },
+                {"MyFunction"},
+                {
+                    "Resources": {
+                        "MyFunction": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {},
+                        },
+                    }
+                },
+            ),
+            (
+                "multiple_serverless_functions",
+                {
+                    "Resources": {
+                        "FuncA": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/a.zip", "ImageUri": "s3://img"},
+                            "Metadata": {"SamResourceId": "FuncA"},
+                        },
+                        "FuncB": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/b.zip"},
+                            "Metadata": {"SamResourceId": "FuncB"},
+                        },
+                    }
+                },
+                {
+                    "Resources": {
+                        "FuncA": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "local/a", "ImageUri": "local/img"},
+                        },
+                        "FuncB": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "local/b"},
+                        },
+                    }
+                },
+                {"FuncA", "FuncB"},
+                {
+                    "Resources": {
+                        "FuncA": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {},
+                        },
+                        "FuncB": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {},
+                        },
+                    }
+                },
+            ),
+            (
+                "lambda_function_with_image",
+                {
+                    "Resources": {
+                        "ImageFunc": {
+                            "Type": "AWS::Lambda::Function",
+                            "Properties": {
+                                "Code": {
+                                    "ImageUri": "123.dkr.ecr.us-east-1.amazonaws.com/repo:tag",
+                                    "S3Bucket": "bucket",
+                                    "S3Key": "key",
+                                    "S3ObjectVersion": "v1",
+                                }
+                            },
+                            "Metadata": {"SamResourceId": "ImageFunc"},
+                        },
+                    }
+                },
+                {
+                    "Resources": {
+                        "ImageFunc": {
+                            "Type": "AWS::Lambda::Function",
+                            "Properties": {
+                                "Code": {
+                                    "ImageUri": "local/image",
+                                    "S3Bucket": "local-bucket",
+                                    "S3Key": "local-key",
+                                    "S3ObjectVersion": "local-v1",
+                                }
+                            },
+                        },
+                    }
+                },
+                {"ImageFunc"},
+                {
+                    "Resources": {
+                        "ImageFunc": {
+                            "Type": "AWS::Lambda::Function",
+                            "Properties": {"Code": {}},
+                        },
+                    }
+                },
+            ),
+            (
+                "mixed_resource_types",
+                {
+                    "Resources": {
+                        "MyFunc": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/code.zip"},
+                            "Metadata": {"SamResourceId": "MyFunc"},
+                        },
+                        "MyLayer": {
+                            "Type": "AWS::Serverless::LayerVersion",
+                            "Properties": {"ContentUri": "s3://bucket/layer.zip"},
+                            "Metadata": {"SamResourceId": "MyLayer"},
+                        },
+                        "MyApi": {
+                            "Type": "AWS::Serverless::Api",
+                            "Properties": {"DefinitionUri": "s3://bucket/api.yaml"},
+                        },
+                        "MyTopic": {
+                            "Type": "AWS::SNS::Topic",
+                            "Properties": {"TopicName": "my-topic"},
+                        },
+                    }
+                },
+                {
+                    "Resources": {
+                        "MyFunc": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "local/"},
+                        },
+                        "MyLayer": {
+                            "Type": "AWS::Serverless::LayerVersion",
+                            "Properties": {"ContentUri": "local/layer"},
+                        },
+                        "MyApi": {
+                            "Type": "AWS::Serverless::Api",
+                            "Properties": {"DefinitionUri": "local/api.yaml"},
+                        },
+                        "MyTopic": {
+                            "Type": "AWS::SNS::Topic",
+                            "Properties": {"TopicName": "my-topic"},
+                        },
+                    }
+                },
+                {"MyFunc", "MyLayer", "MyApi"},
+                {
+                    "Resources": {
+                        "MyFunc": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {},
+                        },
+                        "MyLayer": {
+                            "Type": "AWS::Serverless::LayerVersion",
+                            "Properties": {},
+                        },
+                        "MyApi": {
+                            "Type": "AWS::Serverless::Api",
+                            "Properties": {},
+                        },
+                        "MyTopic": {
+                            "Type": "AWS::SNS::Topic",
+                            "Properties": {"TopicName": "my-topic"},
+                        },
+                    }
+                },
+            ),
+        ]
+    )
+    @patch("samcli.lib.sync.infra_sync_executor.is_local_path")
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_template_regular_resources_unchanged(
+        self,
+        test_name,
+        packaged_template,
+        built_template,
+        expected_processed_resources,
+        expected_sanitized_template,
+        session_mock,
+        local_path_mock,
+    ):
+        """
+        Test 2c: Pass templates with only regular resources (no Fn::ForEach::* keys)
+        to _sanitize_template and verify sanitization produces the same result as
+        current code.
+
+        Parametrized over representative template configurations:
+        - single_serverless_function: basic single function
+        - multiple_serverless_functions: multiple functions with different properties
+        - lambda_function_with_image: Lambda function with image/S3 code properties
+        - mixed_resource_types: functions, layers, APIs, and non-syncable resources
+
+        Validates: Requirements 3.1, 3.4
+        """
+        import copy
+
+        local_path_mock.return_value = True
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+
+        template_to_sanitize = copy.deepcopy(packaged_template)
+        processed_resources = infra_sync_executor._sanitize_template(template_to_sanitize, set(), built_template)
+
+        self.assertEqual(
+            processed_resources,
+            expected_processed_resources,
+            f"Processed resources mismatch for {test_name}",
+        )
+
+        self.assertEqual(
+            template_to_sanitize,
+            expected_sanitized_template,
+            f"Sanitized template mismatch for {test_name}",
+        )
+
+
+class TestSanitizeForEachBody(TestCase):
+    """Tests for _sanitize_foreach_body — sanitizing artifact properties inside ForEach blocks."""
+
+    def setUp(self):
+        self.build_context = MagicMock()
+        self.package_context = MagicMock()
+        self.deploy_context = MagicMock()
+        self.sync_context = MagicMock()
+        EventTracker.clear_trackers()
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_serverless_function(self, session_mock):
+        """ForEach body with Serverless functions — CodeUri and ImageUri should be removed."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["Users", "Orders"],
+            {
+                "${Name}Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "Handler": "index.handler",
+                        "Runtime": "python3.12",
+                        "CodeUri": "s3://bucket/code.zip",
+                    },
+                    "Metadata": {"SamResourceId": "${Name}Function"},
+                }
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        body = foreach_value[2]
+        self.assertNotIn("CodeUri", body["${Name}Function"]["Properties"])
+        self.assertNotIn("SamResourceId", body["${Name}Function"].get("Metadata", {}))
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_api(self, session_mock):
+        """ForEach body with APIs — DefinitionUri should be removed."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["Users", "Orders"],
+            {
+                "${Name}Api": {
+                    "Type": "AWS::Serverless::Api",
+                    "Properties": {"StageName": "prod", "DefinitionUri": "s3://bucket/swagger.yaml"},
+                }
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        self.assertNotIn("DefinitionUri", foreach_value[2]["${Name}Api"]["Properties"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_layer(self, session_mock):
+        """ForEach body with layers — ContentUri should be removed."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["Common", "Auth"],
+            {
+                "${Name}Layer": {
+                    "Type": "AWS::Serverless::LayerVersion",
+                    "Properties": {"ContentUri": "s3://bucket/layer.zip"},
+                }
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        self.assertNotIn("ContentUri", foreach_value[2]["${Name}Layer"]["Properties"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_state_machine(self, session_mock):
+        """ForEach body with state machines — DefinitionUri should be removed."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["Process", "Notify"],
+            {
+                "${Name}StateMachine": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {"DefinitionUri": "s3://bucket/sfn.json"},
+                }
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        self.assertNotIn("DefinitionUri", foreach_value[2]["${Name}StateMachine"]["Properties"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_cfn_api(self, session_mock):
+        """ForEach body with CFN RestApi — BodyS3Location should be removed."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["Users", "Orders"],
+            {
+                "${Name}RestApi": {
+                    "Type": "AWS::ApiGateway::RestApi",
+                    "Properties": {"BodyS3Location": "s3://bucket/swagger.yaml"},
+                }
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        self.assertNotIn("BodyS3Location", foreach_value[2]["${Name}RestApi"]["Properties"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_cfn_step_functions(self, session_mock):
+        """ForEach body with CFN StepFunctions — DefinitionS3Location should be removed."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["Process", "Notify"],
+            {
+                "${Name}SM": {
+                    "Type": "AWS::StepFunctions::StateMachine",
+                    "Properties": {"DefinitionS3Location": "s3://bucket/sfn.json"},
+                }
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        self.assertNotIn("DefinitionS3Location", foreach_value[2]["${Name}SM"]["Properties"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_nested_stack(self, session_mock):
+        """ForEach body with nested stacks — TemplateURL should be removed."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["A", "B"],
+            {
+                "${Name}Stack": {
+                    "Type": "AWS::CloudFormation::Stack",
+                    "Properties": {"TemplateURL": "s3://bucket/nested.yaml"},
+                }
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        self.assertNotIn("TemplateURL", foreach_value[2]["${Name}Stack"]["Properties"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_nested_foreach(self, session_mock):
+        """Nested ForEach — inner body resources should also be sanitized."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Env",
+            ["Dev", "Prod"],
+            {
+                "Fn::ForEach::Services": [
+                    "Svc",
+                    ["Users", "Orders"],
+                    {
+                        "${Env}${Svc}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/code.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ]
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        inner_body = foreach_value[2]["Fn::ForEach::Services"][2]
+        self.assertNotIn("CodeUri", inner_body["${Env}${Svc}Function"]["Properties"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_invalid_value(self, session_mock):
+        """Invalid ForEach value (not a list or too short) — should not raise."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        infra_sync_executor._sanitize_foreach_body("not a list")
+        infra_sync_executor._sanitize_foreach_body([])
+        infra_sync_executor._sanitize_foreach_body(["only_one"])
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_sanitize_foreach_body_mixed_resources(self, session_mock):
+        """ForEach body with mixed resource types — all should be sanitized."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        foreach_value = [
+            "Name",
+            ["A", "B"],
+            {
+                "${Name}Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://bucket/code.zip", "Runtime": "python3.12"},
+                },
+                "${Name}Api": {
+                    "Type": "AWS::Serverless::Api",
+                    "Properties": {"DefinitionUri": "s3://bucket/swagger.yaml", "StageName": "prod"},
+                },
+                "${Name}Layer": {
+                    "Type": "AWS::Serverless::LayerVersion",
+                    "Properties": {"ContentUri": "s3://bucket/layer.zip"},
+                },
+                "${Name}Table": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "Properties": {"TableName": "table"},
+                },
+            },
+        ]
+        infra_sync_executor._sanitize_foreach_body(foreach_value)
+        body = foreach_value[2]
+        self.assertNotIn("CodeUri", body["${Name}Function"]["Properties"])
+        self.assertNotIn("DefinitionUri", body["${Name}Api"]["Properties"])
+        self.assertNotIn("ContentUri", body["${Name}Layer"]["Properties"])
+        # Non-syncable resource should be untouched
+        self.assertEqual(body["${Name}Table"]["Properties"]["TableName"], "table")
+
+
+class TestDetectForEachCodeChanges(TestCase):
+    """Tests for _detect_foreach_code_changes — detecting code changes in expanded ForEach resources."""
+
+    def setUp(self):
+        self.build_context = MagicMock()
+        self.package_context = MagicMock()
+        self.deploy_context = MagicMock()
+        self.sync_context = MagicMock()
+        EventTracker.clear_trackers()
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_no_language_extensions(self, session_mock):
+        """Template without LE — should not add any code sync resources."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        template = {"Resources": {"Func": {"Type": "AWS::Serverless::Function"}}}
+        infra_sync_executor._detect_foreach_code_changes(template, template)
+        self.assertEqual(infra_sync_executor._code_sync_resources, set())
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_function_code_change_detected(self, session_mock):
+        """ForEach function with code change — should be added to _code_sync_resources."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        current = {
+            "Transform": "AWS::LanguageExtensions",
+            "Parameters": {"Names": {"Type": "CommaDelimitedList", "Default": "Users,Orders"}},
+            "Resources": {
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["Users", "Orders"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/new-code.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ]
+            },
+        }
+        deployed = {
+            "Transform": "AWS::LanguageExtensions",
+            "Parameters": {"Names": {"Type": "CommaDelimitedList", "Default": "Users,Orders"}},
+            "Resources": {
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["Users", "Orders"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/old-code.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ]
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(current, deployed)
+        resource_ids = {str(r) for r in infra_sync_executor._code_sync_resources}
+        self.assertIn("UsersFunction", resource_ids)
+        self.assertIn("OrdersFunction", resource_ids)
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_no_changes(self, session_mock):
+        """ForEach with identical templates — no code sync resources."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        template = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["Users"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/same.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ]
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(template, template)
+        self.assertEqual(infra_sync_executor._code_sync_resources, set())
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_api_definition_change_detected(self, session_mock):
+        """ForEach API with definition change — should be added to _code_sync_resources."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        current = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::APIs": [
+                    "Name",
+                    ["Users", "Orders"],
+                    {
+                        "${Name}Api": {
+                            "Type": "AWS::Serverless::Api",
+                            "Properties": {"DefinitionUri": "s3://bucket/new-swagger.yaml", "StageName": "prod"},
+                        }
+                    },
+                ]
+            },
+        }
+        deployed = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::APIs": [
+                    "Name",
+                    ["Users", "Orders"],
+                    {
+                        "${Name}Api": {
+                            "Type": "AWS::Serverless::Api",
+                            "Properties": {"DefinitionUri": "s3://bucket/old-swagger.yaml", "StageName": "prod"},
+                        }
+                    },
+                ]
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(current, deployed)
+        resource_ids = {str(r) for r in infra_sync_executor._code_sync_resources}
+        self.assertIn("UsersApi", resource_ids)
+        self.assertIn("OrdersApi", resource_ids)
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_layer_content_change_detected(self, session_mock):
+        """ForEach layer with content change — should be added to _code_sync_resources."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        current = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::Layers": [
+                    "Name",
+                    ["Common", "Auth"],
+                    {
+                        "${Name}Layer": {
+                            "Type": "AWS::Serverless::LayerVersion",
+                            "Properties": {"ContentUri": "s3://bucket/new-layer.zip"},
+                        }
+                    },
+                ]
+            },
+        }
+        deployed = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::Layers": [
+                    "Name",
+                    ["Common", "Auth"],
+                    {
+                        "${Name}Layer": {
+                            "Type": "AWS::Serverless::LayerVersion",
+                            "Properties": {"ContentUri": "s3://bucket/old-layer.zip"},
+                        }
+                    },
+                ]
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(current, deployed)
+        resource_ids = {str(r) for r in infra_sync_executor._code_sync_resources}
+        self.assertIn("CommonLayer", resource_ids)
+        self.assertIn("AuthLayer", resource_ids)
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_state_machine_definition_change_detected(self, session_mock):
+        """ForEach state machine with definition change — should be added to _code_sync_resources."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        current = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::SMs": [
+                    "Name",
+                    ["Process", "Notify"],
+                    {
+                        "${Name}SM": {
+                            "Type": "AWS::Serverless::StateMachine",
+                            "Properties": {"DefinitionUri": "s3://bucket/new-sfn.json"},
+                        }
+                    },
+                ]
+            },
+        }
+        deployed = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::SMs": [
+                    "Name",
+                    ["Process", "Notify"],
+                    {
+                        "${Name}SM": {
+                            "Type": "AWS::Serverless::StateMachine",
+                            "Properties": {"DefinitionUri": "s3://bucket/old-sfn.json"},
+                        }
+                    },
+                ]
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(current, deployed)
+        resource_ids = {str(r) for r in infra_sync_executor._code_sync_resources}
+        self.assertIn("ProcessSM", resource_ids)
+        self.assertIn("NotifySM", resource_ids)
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_skips_regular_resources(self, session_mock):
+        """Regular (non-ForEach) resources should be skipped — they're handled by the main loop."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        current = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "RegularFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://bucket/new.zip", "Runtime": "python3.12"},
+                },
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["A"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/new.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ],
+            },
+        }
+        deployed = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "RegularFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {"CodeUri": "s3://bucket/old.zip", "Runtime": "python3.12"},
+                },
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["A"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/same.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ],
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(current, deployed)
+        resource_ids = {str(r) for r in infra_sync_executor._code_sync_resources}
+        # RegularFunction should NOT be in the set — it's a regular resource
+        self.assertNotIn("RegularFunction", resource_ids)
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_nested_prefix(self, session_mock):
+        """ForEach code changes with nested prefix — resource IDs should include prefix."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        current = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["Users"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/new.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ]
+            },
+        }
+        deployed = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["Users"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {"CodeUri": "s3://bucket/old.zip", "Runtime": "python3.12"},
+                        }
+                    },
+                ]
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(current, deployed, nested_prefix="ChildStack/")
+        resource_ids = {str(r) for r in infra_sync_executor._code_sync_resources}
+        self.assertIn("ChildStack/UsersFunction", resource_ids)
+
+    @patch("samcli.lib.sync.infra_sync_executor.Session")
+    def test_partial_change_only_changed_resource(self, session_mock):
+        """Only the changed ForEach resource should be added, not all of them."""
+        infra_sync_executor = InfraSyncExecutor(
+            self.build_context, self.package_context, self.deploy_context, self.sync_context
+        )
+        current = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["Users", "Orders"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "CodeUri": {"Fn::FindInMap": ["SAMCodeUriFuncs", {"Ref": "Name"}, "CodeUri"]},
+                                "Runtime": "python3.12",
+                            },
+                        }
+                    },
+                ]
+            },
+            "Mappings": {
+                "SAMCodeUriFuncs": {
+                    "Users": {"CodeUri": "s3://bucket/users-new.zip"},
+                    "Orders": {"CodeUri": "s3://bucket/orders-same.zip"},
+                }
+            },
+        }
+        deployed = {
+            "Transform": "AWS::LanguageExtensions",
+            "Resources": {
+                "Fn::ForEach::Funcs": [
+                    "Name",
+                    ["Users", "Orders"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "CodeUri": {"Fn::FindInMap": ["SAMCodeUriFuncs", {"Ref": "Name"}, "CodeUri"]},
+                                "Runtime": "python3.12",
+                            },
+                        }
+                    },
+                ]
+            },
+            "Mappings": {
+                "SAMCodeUriFuncs": {
+                    "Users": {"CodeUri": "s3://bucket/users-old.zip"},
+                    "Orders": {"CodeUri": "s3://bucket/orders-same.zip"},
+                }
+            },
+        }
+        infra_sync_executor._detect_foreach_code_changes(current, deployed)
+        resource_ids = {str(r) for r in infra_sync_executor._code_sync_resources}
+        self.assertIn("UsersFunction", resource_ids)
+        self.assertNotIn("OrdersFunction", resource_ids)

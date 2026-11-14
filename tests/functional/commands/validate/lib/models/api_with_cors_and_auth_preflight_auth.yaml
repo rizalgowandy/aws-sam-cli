@@ -1,6 +1,6 @@
 Globals:
   Api:
-    Cors: "origins"
+    Cors: origins
 
 Resources:
   ApiFunction:
@@ -8,7 +8,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/member_portal.zip
       Handler: index.gethtml
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         GetHtml:
           Type: Api
@@ -44,11 +44,11 @@ Resources:
             FunctionArn: !GetAtt MyAuthFn.Arn
             Identity:
               Headers:
-                - Authorization1
+              - Authorization1
 
   MyAuthFn:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: s3://bucket/key
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x

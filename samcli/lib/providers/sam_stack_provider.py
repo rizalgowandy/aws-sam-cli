@@ -1,12 +1,15 @@
 """
 Class that provides all nested stacks from a given SAM template
 """
+
 import logging
 import os
-from typing import Optional, Dict, cast, List, Iterator, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, cast
 from urllib.parse import unquote, urlparse
 
-from samcli.commands._utils.template import get_template_data
+from samcli.commands._utils.template import TemplateNotFoundException, get_template_data
+from samcli.lib.cfn_language_extensions.sam_integration import LanguageExtensionResult, expand_language_extensions
+from samcli.lib.intrinsic_resolver.intrinsics_symbol_table import IntrinsicsSymbolTable
 from samcli.lib.providers.exceptions import RemoteStackLocationNotSupported
 from samcli.lib.providers.provider import Stack, get_full_path
 from samcli.lib.providers.sam_base_provider import SamBaseProvider
@@ -29,6 +32,8 @@ class SamLocalStackProvider(SamBaseProvider):
         template_dict: Dict,
         parameter_overrides: Optional[Dict] = None,
         global_parameter_overrides: Optional[Dict] = None,
+        use_sam_transform: bool = True,
+        language_extension_result: Optional[LanguageExtensionResult] = None,
     ):
         """
         Initialize the class with SAM template data. The SAM template passed to this provider is assumed
@@ -37,13 +42,25 @@ class SamLocalStackProvider(SamBaseProvider):
         This class does not perform any syntactic validation of the template.
         After the class is initialized, any changes to the ``template_dict`` will not be reflected in here.
         You need to explicitly update the class with new template, if necessary.
-        :param str template_file: SAM Stack Template file path
-        :param str stack_path: SAM Stack stack_path (See samcli.lib.providers.provider.Stack.stack_path)
-        :param dict template_dict: SAM Template as a dictionary
-        :param dict parameter_overrides: Optional dictionary of values for SAM template parameters that might want
-            to get substituted within the template
-        :param dict global_parameter_overrides: Optional dictionary of values for SAM template global parameters that
-            might want to get substituted within the template and all its child templates
+        Parameters
+        ----------
+        template_file: str
+            SAM Stack Template file path
+        stack_path: str
+            SAM Stack stack_path (See samcli.lib.providers.provider.Stack.stack_path)
+        template_dict: dict
+            SAM Template as a dictionary
+        parameter_overrides: dict
+            Optional dictionary of values for SAM template parameters that might want to get substituted within
+            the template
+        global_parameter_overrides: dict
+            Optional dictionary of values for SAM template global parameters that might want to get substituted within
+            the template and all its child templates
+        use_sam_transform: bool
+            Whether to transform the given template with Serverless Application Model. Default is True
+        language_extension_result : LanguageExtensionResult, optional
+            Pre-computed result from expand_language_extensions(). When provided,
+            avoids redundant deep-copy in SamTranslatorWrapper.
         """
 
         self._template_file = template_file
@@ -51,17 +68,19 @@ class SamLocalStackProvider(SamBaseProvider):
         self._template_dict = self.get_template(
             template_dict,
             SamLocalStackProvider.merge_parameter_overrides(parameter_overrides, global_parameter_overrides),
+            use_sam_transform=use_sam_transform,
+            language_extension_result=language_extension_result,
         )
         self._resources = self._template_dict.get("Resources", {})
         self._global_parameter_overrides = global_parameter_overrides
-
-        LOG.debug("%d stacks found in the template", len(self._resources))
 
         # Store a map of stack name to stack information for quick reference -> self._stacks
         # and detect remote stacks -> self._remote_stack_full_paths
         self._stacks: Dict[str, Stack] = {}
         self.remote_stack_full_paths: List[str] = []
         self._extract_stacks()
+
+        LOG.debug("%d stacks found in the template", len(self._stacks))
 
     def get(self, name: str) -> Optional[Stack]:
         """
@@ -98,7 +117,6 @@ class SamLocalStackProvider(SamBaseProvider):
         """
 
         for name, resource in self._resources.items():
-
             resource_type = resource.get("Type")
             resource_properties = resource.get("Properties", {})
             resource_metadata = resource.get("Metadata", None)
@@ -192,12 +210,15 @@ class SamLocalStackProvider(SamBaseProvider):
 
     @staticmethod
     def get_stacks(
-        template_file: str,
+        template_file: Optional[str] = None,
         stack_path: str = "",
         name: str = "",
         parameter_overrides: Optional[Dict] = None,
         global_parameter_overrides: Optional[Dict] = None,
         metadata: Optional[Dict] = None,
+        template_dictionary: Optional[Dict] = None,
+        use_sam_transform: bool = True,
+        language_extensions_enabled: bool = False,
     ) -> Tuple[List[Stack], List[str]]:
         """
         Recursively extract stacks from a template file.
@@ -205,7 +226,8 @@ class SamLocalStackProvider(SamBaseProvider):
         Parameters
         ----------
         template_file: str
-            the file path of the template to extract stacks from
+            the file path of the template to extract stacks from. Only one of either template_dict or template_file
+            is required
         stack_path: str
             the stack path of the parent stack, for root stack, it is ""
         name: str
@@ -218,6 +240,16 @@ class SamLocalStackProvider(SamBaseProvider):
             that might want to get substituted within the template and its child templates
         metadata: Optional[Dict]
             Optional dictionary of nested stack resource metadata values.
+        template_dictionary: Optional[Dict]
+            dictionary representing the sam template. Only one of either template_dict or template_file is required
+        use_sam_transform: bool
+            Whether to transform the given template with Serverless Application Model. Default is True
+        language_extensions_enabled: bool
+            Whether to run AWS::LanguageExtensions Phase 1 expansion locally.
+            Off by default (matches pre-1.160.0 behavior). Callers at the SAM
+            CLI command boundary (BuildContext, PackageContext, DeployContext,
+            SyncContext, InvokeContext) resolve this via
+            resolve_language_extensions_enabled().
 
         Returns
         -------
@@ -226,21 +258,56 @@ class SamLocalStackProvider(SamBaseProvider):
         remote_stack_full_paths : List[str]
             The list of full paths of detected remote stacks
         """
-        template_dict = get_template_data(template_file)
+        template_dict: dict
+        if template_file:
+            template_dict = get_template_data(template_file)
+        elif template_dictionary:
+            template_file = ""
+            template_dict = template_dictionary
+        else:
+            raise TemplateNotFoundException(
+                message="A template file or a template dict is required but both are missing."
+            )
+
+        # Process language extensions BEFORE creating Stack objects
+        # This ensures Fn::ForEach and other language extensions are expanded early,
+        # so that the Stack's template_dict contains expanded resources
+        merged_params = SamLocalStackProvider.merge_parameter_overrides(parameter_overrides, global_parameter_overrides)
+
+        parameter_values: Dict[str, Any] = {}
+        parameter_values.update(IntrinsicsSymbolTable.DEFAULT_PSEUDO_PARAM_VALUES)
+        parameter_values.update(merged_params or {})
+
+        lang_ext_result = expand_language_extensions(
+            template_dict, parameter_values=parameter_values, enabled=language_extensions_enabled
+        )
+        processed_template_dict = lang_ext_result.expanded_template
+
+        # Store the original template (before language extensions processing) for CloudFormation deployment
+        # This preserves Fn::ForEach and other language extension constructs
+        original_template = lang_ext_result.original_template if lang_ext_result.had_language_extensions else None
+
         stacks = [
             Stack(
                 stack_path,
                 name,
                 template_file,
-                SamLocalStackProvider.merge_parameter_overrides(parameter_overrides, global_parameter_overrides),
-                template_dict,
+                merged_params,
+                processed_template_dict,
                 metadata,
+                original_template_dict=original_template,
             )
         ]
         remote_stack_full_paths: List[str] = []
 
         current = SamLocalStackProvider(
-            template_file, stack_path, template_dict, parameter_overrides, global_parameter_overrides
+            template_file,
+            stack_path,
+            processed_template_dict,  # Use processed template with expanded language extensions
+            parameter_overrides,
+            global_parameter_overrides,
+            use_sam_transform=use_sam_transform,
+            language_extension_result=lang_ext_result if lang_ext_result.had_language_extensions else None,
         )
         remote_stack_full_paths.extend(current.remote_stack_full_paths)
 
@@ -252,6 +319,8 @@ class SamLocalStackProvider(SamBaseProvider):
                 child_stack.parameters,
                 global_parameter_overrides,
                 child_stack.metadata,
+                use_sam_transform=use_sam_transform,
+                language_extensions_enabled=language_extensions_enabled,
             )
             stacks.extend(stacks_in_child)
             remote_stack_full_paths.extend(remote_stack_full_paths_in_child)
@@ -315,9 +384,9 @@ class SamLocalStackProvider(SamBaseProvider):
 
         * symlinks on Windows might not work properly.
           https://stackoverflow.com/questions/43333640/python-os-path-realpath-for-symlink-in-windows
-          For example, using Python 3.7, realpath() is a no-op (same as abspath):
+          For example, using Python 3.8, realpath() is a no-op (same as abspath):
             ```
-            Python 3.7.8 (tags/v3.7.8:4b47a5b6ba, Jun 28 2020, 08:53:46) [MSC v.1916 64 bit (AMD64)] on win32
+            Python 3.8.8 (tags/v3.8.8:4b47a5b6ba, Jun 28 2020, 08:53:46) [MSC v.1916 64 bit (AMD64)] on win32
             Type "help", "copyright", "credits" or "license" for more information.
             >>> import os
             >>> os.symlink('some\\path', 'link1')

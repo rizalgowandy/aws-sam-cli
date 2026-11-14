@@ -1,44 +1,101 @@
-import os
 import tempfile
-from unittest import skipIf
-
-from click.testing import CliRunner
-from samcli.commands.init import cli as init_cmd
+import pytest
+from functools import lru_cache
 from pathlib import Path
 
-from samcli.lib.utils.packagetype import ZIP
+from boto3.session import Session
+from click.testing import CliRunner
+
+from samcli.commands.init import cli as init_cmd
+from samcli.commands.init.init_templates import InitTemplates
+from samcli.commands.init.interactive_init_flow import get_sorted_runtimes
 from tests.integration.init.schemas.schemas_test_data_setup import SchemaTestDataSetup
-from tests.testing_utils import RUNNING_ON_CI, RUNNING_TEST_FOR_MASTER_ON_CI, RUN_BY_CANARY
 
 # Schemas tests require credentials. This is to skip running the test where credentials are not available.
-SKIP_SCHEMA_TESTS = RUNNING_ON_CI and RUNNING_TEST_FOR_MASTER_ON_CI and not RUN_BY_CANARY
+
+EVENT_BRIDGE_USE_CASE = "Infrastructure event management"
+
+# Prompt labels, not runtime ids -- the go entry displays as "go (provided.al2)".
+JAVA_RUNTIME_FOR_INIT = "java17.al2023"
+PYTHON_RUNTIME_FOR_INIT = "python3.9"
+GO_RUNTIME_FOR_INIT = "go (provided.al2)"
 
 
-@skipIf(SKIP_SCHEMA_TESTS, "Skip schema test")
+def _get_registry_position(registry_name):
+    """Query EventBridge Schema registries and return the 1-based menu position for the given registry name.
+
+    The sam init interactive prompt lists registries in alphabetical order.
+    This avoids hardcoding positions that break when new registries are added to the account.
+    """
+    session = Session()
+    client = session.client("schemas", region_name=session.region_name)
+    paginator = client.get_paginator("list_registries")
+    registries = []
+    for page in paginator.paginate():
+        registries.extend(r["RegistryName"] for r in page["Registries"])
+    registries.sort()
+    for i, name in enumerate(registries, 1):
+        if name == registry_name:
+            return i
+    raise ValueError(f"Registry '{registry_name}' not found. Available: {registries}")
+
+
+@lru_cache(maxsize=1)
+def _get_manifest():
+    """Fetch once per process: each call re-fetches MANIFEST_URL, and two calls can differ."""
+    return InitTemplates().get_preprocessed_manifest(None, None, None, None)
+
+
+def _get_runtime_position(runtime_name):
+    """Resolve a runtime's 1-based position; the order shifts as runtimes are added/removed."""
+    runtime_options = _get_manifest()[EVENT_BRIDGE_USE_CASE]
+    runtimes = get_sorted_runtimes(list(runtime_options.keys()))
+    for i, name in enumerate(runtimes, 1):
+        if name == runtime_name:
+            return i
+    raise ValueError(f"Runtime '{runtime_name}' not found. Available: {runtimes}")
+
+
+def _get_use_case_position(use_case_name):
+    """Resolve a use case's 1-based position; the manifest grows over time."""
+    use_cases = list(_get_manifest().keys())
+    for i, name in enumerate(use_cases, 1):
+        if name == use_case_name:
+            return i
+    raise ValueError(f"Use case '{use_case_name}' not found. Available: {use_cases}")
+
+
+@pytest.mark.requires_credential
+@pytest.mark.xdist_group(name="sam_init")
 class TestBasicInitWithEventBridgeCommand(SchemaTestDataSetup):
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_aws_registry(self):
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 7: Infrastructure event management - Use case
-        # 2: Java Runtime (java11)
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {java_runtime_pos}: JAVA_RUNTIME_FOR_INIT (dynamic position)
         # 2: Maven
         # 2: select event-bridge app from scratch
-        # test-project: response to name
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
+        # eb-app-maven: response to name
         # Y: Use default aws configuration
-        # 1: select schema from cli_paginator
-        # 4: select aws.events as registries
+        # {aws_registry_pos}: select aws.events as registries (dynamic position)
         # 9: select schema AWSAPICallViaCloudTrail
-
-        user_input = """
+        aws_registry_pos = _get_registry_position("aws.events")
+        user_input = f"""
 1
-7
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(JAVA_RUNTIME_FOR_INIT)}
 2
 2
-2
+N
+N
+N
 eb-app-maven
 Y
-1
-4
+{aws_registry_pos}
 9
         """
         with tempfile.TemporaryDirectory() as temp:
@@ -53,28 +110,34 @@ Y
                 Path(expected_output_folder, "HelloWorldFunction", "src", "main", "java", "schema").is_dir()
             )
 
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_partner_registry(self):
-        # setup schema data
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 7: Infrastructure event management - Use case
-        # 2: Java Runtime
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {java_runtime_pos}: JAVA_RUNTIME_FOR_INIT (dynamic position)
         # 2: Maven
         # 2: select event-bridge app from scratch
-        # test-project: response to name
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
+        # eb-app-maven: response to name
         # Y: Use default aws configuration
-        # 3: partner registry
+        # {partner_registry_pos}: partner registry (dynamic position)
         # 1: select aws schema
-
-        user_input = """
+        partner_registry_pos = _get_registry_position("partner-registry")
+        user_input = f"""
 1
-7
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(JAVA_RUNTIME_FOR_INIT)}
 2
 2
-2
+N
+N
+N
 eb-app-maven
 Y
-3
+{partner_registry_pos}
 1
         """
         with tempfile.TemporaryDirectory() as temp:
@@ -101,29 +164,36 @@ Y
                 ).is_file()
             )
 
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_pagination(self):
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 7: Infrastructure event management - Use case
-        # 2: Java Runtime
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {java_runtime_pos}: JAVA_RUNTIME_FOR_INIT (dynamic position)
         # 2: Maven
         # 2: select event-bridge app from scratch
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
         # eb-app-maven: response to name
         # Y: Use default aws configuration
-        # 4: select pagination-registry as registries
+        # {pagination_registry_pos}: select pagination-registry (dynamic position)
         # N: Go to next page
-        # P Go to previous page
-        # select 2nd schema
-
-        user_input = """
+        # P: Go to previous page
+        # 2: select 2nd schema
+        pagination_registry_pos = _get_registry_position("test-pagination")
+        user_input = f"""
 1
-7
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(JAVA_RUNTIME_FOR_INIT)}
 2
 2
-2
+N
+N
+N
 eb-app-maven
 Y
-4
+{pagination_registry_pos}
 N
 P
 2
@@ -141,27 +211,34 @@ P
                 Path(expected_output_folder, "HelloWorldFunction", "src", "main", "java", "schema").is_dir()
             )
 
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_customer_registry(self):
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 7: Infrastructure event management - Use case
-        # 2: Java Runtime
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {java_runtime_pos}: JAVA_RUNTIME_FOR_INIT (dynamic position)
         # 2: Maven
         # 2: select event-bridge app from scratch
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
         # eb-app-maven: response to name
         # Y: Use default aws configuration
-        # 2: select 2p-schema other-schema
-        # 1: select 1 schema
-
-        user_input = """
+        # {other_schema_pos}: select other-schema registry (dynamic position)
+        # 1: select 1st schema
+        other_schema_pos = _get_registry_position("other-schema")
+        user_input = f"""
 1
-7
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(JAVA_RUNTIME_FOR_INIT)}
 2
 2
-2
+N
+N
+N
 eb-app-maven
 Y
-2
+{other_schema_pos}
 1
                 """
         with tempfile.TemporaryDirectory() as temp:
@@ -188,26 +265,32 @@ Y
                 ).is_file()
             )
 
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_aws_schemas_python(self):
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 7: Infrastructure event management - Use case
-        # 6: Python 3.8
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {python_runtime_pos}: PYTHON_RUNTIME_FOR_INIT (dynamic position)
         # 2: select event-bridge app from scratch
-        # eb-app-python38: response to name
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
+        # eb-app-python39: response to name
         # Y: Use default aws configuration
-        # 4: select aws.events as registries
+        # {aws_registry_pos}: select aws.events as registries (dynamic position)
         # 1: select aws schema
-
-        user_input = """
+        aws_registry_pos = _get_registry_position("aws.events")
+        user_input = f"""
 1
-7
-6
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(PYTHON_RUNTIME_FOR_INIT)}
 2
-eb-app-python38
+N
+N
+N
+eb-app-python39
 Y
-1
-4
+{aws_registry_pos}
 1
         """
         with tempfile.TemporaryDirectory() as temp:
@@ -215,30 +298,37 @@ Y
             result = runner.invoke(init_cmd, ["--output-dir", temp], input=user_input)
 
             self.assertFalse(result.exception)
-            expected_output_folder = Path(temp, "eb-app-python38")
+            expected_output_folder = Path(temp, "eb-app-python39")
             self.assertTrue(expected_output_folder.exists)
             self.assertTrue(expected_output_folder.is_dir())
             self.assertTrue(Path(expected_output_folder, "hello_world_function", "schema").is_dir())
 
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_aws_schemas_go(self):
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 7: Infrastructure event management - Use case
-        # 1: Go 1.x
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {go_runtime_pos}: GO_RUNTIME_FOR_INIT (dynamic position)
         # 2: select event-bridge app from scratch
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
         # eb-app-go: response to name
         # Y: Use default aws configuration
-        # 4: select aws.events as registries
+        # {aws_registry_pos}: select aws.events as registries (dynamic position)
         # 1: select aws schema
-
-        user_input = """
+        aws_registry_pos = _get_registry_position("aws.events")
+        user_input = f"""
 1
-7
-1
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(GO_RUNTIME_FOR_INIT)}
 2
+N
+N
+N
 eb-app-go
 Y
-4
+{aws_registry_pos}
 1
         """
         with tempfile.TemporaryDirectory() as temp:
@@ -251,27 +341,34 @@ Y
             self.assertTrue(expected_output_folder.is_dir())
             self.assertTrue(Path(expected_output_folder, "HelloWorld", "schema").is_dir())
 
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_non_default_profile_selection(self):
         self._init_custom_config("mynewprofile", "us-west-2")
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 3: Infrastructure event management - Use case
-        # 6: Python 3.8
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {python_runtime_pos}: PYTHON_RUNTIME_FOR_INIT (dynamic position)
         # 2: select event-bridge app from scratch
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
         # eb-app-python38: response to name
         # N: Use default profile
         # 2: uses second profile from displayed one (myprofile)
         # schemas aws region us-east-1
         # 1: select aws.events as registries
         # 1: select aws schema
+        # Registry hardcoded: non-default profile/region resolves a different account.
 
-        user_input = """
+        user_input = f"""
 1
-7
-6
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(PYTHON_RUNTIME_FOR_INIT)}
 2
-eb-app-python38
-3
+N
+N
+N
+eb-app-python39
 N
 2
 us-east-1
@@ -283,31 +380,36 @@ us-east-1
             result = runner.invoke(init_cmd, ["--output-dir", temp], input=user_input)
 
             self.assertFalse(result.exception)
-            expected_output_folder = Path(temp, "eb-app-python38")
+            expected_output_folder = Path(temp, "eb-app-python39")
             self.assertTrue(expected_output_folder.exists)
             self.assertTrue(expected_output_folder.is_dir())
             self.assertTrue(Path(expected_output_folder, "hello_world_function", "schema").is_dir())
 
-            self._tear_down_custom_config()
-
+    @pytest.mark.timeout(300)
     def test_init_interactive_with_event_bridge_app_non_supported_schemas_region(self):
         self._init_custom_config("default", "cn-north-1")
         # WHEN the user follows interactive init prompts
         # 1: AWS Quick Start Templates
-        # 7: Infrastructure event management - Use case
-        # 6: Python 3.8
+        # {use_case_pos}: Infrastructure event management - Use case (dynamic position)
+        # {python_runtime_pos}: PYTHON_RUNTIME_FOR_INIT (dynamic position)
         # 2: select event-bridge app from scratch
-        # eb-app-python38: response to name
+        # N: disable adding xray tracing
+        # N: disable cloudwatch insights
+        # N: disable structured logging
+        # eb-app-python39: response to name
         # Y: Use default profile
         # 1: select aws.events as registries
         # 1: select aws schema
 
-        user_input = """
+        user_input = f"""
 1
-7
-6
+{_get_use_case_position(EVENT_BRIDGE_USE_CASE)}
+{_get_runtime_position(PYTHON_RUNTIME_FOR_INIT)}
 2
-eb-app-python38
+N
+N
+N
+eb-app-python39
 Y
 1
 1
@@ -316,11 +418,3 @@ Y
             runner = CliRunner()
             result = runner.invoke(init_cmd, ["--output-dir", temp], input=user_input)
             self.assertTrue(result.exception)
-            self._tear_down_custom_config()
-
-
-def _get_command():
-    command = "sam"
-    if os.getenv("SAM_CLI_DEV"):
-        command = "samdev"
-    return command

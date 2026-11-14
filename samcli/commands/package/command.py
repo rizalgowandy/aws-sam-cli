@@ -1,29 +1,36 @@
 """
 CLI command for "package" command
 """
+
 import click
 
-from samcli.cli.cli_config_file import configuration_option, TomlProvider
-from samcli.cli.main import pass_context, common_options, aws_creds_options, print_cmdline_args
+from samcli.cli.cli_config_file import ConfigProvider, configuration_option, save_params_option
+from samcli.cli.main import aws_creds_options, common_options, pass_context, print_cmdline_args
 from samcli.commands._utils.cdk_support_decorators import unsupported_command_cdk
-from samcli.lib.cli_validation.image_repository_validation import image_repository_validation
+from samcli.commands._utils.command_exception_handler import command_exception_handler
 from samcli.commands._utils.options import (
-    signing_profiles_option,
-    s3_bucket_option,
-    image_repository_option,
-    image_repositories_option,
-    s3_prefix_option,
-    kms_key_id_option,
-    use_json_option,
     force_upload_option,
+    image_repositories_option,
+    image_repository_option,
+    kms_key_id_option,
+    language_extensions_option,
+    metadata_option,
+    no_progressbar_option,
+    resolve_image_repos_option,
     resolve_s3_option,
+    s3_bucket_option,
+    s3_prefix_option,
+    signing_profiles_option,
+    template_click_option,
+    use_json_option,
 )
-from samcli.commands._utils.options import metadata_option, template_click_option, no_progressbar_option
-from samcli.lib.utils.resources import resources_generator
-from samcli.lib.bootstrap.bootstrap import manage_stack
+from samcli.commands.package.core.command import PackageCommand
+from samcli.lib.bootstrap.bootstrap import manage_stack, print_managed_s3_bucket_info
+from samcli.lib.cli_validation.image_repository_validation import image_repository_validation
 from samcli.lib.telemetry.metric import track_command, track_template_warnings
+from samcli.lib.utils.resources import resources_generator
 from samcli.lib.utils.version_checker import check_newer_version
-from samcli.lib.warnings.sam_cli_warning import CodeDeployWarning, CodeDeployConditionWarning
+from samcli.lib.warnings.sam_cli_warning import CodeDeployConditionWarning, CodeDeployWarning
 
 SHORT_HELP = "Package an AWS SAM application."
 
@@ -39,21 +46,31 @@ def resources_and_properties_help_string():
     )
 
 
-HELP_TEXT = (
-    """The SAM package command creates and uploads artifacts based on the package type of a given resource.
-It uploads local images to ECR for `Image` package types.
-It creates zip of your code and dependencies and uploads it to S3 for other package types.
-The command returns a copy of your template, replacing references to local artifacts
-with the AWS location where the command uploaded the artifacts.
+DESCRIPTION = """
+  Creates and uploads artifacts based on the package type of a given resource.
+  It uploads local images to ECR for `Image` package types.
+  It creates a zip of code and dependencies and uploads it to S3 for `Zip` package types. 
+  
+  A new template is returned which replaces references to local artifacts
+  with the AWS location where the command uploaded the artifacts.
+    """
 
-The following resources and their property locations are supported.
-"""
-    + resources_and_properties_help_string()
+
+@click.command(
+    "package",
+    short_help=SHORT_HELP,
+    context_settings={
+        "ignore_unknown_options": False,
+        "allow_interspersed_args": True,
+        "allow_extra_args": True,
+        "max_content_width": 120,
+    },
+    cls=PackageCommand,
+    help=SHORT_HELP,
+    description=DESCRIPTION,
+    requires_credentials=True,
 )
-
-
-@click.command("package", short_help=SHORT_HELP, help=HELP_TEXT, context_settings=dict(max_content_width=120))
-@configuration_option(provider=TomlProvider(section="parameters"))
+@configuration_option(provider=ConfigProvider(section="parameters"))
 @template_click_option(include_build=True)
 @click.option(
     "--output-template-file",
@@ -71,18 +88,22 @@ The following resources and their property locations are supported.
 @use_json_option
 @force_upload_option
 @resolve_s3_option
+@resolve_image_repos_option
 @metadata_option
 @signing_profiles_option
 @no_progressbar_option
+@language_extensions_option
 @common_options
 @aws_creds_options
-@image_repository_validation
+@save_params_option
+@image_repository_validation(support_resolve_image_repos=True)
 @pass_context
 @track_command
 @check_newer_version
 @track_template_warnings([CodeDeployWarning.__name__, CodeDeployConditionWarning.__name__])
 @print_cmdline_args
 @unsupported_command_cdk(alternative_command="cdk deploy")
+@command_exception_handler
 def cli(
     ctx,
     template_file,
@@ -98,6 +119,9 @@ def cli(
     metadata,
     signing_profiles,
     resolve_s3,
+    resolve_image_repos,
+    language_extensions,
+    save_params,
     config_file,
     config_env,
 ):
@@ -122,6 +146,8 @@ def cli(
         ctx.region,
         ctx.profile,
         resolve_s3,
+        resolve_image_repos,
+        language_extensions,
     )  # pragma: no cover
 
 
@@ -141,18 +167,26 @@ def do_cli(
     region,
     profile,
     resolve_s3,
+    resolve_image_repos,
+    language_extensions,
 ):
     """
     Implementation of the ``cli`` method
     """
 
+    from samcli.commands.package.exceptions import PackageResolveS3AndS3NotSetError, PackageResolveS3WebFunctionError
     from samcli.commands.package.package_context import PackageContext
+    from samcli.lib.providers.sam_web_function_provider import template_file_has_local_web_functions
 
     if resolve_s3:
+        # sam package has no stack to create a Web Function code bucket for
+        if template_file_has_local_web_functions(template_file):
+            raise PackageResolveS3WebFunctionError()
         s3_bucket = manage_stack(profile=profile, region=region)
-        click.echo(f"\n\t\tManaged S3 bucket: {s3_bucket}")
-        click.echo("\t\tA different default S3 bucket can be set in samconfig.toml")
-        click.echo("\t\tOr by specifying --s3-bucket explicitly.")
+        print_managed_s3_bucket_info(s3_bucket)
+
+    if resolve_image_repos and not s3_bucket:
+        raise PackageResolveS3AndS3NotSetError()
 
     with PackageContext(
         template_file=template_file,
@@ -169,5 +203,7 @@ def do_cli(
         region=region,
         profile=profile,
         signing_profiles=signing_profiles,
+        resolve_image_repos=resolve_image_repos,
+        language_extensions=language_extensions,
     ) as package_context:
         package_context.run()

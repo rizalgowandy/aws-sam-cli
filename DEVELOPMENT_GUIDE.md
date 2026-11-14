@@ -11,7 +11,7 @@ inaccurate, update this guide and send a Pull Request.
 
 For setting up a local development environment, we recommend using Gitpod - a service that allows you to spin up an in-browser Visual Studio Code-compatible editor, with everything set up and ready to go for development on this project. Just click the button below to create your private workspace:
 
-[![Gitpod ready-to-code](https://img.shields.io/badge/Gitpod-ready--to--code-blue?logo=gitpod)](https://gitpod.io/#https://github.com/awslabs/aws-sam-cli)
+[![Gitpod ready-to-code](https://img.shields.io/badge/Gitpod-ready--to--code-blue?logo=gitpod)](https://gitpod.io/#https://github.com/aws/aws-sam-cli)
 
 This will start a new Gitpod workspace, and immediately kick off a build of the code. Once it's done, you can start working.
 
@@ -20,8 +20,8 @@ Gitpod is free for 50 hours per month - make sure to stop your workspace when yo
 ## Environment Setup
 ### 1. Prerequisites (Python Virtual Environment)
 
-AWS SAM CLI is mainly written in Python 3 and we support Python 3.7 and 3.8.
-So having a Python environment with aforementioned versions is required.
+AWS SAM CLI is mainly written in Python 3 and currently requires Python 3.10 and above.
+So, having a Python environment with this version is required.
 
 Having a dedicated Python virtual environment ensures it won't "pollute" or get "polluted" 
 by other python packages. Here we introduce two ways of setting up a Python virtual environment:
@@ -64,10 +64,10 @@ exec $SHELL  # restart your shell to enable pyenv-virtualenv
 Next, setup a virtual environment and activate it:
 
 ```sh
-# Assuming you want to develop AWS SAM CLI in Python 3.8.9
-pyenv install 3.8.9  # install Python 3.8.9 using pyenv
-pyenv virtualenv 3.8.9 samcli38  # create a virtual environment using 3.8.9 named "samcli38"
-pyenv activate samcli38  # activate the virtual environment
+# Assuming you want to develop AWS SAM CLI in Python 3.10.19
+pyenv install 3.10.19  # install Python 3.10.19 using pyenv
+pyenv virtualenv 3.10.19 samcli310  # create a virtual environment using 3.10.19 named "samcli310"
+pyenv activate samcli310  # activate the virtual environment
 ```
 
 ### 2. Initialize dependencies and create `samdev` available in `$PATH`
@@ -110,8 +110,18 @@ samdev --version  # this will print something like "SAM CLI, version x.xx.x"
 echo '__version__ = "123.456.789"' >> samcli/__init__.py
 samdev --version  # this will print "SAM CLI, version 123.456.789"
 ```
+### 3 VS Code Debugger
 
-### 3. (Optional) Install development version of SAM Transformer
+For VS Code Launch configuration, run the following command to create your local VS Code launch configuration:
+
+```bash
+cp .vscode/launch.json.template .vscode/launch.json
+```
+
+This will create a local copy of the launch configuration that you can customize without affecting the shared template.
+
+
+### 4. (Optional) Install development version of SAM Transformer
 
 If you want to run the latest version of [SAM Transformer](https://github.com/aws/serverless-application-model/)
 or work on it at the same time, you can clone it locally and install it in your virtual environment. 
@@ -132,7 +142,7 @@ Make sure you are in the same virtual environment as the one you are using with 
 ```sh
 source <sam-cli-directory-path>/.venv/bin/activate  # if you chose to use venv to setup the virtual environment
 # or
-pyenv activate samcli38  # if you chose to use pyenv to setup the virtual environment
+pyenv activate samcli310  # if you chose to use pyenv to setup the virtual environment
 ```
 
 Install the SAM Transformer in editable mode so that 
@@ -142,7 +152,7 @@ all changes you make to the SAM Transformer locally are immediately picked up fo
 pip install -e .
 ```
 
-Move back to your SAM CLI directory and re-run init, If necessary: open requirements/base.txt and replace the version number of aws-sam-translator with the ``version number`` specified in your local version of `serverless-application-model/samtranslator/__init__.py`
+Move back to your SAM CLI directory and re-run init, If necessary: open `pyproject.toml` and replace the version number of `aws-sam-translator` in the `[project].dependencies` list with the ``version number`` specified in your local version of `serverless-application-model/samtranslator/__init__.py`
 
 ```sh
 # Make sure you are back to your SAM CLI directory
@@ -163,26 +173,27 @@ contribute to the repository, there are a few more things to consider.
 
 ### Make Sure AWS SAM CLI Work in Multiple Python Versions
 
-We support 3.7 and 3.8 versions. Our CI/CD pipeline is setup to run
-unit tests against all Python versions. So make sure you test it
-with all versions before sending a Pull Request.
-See [Unit testing with multiple Python versions](#unit-testing-with-multiple-python-versions).
+We support version 3.10 and above. Our PR workflow runs on Python 3.10 and 3.11,
+and our integration workflows install additional Python versions to cover Lambda runtime scenarios.
+So make sure you test your change against supported Python versions before sending a Pull Request.
+See [Unit testing with multiple Python versions](#unit-testing-with-multiple-python-versions-optional). 
+This is most important if you are developing in a Python version greater than the minimum supported version (currently 3.10), as any new features released in higher versions will not work on the minimum supported version.
 
 If you chose to use `pyenv` in the previous session, setting up a 
 different Python version should be easy:
 
-(assuming you are in virtual environment `samcli38`)
+(assuming you are in virtual environment named `samcli311` with Python version 3.11.x)
 
 ```sh
-# Your shell now should looks like "(samcli38) $"
-pyenv deactivate samcli38  # "(samcli38)" will disappear
-pyenv install 3.7.10  # one time setup
-pyenv virtualenv 3.7.10 samcli37  # one time setup
-pyenv activate samcli37
-# Your shell now should looks like "(samcli37) $"
+# Your shell now should look like "(samcli311) $"
+pyenv deactivate samcli311  # "(samcli311)" will disappear
+pyenv install 3.10.19  # one time setup
+pyenv virtualenv 3.10.19 samcli310  # one time setup
+pyenv activate samcli310
+# Your shell now should look like "(samcli310) $"
 
 # You can verify the version of Python
-python --version  # Python 3.7.10
+python --version  # Python 3.10.19
 
 make init  # one time setup, this will put a file `samdev` available in $PATH
 ```
@@ -191,8 +202,8 @@ For Windows, use your favorite tool for managing different python versions and e
 
 ### Format Python Code
 
-We format our code using [Black](https://github.com/python/black) and verify the source code is
-black compliant in AppVeyor during PRs. Black will be installed automatically with `make init` or `./Make -Init` on Windows.
+We format our code using [Black](https://github.com/python/black) and verify the source code in GitHub Actions during PRs.
+Black will be installed automatically with `make init` or `./Make -Init` on Windows.
 
 There are generally 3 options to make sure your change is compliant with our formatting standard:
 
@@ -224,11 +235,11 @@ and this will happen:
 pyenv: black: command not found
 
 The `black' command exists in these Python versions:
-  3.8.9/envs/samcli38
-  samcli38
+  3.10.19/envs/samcli310
+  samcli310
 ``` 
 
-A simple workaround is to use `/Users/<username>/.pyenv/versions/samcli37/bin/black` 
+A simple workaround is to use `/Users/<username>/.pyenv/versions/samcli310/bin/black`
 instead of `/Users/<username>/.pyenv/shims/black`.
 
 #### (Option 3) Pre-commit
@@ -254,12 +265,12 @@ We also suggest to run `make pr` or `./Make -pr` in all Python versions.
 
 #### Unit Testing with Multiple Python Versions (Optional)
 
-Currently, SAM CLI only supports Python3 versions (see setup.py for exact versions). For the most
-part, code that works in Python3.7 will work in Python3.8. You only run into problems if you are
-trying to use features released in a higher version (for example features introduced into Python3.8
-will not work in Python3.7). If you want to test in many versions, you can create a virtualenv for
-each version and flip between them (sourcing the activate script). Typically, we run all tests in
-one python version locally and then have our ci (appveyor) run all supported versions.
+Currently, SAM CLI supports Python 3.10 and above (see `pyproject.toml` for package metadata and
+`.github/workflows/build.yml` for the PR test matrix). For the most part, code that works in Python 3.10
+will work in Python 3.11. You only run into problems if you are trying to use features released in a
+higher version that do not exist in the minimum supported version. If you want to test in many versions,
+you can create a virtualenv for each version and flip between them (sourcing the activate script).
+Typically, we run tests in one Python version locally and let CI cover the supported matrix.
 
 #### Integration Test (Optional)
 
@@ -328,6 +339,24 @@ conventions are best practices that we have learnt over time.
     comments.
     
     
+### Dependency Updates
+
+Please update all the required files if the changes involve a version update on a dependency or to include a new dependency.
+
+#### pyproject.toml for SAM CLI code dependencies
+All runtime and development dependencies are declared in `pyproject.toml` at the project root. Runtime dependencies go in `[project].dependencies` and test/dev dependencies go in `[project.optional-dependencies].dev`. Simply follow the current convention and input the dependency name plus version, together with any necessary comment. For more information on the operators to be used for restricting compatible versions, read on [python's enhancement proposals](https://peps.python.org/pep-0440/#compatible-release).
+
+#### reproducible-linux.txt for SAM CLI code dependencies
+For dependencies used in SAM CLI code, also remember to update `reproducible-linux.txt` in `requirements` folder and `THIRD-PARTY-LICENSES` in `installer/assets` folder. To update the reproducible requirements, run the following script to regenerate the files:
+```
+make update-reproducible-reqs
+```
+Note that these are fully auto-generated files, any manual changes to reproducible-*.txt will not last after the next update running the above script. As for updating the `THIRD-PARTY-LICENSES`, find the corresponding dependency entry in the license file (usually grouped by licensing organization) and update the versions. For adding a new dependency, look up for its licensing organization through PyPi and update the corresponding section. If the license is from GNU or another license type not included in the file, please contact the repository maintainers first. If you are not familiar with working with this file, please contact one of the repository maintainers or cut an issue to help with the update.
+
+#### pyinstaller-build.txt for SAM CLI native installer build dependencies
+For changing Python dependencies needed for creating builds through Pyinstaller (to run `build-mac.sh` or `build-linux.sh` in `installer/pyinstaller` folder), modify `pyinstaller-build.txt` in the `requirements` folder.
+
+
 ### Our Testing Practices
 
 We need thorough test coverage to ensure the code change works today, 

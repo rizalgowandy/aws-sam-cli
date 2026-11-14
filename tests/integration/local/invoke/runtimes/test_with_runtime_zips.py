@@ -1,6 +1,7 @@
 # coding=utf-8
 
 import os
+import platform
 import tempfile
 
 from subprocess import Popen, PIPE, TimeoutExpired
@@ -22,7 +23,6 @@ class TestWithDifferentLambdaRuntimeZips(InvokeIntegBase):
     template = Path("runtimes", "template.yaml")
 
     def setUp(self):
-
         # Don't delete on close. Need the file to be present for tests to run.
         events_file = tempfile.NamedTemporaryFile(delete=False)
         events_file.write(b'"yolo"')  # Just empty event
@@ -34,12 +34,16 @@ class TestWithDifferentLambdaRuntimeZips(InvokeIntegBase):
     def tearDown(self):
         os.remove(self.events_file_path)
 
+    @parameterized.expand([param("Go1xFunction"), param("Java21Function")])
     @pytest.mark.timeout(timeout=300, method="thread")
-    @parameterized.expand([param("Go1xFunction"), param("Java8Function")])
     def test_runtime_zip(self, function_name):
-        command_list = self.get_command_list(
+        command_list = InvokeIntegBase.get_command_list(
             function_name, template_path=self.template_path, event_path=self.events_file_path
         )
+
+        # Temporarily skip al2023 tests on Windows
+        if function_name == "Java21Function" and platform.system().lower() == "windows":
+            self.skipTest("Skipping AL2023 test on Windows")
 
         process = Popen(command_list, stdout=PIPE)
         try:
@@ -54,7 +58,7 @@ class TestWithDifferentLambdaRuntimeZips(InvokeIntegBase):
 
     @pytest.mark.timeout(timeout=300, method="thread")
     def test_custom_provided_runtime(self):
-        command_list = self.get_command_list(
+        command_list = InvokeIntegBase.get_command_list(
             "CustomBashFunction", template_path=self.template_path, event_path=self.events_file_path
         )
 

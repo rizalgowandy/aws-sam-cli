@@ -1,5 +1,6 @@
 import itertools
 from copy import deepcopy
+from typing import List, Dict
 from unittest import TestCase
 from unittest.mock import Mock, patch, MagicMock, call, ANY
 
@@ -7,7 +8,13 @@ from parameterized import parameterized
 
 from samcli.lib.utils.architecture import X86_64, ARM64
 from samcli.lib.build.exceptions import MissingBuildMethodException
-from samcli.lib.build.build_graph import BuildGraph, FunctionBuildDefinition, LayerBuildDefinition
+from samcli.lib.build.build_graph import (
+    BuildGraph,
+    FunctionBuildDefinition,
+    LayerBuildDefinition,
+    MicrovmImageBuildDefinition,
+)
+from samcli.lib.build.workflow_config import UnsupportedRuntimeException
 from samcli.lib.build.build_strategy import (
     ParallelBuildStrategy,
     BuildStrategy,
@@ -15,6 +22,8 @@ from samcli.lib.build.build_strategy import (
     CachedBuildStrategy,
     CachedOrIncrementalBuildStrategyWrapper,
     IncrementalBuildStrategy,
+    WorkspaceAwareBuildStrategy,
+    clean_redundant_folders,
 )
 from samcli.lib.utils import osutils
 from pathlib import Path
@@ -32,24 +41,35 @@ class BuildStrategyBaseTest(TestCase):
         self.function1_1 = Mock()
         self.function1_1.inlinecode = None
         self.function1_1.get_build_dir = Mock()
-        self.function1_1.full_path = Mock()
+        self.function1_1.full_path = "function1_1"
         self.function1_2 = Mock()
         self.function1_2.inlinecode = None
         self.function1_2.get_build_dir = Mock()
-        self.function1_2.full_path = Mock()
+        self.function1_2.full_path = "function1_2"
         self.function2 = Mock()
         self.function2.inlinecode = None
         self.function2.get_build_dir = Mock()
-        self.function2.full_path = Mock()
+        self.function2.full_path = "function2"
 
-        self.function_build_definition1 = FunctionBuildDefinition("runtime", "codeuri", ZIP, X86_64, {}, "handler")
-        self.function_build_definition2 = FunctionBuildDefinition("runtime2", "codeuri", ZIP, X86_64, {}, "handler")
+        self.function_build_definition1 = FunctionBuildDefinition(
+            "runtime", "codeuri", None, ZIP, X86_64, {}, "handler"
+        )
+        self.function_build_definition2 = FunctionBuildDefinition(
+            "runtime2", "codeuri", None, ZIP, X86_64, {}, "handler"
+        )
+
+        self.function_build_definition1.add_function(self.function1_1)
+        self.function_build_definition1.add_function(self.function1_2)
+        self.function_build_definition2.add_function(self.function2)
+
         self.build_graph.put_function_build_definition(self.function_build_definition1, self.function1_1)
         self.build_graph.put_function_build_definition(self.function_build_definition1, self.function1_2)
         self.build_graph.put_function_build_definition(self.function_build_definition2, self.function2)
 
         self.layer1 = Mock()
+        self.layer1.compatible_architectures = None
         self.layer2 = Mock()
+        self.layer2.compatible_architectures = None
 
         self.layer_build_definition1 = LayerBuildDefinition("layer1", "codeuri", "build_method", [], X86_64)
         self.layer_build_definition2 = LayerBuildDefinition("layer2", "codeuri", "build_method", [], X86_64)
@@ -62,6 +82,9 @@ class _TestBuildStrategy(BuildStrategy):
         return {}
 
     def build_single_layer_definition(self, layer_definition):
+        return {}
+
+    def build_single_microvm_image_definition(self, microvm_definition):
         return {}
 
 
@@ -121,6 +144,59 @@ class BuildStrategyTest(BuildStrategyBaseTest):
             ]
         )
 
+    @patch("samcli.lib.build.build_strategy.pathlib")
+    @patch("samcli.lib.build.build_strategy.shutil")
+    def test_clean_redundant_folders(self, patched_shutil, patched_pathlib):
+        base_dir = "base_dir"
+        valid_uuid = "valid_uuid"
+        redundant_uuid = "redundant_uuid"
+        not_a_folder = "not a folder"
+
+        # create mock for a valid uuid which shouldn't be deleted
+        patched_valid_uuid_path = Mock()
+        patched_valid_uuid_path.name = valid_uuid
+        patched_valid_uuid_path.is_dir.return_value = True
+
+        # create mock for an invalid uuid which should be deleted
+        patched_redundant_uuid_path = Mock()
+        patched_redundant_uuid_path.name = redundant_uuid
+        patched_redundant_uuid_path.is_dir.return_value = True
+
+        # create a mock for a pathc which is not a directory and shouldn't be deleted
+        patched_not_a_folder_path = Mock()
+        patched_not_a_folder_path.name = not_a_folder
+        patched_not_a_folder_path.is_dir.return_value = False
+
+        # create mock for the base directory
+        patched_base_dir_path = Mock()
+        patched_base_dir_path.iterdir.return_value = [
+            patched_valid_uuid_path,
+            patched_redundant_uuid_path,
+            patched_not_a_folder_path,
+        ]
+
+        patched_deleted_path = Mock()
+
+        patched_paths = {
+            base_dir: patched_base_dir_path,
+            valid_uuid: patched_valid_uuid_path,
+            redundant_uuid: patched_redundant_uuid_path,
+            not_a_folder: patched_not_a_folder_path,
+        }
+
+        def path_side_effect(path, additional_path=None):
+            if path and additional_path:
+                return patched_deleted_path
+            return patched_paths.get(path)
+
+        patched_pathlib.Path.side_effect = path_side_effect
+        clean_redundant_folders(base_dir, {valid_uuid})
+
+        # only 1 directory should be deleted
+        patched_shutil.rmtree.assert_called_once()
+        # confirm expected path is deleted
+        patched_shutil.rmtree.assert_called_with(patched_deleted_path)
+
 
 @patch("samcli.lib.build.build_strategy.osutils.copytree")
 class DefaultBuildStrategyTest(BuildStrategyBaseTest):
@@ -133,11 +209,36 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
         build_graph = Mock(spec=BuildGraph)
         build_graph.get_layer_build_definitions.return_value = [layer_build_definition]
         build_graph.get_function_build_definitions.return_value = []
+        build_graph.get_microvm_image_build_definitions.return_value = []
         mock_function = Mock()
         mock_function.inlinecode = None
-        default_build_strategy = DefaultBuildStrategy(build_graph, "build_dir", mock_function, Mock())
+        default_build_strategy = DefaultBuildStrategy(build_graph, "build_dir", mock_function, Mock(), Mock())
 
         self.assertRaises(MissingBuildMethodException, default_build_strategy.build)
+
+    def test_build_microvm_image(self, mock_copy_tree):
+        mock_build_microvm_image = Mock(return_value="myagent:latest")
+
+        microvm_image = Mock()
+        microvm_image.full_path = "MyAgent"
+        microvm_image.architecture = "arm64"
+
+        microvm_definition = MicrovmImageBuildDefinition("MyAgent", "./app", "arm64")
+        microvm_definition.microvm_image = microvm_image
+
+        build_graph = Mock(spec=BuildGraph)
+        build_graph.get_function_build_definitions.return_value = []
+        build_graph.get_layer_build_definitions.return_value = []
+        build_graph.get_microvm_image_build_definitions.return_value = [microvm_definition]
+
+        default_build_strategy = DefaultBuildStrategy(
+            build_graph, "build_dir", Mock(), Mock(), mock_build_microvm_image
+        )
+
+        result = default_build_strategy.build()
+
+        mock_build_microvm_image.assert_called_once_with("MyAgent", "./app", "arm64")
+        self.assertEqual(result, {"MyAgent": "myagent:latest"})
 
     def test_build_layers_and_functions(self, mock_copy_tree):
         given_build_function = Mock()
@@ -145,7 +246,7 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
         given_build_layer = Mock()
         given_build_dir = "build_dir"
         default_build_strategy = DefaultBuildStrategy(
-            self.build_graph, given_build_dir, given_build_function, given_build_layer
+            self.build_graph, given_build_dir, given_build_function, given_build_layer, Mock()
         )
 
         default_build_strategy.build()
@@ -156,6 +257,7 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
                 call(
                     self.function_build_definition1.get_function_name(),
                     self.function_build_definition1.codeuri,
+                    self.function_build_definition1.imageuri,
                     ZIP,
                     self.function_build_definition1.runtime,
                     self.function_build_definition1.architecture,
@@ -163,12 +265,13 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
                     self.function_build_definition1.get_build_dir(given_build_dir),
                     self.function_build_definition1.metadata,
                     self.function_build_definition1.env_vars,
-                    self.function_build_definition1.dependencies_dir,
+                    None,
                     True,
                 ),
                 call(
                     self.function_build_definition2.get_function_name(),
                     self.function_build_definition2.codeuri,
+                    self.function_build_definition2.imageuri,
                     ZIP,
                     self.function_build_definition2.runtime,
                     self.function_build_definition2.architecture,
@@ -176,7 +279,7 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
                     self.function_build_definition2.get_build_dir(given_build_dir),
                     self.function_build_definition2.metadata,
                     self.function_build_definition2.env_vars,
-                    self.function_build_definition2.dependencies_dir,
+                    None,
                     True,
                 ),
             ]
@@ -193,8 +296,9 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
                     self.layer1.build_architecture,
                     self.layer1.get_build_dir(given_build_dir),
                     self.layer_build_definition1.env_vars,
-                    self.layer_build_definition1.dependencies_dir,
+                    None,
                     True,
+                    self.layer1.metadata,
                 ),
                 call(
                     self.layer2.name,
@@ -204,8 +308,9 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
                     self.layer2.build_architecture,
                     self.layer2.get_build_dir(given_build_dir),
                     self.layer_build_definition2.env_vars,
-                    self.layer_build_definition2.dependencies_dir,
+                    None,
                     True,
+                    self.layer2.metadata,
                 ),
             ]
         )
@@ -219,6 +324,27 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
             self.function1_2.get_build_dir(given_build_dir),
         )
 
+    @patch("samcli.lib.build.build_strategy.is_experimental_enabled")
+    def test_dedup_build_functions_with_symlink(self, patched_is_experimental, mock_copy_tree):
+        patched_is_experimental.return_value = True
+        given_build_function = Mock()
+        given_build_function.inlinecode = None
+        given_build_layer = Mock()
+        given_build_dir = "build_dir"
+        default_build_strategy = DefaultBuildStrategy(
+            self.build_graph, given_build_dir, given_build_function, given_build_layer, Mock()
+        )
+
+        build_result = default_build_strategy.build()
+        # with 22 build improvements, functions with same build definitions should point to same artifact folder
+        self.assertEqual(
+            build_result.get(self.function_build_definition1.functions[0].full_path),
+            build_result.get(self.function_build_definition1.functions[1].full_path),
+        )
+
+        # assert that copy operation is not called
+        mock_copy_tree.assert_not_called()
+
     def test_build_single_function_definition_image_functions_with_same_metadata(self, mock_copy_tree):
         given_build_function = Mock()
         built_image = Mock()
@@ -226,7 +352,7 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
         given_build_layer = Mock()
         given_build_dir = "build_dir"
         default_build_strategy = DefaultBuildStrategy(
-            self.build_graph, given_build_dir, given_build_function, given_build_layer
+            self.build_graph, given_build_dir, given_build_function, given_build_layer, Mock()
         )
 
         function1 = Mock()
@@ -238,7 +364,7 @@ class DefaultBuildStrategyTest(BuildStrategyBaseTest):
         function2.full_path = "Function2"
         function2.packagetype = IMAGE
         build_definition = FunctionBuildDefinition(
-            "3.7", "codeuri", IMAGE, X86_64, {}, "handler", env_vars={"FOO": "BAR"}
+            "3.12", "codeuri", "imageuri", IMAGE, X86_64, {}, "handler", env_vars={"FOO": "BAR"}
         )
         # since they have the same metadata, they are put into the same build_definition.
         build_definition.functions = [function1, function2]
@@ -258,7 +384,8 @@ class CachedBuildStrategyTest(BuildStrategyBaseTest):
     FUNCTION_UUID = "3c1c254e-cd4b-4d94-8c74-7ab870b36063"
     SOURCE_HASH = "cae49aa393d669e850bd49869905099d"
     LAYER_UUID = "761ce752-d1c8-4e07-86a0-f64778cdd108"
-    LAYER_METHOD = "nodejs12.x"
+    LAYER_METHOD = "nodejs20.x"
+    LAYER_METHOD = "nodejs20.x"
 
     BUILD_GRAPH_CONTENTS = f"""
     [function_build_definitions]
@@ -273,8 +400,8 @@ class CachedBuildStrategyTest(BuildStrategyBaseTest):
     [layer_build_definitions.{LAYER_UUID}]
     layer_name = "SumLayer"
     codeuri = "sum_layer/"
-    build_method = "nodejs12.x"
-    compatible_runtimes = ["nodejs12.x"]
+    build_method = "nodejs20.x"
+    compatible_runtimes = ["nodejs20.x"]
     source_hash = "{SOURCE_HASH}"
     layer = "SumLayer"
     """
@@ -289,7 +416,7 @@ class CachedBuildStrategyTest(BuildStrategyBaseTest):
         given_build_layer = Mock()
         given_build_dir = "build_dir"
         default_build_strategy = DefaultBuildStrategy(
-            self.build_graph, given_build_dir, given_build_function, given_build_layer
+            self.build_graph, given_build_dir, given_build_function, given_build_layer, Mock()
         )
         cache_build_strategy = CachedBuildStrategy(
             self.build_graph, default_build_strategy, "base_dir", given_build_dir, "cache_dir"
@@ -337,6 +464,86 @@ class CachedBuildStrategyTest(BuildStrategyBaseTest):
             cached_build_strategy.build_single_layer_definition(layer_definition)
             self.assertEqual(copytree_mock.call_count, 3)
 
+    @parameterized.expand([(True,), (False,)])
+    @patch("samcli.lib.build.build_strategy.osutils.copytree")
+    @patch("samcli.lib.build.build_strategy.pathlib.Path.exists")
+    @patch("samcli.lib.build.build_strategy.dir_checksum")
+    @patch("samcli.lib.utils.osutils.os")
+    @patch("samcli.lib.build.build_strategy.is_experimental_enabled")
+    def test_if_cached_valid_when_build_single_function_definition_with_build_improvements_22(
+        self, should_raise_os_error, patch_is_experimental, patch_os, dir_checksum_mock, exists_mock, copytree_mock
+    ):
+        patch_is_experimental.return_value = True
+        if should_raise_os_error:
+            patch_os.symlink.side_effect = OSError()
+        with osutils.mkdir_temp() as temp_base_dir:
+            build_dir = Path(temp_base_dir, ".aws-sam", "build")
+            build_dir.mkdir(parents=True)
+            cache_dir = Path(temp_base_dir, ".aws-sam", "cache")
+            cache_dir.mkdir(parents=True)
+
+            exists_mock.return_value = True
+            dir_checksum_mock.return_value = CachedBuildStrategyTest.SOURCE_HASH
+
+            build_graph_path = Path(build_dir.parent, "build.toml")
+            build_graph_path.write_text(CachedBuildStrategyTest.BUILD_GRAPH_CONTENTS)
+            build_graph = BuildGraph(str(build_dir))
+            cached_build_strategy = CachedBuildStrategy(
+                build_graph, DefaultBuildStrategy, temp_base_dir, build_dir, cache_dir
+            )
+            func1 = Mock()
+            func1.name = "func1_name"
+            func1.full_path = "func1_full_path"
+            func1.inlinecode = None
+            func1.get_build_dir.return_value = "func1/build/dir"
+            func2 = Mock()
+            func2.name = "func2_name"
+            func2.full_path = "func2_full_path"
+            func2.inlinecode = None
+            build_definition = build_graph.get_function_build_definitions()[0]
+            layer_definition = build_graph.get_layer_build_definitions()[0]
+            build_graph.put_function_build_definition(build_definition, func1)
+            build_graph.put_function_build_definition(build_definition, func2)
+            layer = Mock()
+            layer.name = "layer_name"
+            layer.full_path = "layer_full_path"
+            layer.get_build_dir.return_value = "layer/build/dir"
+            build_graph.put_layer_build_definition(layer_definition, layer)
+            cached_build_strategy.build_single_function_definition(build_definition)
+            cached_build_strategy.build_single_layer_definition(layer_definition)
+
+            if should_raise_os_error:
+                copytree_mock.assert_has_calls(
+                    [
+                        call(
+                            str(cache_dir.joinpath(build_graph.get_function_build_definitions()[0].uuid)),
+                            build_graph.get_function_build_definitions()[0].functions[0].get_build_dir(build_dir),
+                        ),
+                        call(
+                            str(cache_dir.joinpath(build_graph.get_layer_build_definitions()[0].uuid)),
+                            build_graph.get_layer_build_definitions()[0].layer.get_build_dir(build_dir),
+                        ),
+                    ]
+                )
+            else:
+                copytree_mock.assert_not_called()
+                patch_os.symlink.assert_has_calls(
+                    [
+                        call(
+                            cache_dir.joinpath(build_graph.get_function_build_definitions()[0].uuid),
+                            Path(
+                                build_graph.get_function_build_definitions()[0].functions[0].get_build_dir(build_dir)
+                            ).absolute(),
+                        ),
+                        call(
+                            cache_dir.joinpath(build_graph.get_layer_build_definitions()[0].uuid),
+                            Path(
+                                build_graph.get_layer_build_definitions()[0].layer.get_build_dir(build_dir)
+                            ).absolute(),
+                        ),
+                    ]
+                )
+
     @patch("samcli.lib.build.build_strategy.osutils.copytree")
     @patch("samcli.lib.build.build_strategy.DefaultBuildStrategy.build_single_function_definition")
     @patch("samcli.lib.build.build_strategy.DefaultBuildStrategy.build_single_layer_definition")
@@ -378,36 +585,48 @@ class CachedBuildStrategyTest(BuildStrategyBaseTest):
 
 
 class ParallelBuildStrategyTest(BuildStrategyBaseTest):
-    def test_given_async_context_should_call_expected_methods(self):
-        mock_async_context = Mock()
+    @patch("samcli.lib.build.build_strategy.AsyncContext")
+    def test_given_async_context_should_call_expected_methods(self, patched_async_context):
         delegate_build_strategy = MagicMock(wraps=_TestBuildStrategy(self.build_graph))
-        parallel_build_strategy = ParallelBuildStrategy(self.build_graph, delegate_build_strategy, mock_async_context)
+        parallel_build_strategy = ParallelBuildStrategy(self.build_graph, delegate_build_strategy)
 
-        given_build_results = [
-            {"function1": "function_location1"},
-            {"function2": "function_location2"},
+        mock_layer_async_context = Mock()
+        mock_function_async_context = Mock()
+        patched_async_context.side_effect = [mock_layer_async_context, mock_function_async_context]
+
+        layer_build_results: List[Dict[str, str]] = [
             {"layer1": "layer_location1"},
             {"layer2": "layer_location2"},
         ]
-        mock_async_context.run_async.return_value = given_build_results
+        function_build_results: List[Dict[str, str]] = [
+            {"function1": "function_location1"},
+            {"function2": "function_location2"},
+        ]
+        mock_layer_async_context.run_async.return_value = layer_build_results
+        mock_function_async_context.run_async.return_value = function_build_results
 
         results = parallel_build_strategy.build()
 
         expected_results = {}
-        for given_build_result in given_build_results:
+        for given_build_result in layer_build_results + function_build_results:
             expected_results.update(given_build_result)
         self.assertEqual(results, expected_results)
 
         # assert that result has collected
-        mock_async_context.run_async.assert_has_calls([call()])
+        mock_layer_async_context.run_async.assert_has_calls([call()])
+        mock_function_async_context.run_async.assert_has_calls([call()])
 
         # assert that delegated function calls have been registered in async context
-        mock_async_context.add_async_task.assert_has_calls(
+        mock_layer_async_context.add_async_task.assert_has_calls(
             [
-                call(delegate_build_strategy.build_single_layer_definition, self.layer_build_definition1),
-                call(delegate_build_strategy.build_single_layer_definition, self.layer_build_definition2),
-                call(delegate_build_strategy.build_single_function_definition, self.function_build_definition1),
-                call(delegate_build_strategy.build_single_function_definition, self.function_build_definition2),
+                call(parallel_build_strategy.build_single_layer_definition, self.layer_build_definition1),
+                call(parallel_build_strategy.build_single_layer_definition, self.layer_build_definition2),
+            ]
+        )
+        mock_function_async_context.add_async_task.assert_has_calls(
+            [
+                call(parallel_build_strategy.build_single_function_definition, self.function_build_definition1),
+                call(parallel_build_strategy.build_single_function_definition, self.function_build_definition2),
             ]
         )
 
@@ -463,7 +682,7 @@ class TestIncrementalBuildStrategy(TestCase):
         self.build_layer = Mock()
         self.build_graph = Mock()
         self.delegate_build_strategy = DefaultBuildStrategy(
-            self.build_graph, Mock(), self.build_function, self.build_layer
+            self.build_graph, Mock(), self.build_function, self.build_layer, Mock(), cached=True
         )
         self.build_strategy = IncrementalBuildStrategy(
             self.build_graph,
@@ -494,13 +713,14 @@ class TestIncrementalBuildStrategy(TestCase):
             manifest_hash=build_toml_manifest_hash, functions=[Mock()], dependencies_dir=dependency_dir
         )
         self.build_graph.get_function_build_definitions.return_value = [given_function_build_def]
+        self.build_graph.get_microvm_image_build_definitions.return_value = []
         self.build_graph.get_layer_build_definitions.return_value = []
 
         download_dependencies = manifest_hash != build_toml_manifest_hash or not dependency_dir_exist
 
         self.build_strategy.build()
         self.build_function.assert_called_with(
-            ANY, ANY, ANY, ANY, ANY, ANY, ANY, ANY, ANY, dependency_dir, download_dependencies
+            ANY, ANY, ANY, ANY, ANY, ANY, ANY, ANY, ANY, ANY, dependency_dir, download_dependencies
         )
 
     @parameterized.expand(
@@ -524,13 +744,44 @@ class TestIncrementalBuildStrategy(TestCase):
         given_layer_build_def = Mock(
             manifest_hash=build_toml_manifest_hash, functions=[Mock()], dependencies_dir=dependency_dir
         )
+        given_layer_build_def.layer.compatible_architectures = None
         self.build_graph.get_function_build_definitions.return_value = []
+        self.build_graph.get_microvm_image_build_definitions.return_value = []
         self.build_graph.get_layer_build_definitions.return_value = [given_layer_build_def]
 
         download_dependencies = manifest_hash != build_toml_manifest_hash or not dependency_dir_exist
 
         self.build_strategy.build()
-        self.build_layer.assert_called_with(ANY, ANY, ANY, ANY, ANY, ANY, ANY, dependency_dir, download_dependencies)
+        self.build_layer.assert_called_with(
+            ANY, ANY, ANY, ANY, ANY, ANY, ANY, dependency_dir, download_dependencies, ANY
+        )
+
+    def test_manifest_pre_check_failure_is_attributed_to_function(self, patched_hash_gen, patched_os):
+        # The manifest pre-check (get_workflow_config) can raise an unsupported-runtime error before the
+        # delegate's attribution runs. Ensure that escaping failure still carries the function full paths
+        # so --cached/--incremental builds report error.resources just like the non-cached path. Two
+        # collapsed functions confirm every affected resource is reported, not just the first.
+        build_definition = Mock(functions=[Mock(full_path="ChildStack/MyFn"), Mock(full_path="ChildStack/MyFn2")])
+        self.build_strategy._check_whether_manifest_is_changed = Mock(
+            side_effect=UnsupportedRuntimeException("'python3.7' runtime is not supported")
+        )
+
+        with self.assertRaises(UnsupportedRuntimeException) as ctx:
+            self.build_strategy.build_single_function_definition(build_definition)
+
+        self.assertEqual(ctx.exception.resource_names, ["ChildStack/MyFn", "ChildStack/MyFn2"])
+
+    def test_manifest_pre_check_failure_is_attributed_to_layer(self, patched_hash_gen, patched_os):
+        layer_definition = Mock()
+        layer_definition.full_path = "ChildStack/MyLayer"
+        self.build_strategy._check_whether_manifest_is_changed = Mock(
+            side_effect=UnsupportedRuntimeException("'python3.7' runtime is not supported")
+        )
+
+        with self.assertRaises(UnsupportedRuntimeException) as ctx:
+            self.build_strategy.build_single_layer_definition(layer_definition)
+
+        self.assertEqual(ctx.exception.resource_names, ["ChildStack/MyLayer"])
 
 
 @patch("samcli.lib.build.build_graph.BuildGraph._write")
@@ -547,52 +798,42 @@ class TestCachedOrIncrementalBuildStrategyWrapper(TestCase):
             "cache_dir",
             "manifest_path_override",
             False,
+            False,
         )
 
     @parameterized.expand(
         [
-            ("python3.7", True),
-            ("nodejs12.x", True),
-            ("ruby2.7", True),
-            ("python3.7", False),
+            "python3.12",
+            "nodejs20.x",
+            "ruby3.2",
         ]
     )
-    @patch("samcli.lib.build.build_strategy.is_experimental_enabled")
-    def test_will_call_incremental_build_strategy(
-        self, mocked_read, mocked_write, runtime, experimental_enabled, patched_experimental
-    ):
-        patched_experimental.return_value = experimental_enabled
-        build_definition = FunctionBuildDefinition(runtime, "codeuri", "packate_type", X86_64, {}, "handler")
-        self.build_graph.put_function_build_definition(build_definition, Mock())
-        with patch.object(
-            self.build_strategy, "_incremental_build_strategy"
-        ) as patched_incremental_build_strategy, patch.object(
-            self.build_strategy, "_cached_build_strategy"
-        ) as patched_cached_build_strategy:
+    def test_will_call_incremental_build_strategy(self, mocked_read, mocked_write, runtime):
+        build_definition = FunctionBuildDefinition(runtime, "codeuri", None, "package_type", X86_64, {}, "handler")
+        self.build_graph.put_function_build_definition(build_definition, Mock(full_path="function_full_path"))
+        with (
+            patch.object(self.build_strategy, "_incremental_build_strategy") as patched_incremental_build_strategy,
+            patch.object(self.build_strategy, "_cached_build_strategy") as patched_cached_build_strategy,
+        ):
             self.build_strategy.build()
 
-            if experimental_enabled:
-                patched_incremental_build_strategy.build_single_function_definition.assert_called_with(build_definition)
-                patched_cached_build_strategy.assert_not_called()
-            else:
-                patched_cached_build_strategy.build_single_function_definition.assert_called_with(build_definition)
-                patched_incremental_build_strategy.assert_not_called()
+            patched_incremental_build_strategy.build_single_function_definition.assert_called_with(build_definition)
+            patched_cached_build_strategy.assert_not_called()
 
     @parameterized.expand(
         [
-            "dotnetcore3.1",
+            "dotnet6",
             "go1.x",
             "java11",
         ]
     )
     def test_will_call_cached_build_strategy(self, mocked_read, mocked_write, runtime):
-        build_definition = FunctionBuildDefinition(runtime, "codeuri", "packate_type", X86_64, {}, "handler")
-        self.build_graph.put_function_build_definition(build_definition, Mock())
-        with patch.object(
-            self.build_strategy, "_incremental_build_strategy"
-        ) as patched_incremental_build_strategy, patch.object(
-            self.build_strategy, "_cached_build_strategy"
-        ) as patched_cached_build_strategy:
+        build_definition = FunctionBuildDefinition(runtime, "codeuri", None, "package_type", X86_64, {}, "handler")
+        self.build_graph.put_function_build_definition(build_definition, Mock(full_path="function_full_path"))
+        with (
+            patch.object(self.build_strategy, "_incremental_build_strategy") as patched_incremental_build_strategy,
+            patch.object(self.build_strategy, "_cached_build_strategy") as patched_cached_build_strategy,
+        ):
             self.build_strategy.build()
 
             patched_cached_build_strategy.build_single_function_definition.assert_called_with(build_definition)
@@ -613,9 +854,17 @@ class TestCachedOrIncrementalBuildStrategyWrapper(TestCase):
             mocked_build_graph = Mock()
             mocked_build_graph.get_layer_build_definitions.return_value = []
             mocked_build_graph.get_function_build_definitions.return_value = []
+            mocked_build_graph.get_microvm_image_build_definitions.return_value = []
 
             cached_build_strategy = CachedOrIncrementalBuildStrategyWrapper(
-                mocked_build_graph, Mock(), temp_base_dir, build_dir, cache_dir, None, is_building_specific_resource
+                mocked_build_graph,
+                Mock(),
+                temp_base_dir,
+                build_dir,
+                cache_dir,
+                None,
+                is_building_specific_resource,
+                False,
             )
 
             cached_build_strategy.build()
@@ -630,3 +879,158 @@ class TestCachedOrIncrementalBuildStrategyWrapper(TestCase):
                 mocked_build_graph.clean_redundant_definitions_and_update.assert_called_once()
                 clean_cache_mock.assert_called_once()
                 clean_dep_mock.assert_called_once()
+
+    @parameterized.expand(
+        [
+            ("python", True),
+            ("ruby", True),
+            ("nodejs", True),
+            ("python", False),
+            ("ruby", False),
+            ("nodejs", False),
+        ]
+    )
+    def test_wrapper_with_or_without_container(self, mocked_read, mocked_write, runtime, use_container):
+        build_strategy = CachedOrIncrementalBuildStrategyWrapper(
+            self.build_graph,
+            Mock(),
+            "base_dir",
+            "build_dir",
+            "cache_dir",
+            "manifest_path_override",
+            False,
+            use_container,
+        )
+
+        build_definition = FunctionBuildDefinition(runtime, "codeuri", None, "package_type", X86_64, {}, "handler")
+        self.build_graph.put_function_build_definition(build_definition, Mock(full_path="function_full_path"))
+        with (
+            patch.object(build_strategy, "_incremental_build_strategy") as patched_incremental_build_strategy,
+            patch.object(build_strategy, "_cached_build_strategy") as patched_cached_build_strategy,
+        ):
+            build_strategy.build()
+
+            if not use_container:
+                patched_incremental_build_strategy.build_single_function_definition.assert_called_with(build_definition)
+                patched_cached_build_strategy.assert_not_called()
+            else:
+                patched_cached_build_strategy.build_single_function_definition.assert_called_with(build_definition)
+                patched_incremental_build_strategy.assert_not_called()
+
+
+@patch("samcli.lib.build.build_graph.BuildGraph._write")
+@patch("samcli.lib.build.build_graph.BuildGraph._read")
+class WorkspaceAwareBuildStrategyTest(TestCase):
+    BASE_DIR = "/base"
+
+    def setUp(self):
+        self.delegate = MagicMock()
+        self.resolver = Mock(return_value=None)
+        self.installer = Mock(return_value=True)
+
+    def _strategy(self, build_graph):
+        return WorkspaceAwareBuildStrategy(build_graph, self.delegate, self.BASE_DIR, self.resolver, self.installer)
+
+    def _graph(self, *definitions):
+        build_graph = BuildGraph("build_dir")
+        for index, definition in enumerate(definitions):
+            function = Mock()
+            function.inlinecode = None
+            function.full_path = f"function{index}"
+            build_graph.put_function_build_definition(definition, function)
+        return build_graph
+
+    @staticmethod
+    def _definition(runtime="nodejs22.x", codeuri="endpoints/fn", packagetype=ZIP, metadata=None):
+        return FunctionBuildDefinition(runtime, codeuri, None, packagetype, X86_64, metadata or {}, "handler")
+
+    def _code_dir(self, codeuri):
+        return str(Path(self.BASE_DIR, codeuri).resolve())
+
+    def test_functions_sharing_a_workspace_root_install_once_and_skip_their_own_installs(self, _read, _write):
+        definition1 = self._definition(codeuri="endpoints/fn1")
+        definition2 = self._definition(codeuri="endpoints/fn2", metadata={"BuildMethod": "esbuild"})
+        build_graph = self._graph(definition1, definition2)
+        self.resolver.return_value = "/base/mono"
+
+        strategy = self._strategy(build_graph)
+        result = strategy._build_functions(build_graph)
+
+        self.installer.assert_called_once_with("/base/mono", definition1)
+        self.assertFalse(definition1.download_dependencies)
+        self.assertFalse(definition2.download_dependencies)
+        self.delegate._build_functions.assert_called_once_with(build_graph)
+        self.assertEqual(result, self.delegate._build_functions.return_value)
+
+    def test_a_failed_shared_preparation_leaves_per_function_installs(self, _read, _write):
+        definition = self._definition()
+        build_graph = self._graph(definition)
+        self.resolver.return_value = "/base/mono"
+        self.installer.return_value = False
+
+        self._strategy(build_graph)._build_functions(build_graph)
+
+        self.assertTrue(definition.download_dependencies)
+        self.delegate._build_functions.assert_called_once_with(build_graph)
+
+    def test_a_standalone_package_is_not_grouped(self, _read, _write):
+        # npm answers with the directory itself for anything that is not a workspace member
+        definition = self._definition(codeuri="standalone")
+        build_graph = self._graph(definition)
+        self.resolver.return_value = self._code_dir("standalone")
+
+        self._strategy(build_graph)._build_functions(build_graph)
+
+        self.installer.assert_not_called()
+        self.assertTrue(definition.download_dependencies)
+
+    def test_out_of_scope_functions_never_resolve_a_root(self, _read, _write):
+        out_of_scope = [
+            ("python3.12", ZIP, None),
+            ("nodejs22.x", IMAGE, None),
+            ("nodejs22.x", ZIP, {"BuildMethod": "makefile"}),
+        ]
+        for runtime, packagetype, metadata in out_of_scope:
+            with self.subTest(runtime=runtime, packagetype=packagetype, metadata=metadata):
+                definition = self._definition(runtime=runtime, packagetype=packagetype, metadata=metadata)
+                build_graph = self._graph(definition)
+
+                self._strategy(build_graph)._build_functions(build_graph)
+
+                self.resolver.assert_not_called()
+                self.installer.assert_not_called()
+
+    def test_a_build_method_naming_the_runtime_is_in_scope(self, _read, _write):
+        definition = self._definition(metadata={"BuildMethod": "nodejs22.x"})
+        build_graph = self._graph(definition)
+        self.resolver.return_value = "/base/mono"
+
+        self._strategy(build_graph)._build_functions(build_graph)
+
+        self.installer.assert_called_once()
+        self.assertFalse(definition.download_dependencies)
+
+    def test_distinct_workspace_roots_install_separately(self, _read, _write):
+        definition1 = self._definition(codeuri="monoA/endpoints/fn1")
+        definition2 = self._definition(codeuri="monoB/endpoints/fn2")
+        build_graph = self._graph(definition1, definition2)
+        self.resolver.side_effect = ["/base/monoA", "/base/monoB"]
+
+        self._strategy(build_graph)._build_functions(build_graph)
+
+        self.installer.assert_has_calls([call("/base/monoA", definition1), call("/base/monoB", definition2)])
+        self.assertFalse(definition1.download_dependencies)
+        self.assertFalse(definition2.download_dependencies)
+
+    def test_build_enters_the_delegate_context_and_delegates_everything(self, _read, _write):
+        definition = self._definition(runtime="python3.12")
+        build_graph = self._graph(definition)
+        self.delegate._build_layers.return_value = {}
+        self.delegate._build_functions.return_value = {"function0": "artifacts"}
+
+        result = self._strategy(build_graph).build()
+
+        self.delegate.__enter__.assert_called_once()
+        self.delegate.__exit__.assert_called_once()
+        self.delegate._build_layers.assert_called_once_with(build_graph)
+        self.assertEqual(result, {"function0": "artifacts"})

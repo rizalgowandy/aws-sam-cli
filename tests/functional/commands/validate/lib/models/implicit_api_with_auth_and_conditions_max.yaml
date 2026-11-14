@@ -11,8 +11,8 @@ Globals:
 
         MyCognitoAuthMultipleUserPools:
           UserPoolArn:
-            - arn:aws:2
-            - arn:aws:3
+          - arn:aws:2
+          - arn:aws:3
           Identity:
             Header: MyAuthorizationHeader2
             ValidationExpression: myauthvalidationexpression2
@@ -38,40 +38,40 @@ Globals:
           FunctionInvokeRole: arn:aws:iam::123456789012:role/S3Access
           Identity:
             Headers:
-              - Authorization1
+            - Authorization1
             QueryStrings:
-              - Authorization2
+            - Authorization2
             StageVariables:
-              - Authorization3
+            - Authorization3
             Context:
-              - Authorization4
+            - Authorization4
             ReauthorizeEvery: 0
 
 Conditions:
   FunctionCondition:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   FunctionCondition2:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   FunctionCondition3:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   FunctionCondition4:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   FunctionCondition5:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
   FunctionCondition6:
     Fn::Equals:
-      - true
-      - false
+    - true
+    - false
 
 Resources:
   MyFunction:
@@ -80,7 +80,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/thumbnails.zip
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         WithNoAuthorizer:
           Type: Api
@@ -95,7 +95,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/thumbnails.zip
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         WithCognitoMultipleUserPoolsAuthorizer:
           Type: Api
@@ -110,7 +110,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/thumbnails.zip
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         WithLambdaTokenAuthorizer:
           Type: Api
@@ -125,7 +125,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/thumbnails.zip
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         WithLambdaTokenAuthorizer:
           Type: Api
@@ -140,7 +140,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/thumbnails.zip
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         WithLambdaRequestAuthorizer:
           Type: Api
@@ -155,7 +155,7 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/thumbnails.zip
       Handler: index.handler
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Events:
         WithDefaultAuthorizer:
           Type: Api

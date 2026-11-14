@@ -2,20 +2,49 @@
 Integration tests for sam validate
 """
 
+import json
 import os
 import re
+import tempfile
+from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import List, Optional
 from unittest import TestCase
-from unittest.case import skipIf
 
+import pytest
 from parameterized import parameterized
-from tests.testing_utils import RUN_BY_CANARY, RUNNING_ON_CI, RUNNING_TEST_FOR_MASTER_ON_CI, run_command
+from tests.testing_utils import (
+    run_command,
+    get_sam_command,
+)
 
-# Validate tests require credentials and CI/CD will only add credentials to the env if the PR is from the same repo.
-# This is to restrict package tests to run outside of CI/CD, when the branch is not master or tests are not run by Canary
-SKIP_VALIDATE_TESTS = RUNNING_ON_CI and RUNNING_TEST_FOR_MASTER_ON_CI and not RUN_BY_CANARY
+from cfnlint.helpers import load_resource
+from cfnlint.data import AdditionalSpecs
+
+
+# cfn-lint has a dynamic validation for deprecated runtimes depending on the date, and the error will change according to that
+# some of the logic from cfn-lint):
+# https://github.com/aws-cloudformation/cfn-lint/blob/baa4f017592fc56f7f11f10d22c8044ff36c3f6a/src/cfnlint/rules/resources/lmbd/DeprecatedRuntimeEol.py#L32
+def get_runtime_deprecation_values(runtime):
+    current_date = datetime.today()
+    # Runtime deprecation dates: https://github.com/aws-cloudformation/cfn-lint/blob/main/src/cfnlint/data/AdditionalSpecs/LmbdRuntimeLifecycle.json
+    deprecated_runtimes = load_resource(AdditionalSpecs, "LmbdRuntimeLifecycle.json")
+    runtime_data = deprecated_runtimes.get(runtime)
+    # Not deprecated
+    if not runtime_data or current_date < datetime.strptime(runtime_data["deprecated"], "%Y-%m-%d"):
+        return None
+    # Deprecated but not create-blocked yet
+    if current_date < datetime.strptime(runtime_data["create-block"], "%Y-%m-%d"):
+        return {"code": "W2531", "msg": "Check if EOL Lambda Function Runtimes are used"}
+    # Create-blocked but not update-blocked
+    if current_date < datetime.strptime(runtime_data["update-block"], "%Y-%m-%d"):
+        return {"code": "E2531", "msg": "Validate if lambda runtime is deprecated"}
+    # Fully deprecated including update-blocked
+    return {"code": "E2533", "msg": "Check if Lambda Function Runtimes are updatable"}
+
+
+# These tests require AWS credentials; they are gated by the requires_credential marker.
 
 
 class TemplateFileTypes(Enum):
@@ -23,18 +52,24 @@ class TemplateFileTypes(Enum):
     YAML = auto()
 
 
-@skipIf(SKIP_VALIDATE_TESTS, "Skip validate tests in CI/CD only")
+@pytest.mark.requires_credential
 class TestValidate(TestCase):
     @classmethod
     def setUpClass(cls):
         cls.patterns = {
+            TemplateFileTypes.JSON: re.compile(
+                r"template\.json is a valid SAM Template. This is according to basic SAM Validation, "
+                'for additional validation, please run with "--lint" option(\r\n)?$'
+            ),
+            TemplateFileTypes.YAML: re.compile(
+                r"template\.yaml is a valid SAM Template. This is according to basic SAM Validation, "
+                'for additional validation, please run with "--lint" option(\r\n)?$'
+            ),
+        }
+        cls.lint_patterns = {
             TemplateFileTypes.JSON: re.compile(r"template\.json is a valid SAM Template(\r\n)?$"),
             TemplateFileTypes.YAML: re.compile(r"template\.yaml is a valid SAM Template(\r\n)?$"),
         }
-
-    @staticmethod
-    def base_command() -> str:
-        return "samdev" if os.getenv("SAM_CLI_DEV") else "sam"
 
     def command_list(
         self,
@@ -42,8 +77,9 @@ class TestValidate(TestCase):
         profile: Optional[str] = None,
         region: Optional[str] = None,
         config_file: Optional[Path] = None,
+        lint: Optional[bool] = None,
     ) -> List[str]:
-        command_list = [self.base_command(), "validate"]
+        command_list = [get_sam_command(), "validate"]
         if template_file:
             command_list += ["--template-file", str(template_file)]
         if profile:
@@ -52,6 +88,8 @@ class TestValidate(TestCase):
             command_list += ["--region", region]
         if config_file:
             command_list += ["--config_file", str(config_file)]
+        if lint:
+            command_list += ["--lint"]
         return command_list
 
     @parameterized.expand(
@@ -65,6 +103,7 @@ class TestValidate(TestCase):
             ),  # project with template.json and standard build directory .aws-sam/build/template.yaml
         ]
     )
+    @pytest.mark.tier1
     def test_default_template_file_choice(self, relative_folder: str, expected_file: TemplateFileTypes):
         test_data_path = Path(__file__).resolve().parents[2] / "integration" / "testdata" / "validate"
         process_dir = test_data_path / relative_folder
@@ -79,7 +118,8 @@ class TestValidate(TestCase):
         template_file = "aws-serverless-function-cdk.yaml"
         template_path = test_data_path.joinpath(template_file)
         command_result = run_command(self.command_list(template_file=template_path))
-        output = command_result.stdout.decode("utf-8")
+        # The CDK warning is emitted on stderr so it does not pollute the --output json stdout stream.
+        output = command_result.stderr.decode("utf-8")
 
         warning_message = (
             f"Warning: CDK apps are not officially supported with this command.{os.linesep}"
@@ -87,3 +127,160 @@ class TestValidate(TestCase):
         )
 
         self.assertIn(warning_message, output)
+
+    @parameterized.expand(
+        [
+            ("default_yaml", TemplateFileTypes.YAML),  # project with template.yaml
+            ("default_json", TemplateFileTypes.JSON),  # project with template.json
+            ("multiple_files", TemplateFileTypes.YAML),  # project with both template.yaml and template.json
+            (
+                "with_build",
+                TemplateFileTypes.JSON,
+            ),  # project with template.json and standard build directory .aws-sam/build/template.yaml
+        ]
+    )
+    def test_lint_template(self, relative_folder: str, expected_file: TemplateFileTypes):
+        test_data_path = Path(__file__).resolve().parents[2] / "integration" / "testdata" / "validate"
+        process_dir = test_data_path / relative_folder
+        command_result = run_command(self.command_list(lint=True), cwd=str(process_dir))
+        pattern = self.lint_patterns[expected_file]  # type: ignore
+        output = command_result.stdout.decode("utf-8")
+        self.assertEqual(command_result.process.returncode, 0)
+        self.assertRegex(output, pattern)
+
+    @parameterized.expand(
+        [
+            ("nodejs",),
+            ("python3.9",),
+            ("nodejs18.x",),
+            ("ruby3.2",),
+            ("dotnet6",),
+            ("nodejs20.x"),
+            ("provided.al2",),
+            ("python3.10",),
+            ("dotnet8",),
+        ]
+    )
+    def test_lint_deprecated_runtimes(self, runtime):
+
+        # The message for deprecated runtimes can change according to the current date
+        deprecation_values = get_runtime_deprecation_values(runtime)
+        if not deprecation_values:
+            self.fail(f"Runtime {runtime} is not marked as deprecated. This shouldn't happen in this test.")
+        template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "HelloWorldFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "HelloWorldFunction",
+                        "Handler": "app.lambdaHandler",
+                        "Runtime": runtime,
+                    },
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp:
+            template_file = Path(temp, "template.json")
+            with open(template_file, "w") as f:
+                f.write(json.dumps(template, indent=4) + "\n")
+
+            command_result = run_command(self.command_list(lint=True), cwd=str(temp))
+
+            output = command_result.stdout.decode("utf-8")
+            self.assertEqual(command_result.process.returncode, 1)
+            self.assertIn(
+                f"[[{deprecation_values['code']}: {deprecation_values['msg']}] (Runtime '{runtime}' was deprecated on ",
+                output,
+            )
+
+    def test_lint_supported_runtimes(self):
+        template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {},
+        }
+        supported_runtimes = [
+            "dotnet10",
+            "java25",
+            "java21",
+            "java17",
+            "java11",
+            "java8.al2",
+            "nodejs22.x",
+            "nodejs24.x",
+            "provided.al2023",
+            "python3.11",
+            "python3.12",
+            "python3.13",
+            "python3.14",
+            "python3.15",
+            "ruby3.3",
+            "ruby3.4",
+        ]
+        i = 0
+        for runtime in supported_runtimes:
+            i += 1
+            template["Resources"][f"HelloWorldFunction{i}"] = {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "CodeUri": "HelloWorldFunction",
+                    "Handler": "app.lambdaHandler",
+                    "Runtime": runtime,
+                },
+            }
+        with tempfile.TemporaryDirectory() as temp:
+            template_file = Path(temp, "template.json")
+            with open(template_file, "w") as f:
+                f.write(json.dumps(template, indent=4) + "\n")
+            command_result = run_command(self.command_list(lint=True), cwd=str(temp))
+            pattern = self.lint_patterns[TemplateFileTypes.JSON]
+            output = command_result.stdout.decode("utf-8")
+            self.assertEqual(command_result.process.returncode, 0)
+            self.assertRegex(output, pattern)
+
+    def test_lint_error_no_region(self):
+        test_data_path = Path(__file__).resolve().parents[2] / "integration" / "testdata" / "validate" / "default_json"
+        template_file = "template.json"
+        template_path = test_data_path.joinpath(template_file)
+        command_result = run_command(self.command_list(lint=True, region="--debug", template_file=template_path))
+        output = command_result.stderr.decode("utf-8")
+
+        error_message = f"Error: Provided region: --debug doesn't match a supported format"
+
+        self.assertIn(error_message, output)
+
+    def test_lint_error_invalid_region(self):
+        test_data_path = Path(__file__).resolve().parents[2] / "integration" / "testdata" / "validate" / "default_json"
+        template_file = "template.json"
+        template_path = test_data_path.joinpath(template_file)
+        command_result = run_command(self.command_list(lint=True, region="us-north-5", template_file=template_path))
+        output = command_result.stderr.decode("utf-8")
+
+        error_message = (
+            f"Error: AWS Region was not found. Please configure your region through the --region option.{os.linesep}"
+            f"Regions ['us-north-5'] are unsupported. Supported regions are"
+        )
+
+        self.assertIn(error_message, output)
+
+    def test_lint_invalid_template(self):
+        test_data_path = Path(__file__).resolve().parents[2] / "integration" / "testdata" / "validate" / "default_yaml"
+        template_file = "templateError.yaml"
+        template_path = test_data_path.joinpath(template_file)
+        command_result = run_command(self.command_list(lint=True, template_file=template_path))
+        output = command_result.stdout.decode("utf-8")
+        # Remove Windows Line Endings for comparison.
+        output = output.replace("\r", "")
+
+        warning_message = (
+            "[[E0000: Parsing error found when parsing the template] "
+            "(Duplicate found 'HelloWorldFunction' (line 5)) matched 5, "
+            "[E0000: Parsing error found when parsing the template] "
+            "(Duplicate found 'HelloWorldFunction' (line 12)) matched 12]\n"
+        )
+
+        self.assertIn(warning_message, output)
+        self.assertEqual(command_result.process.returncode, 1)

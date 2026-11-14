@@ -1,8 +1,9 @@
 """
 Lambda Function configuration data required by the runtime
 """
+
 from samcli.commands.local.cli_common.user_exceptions import InvalidSamTemplateException
-from .env_vars import EnvironmentVariables
+from samcli.local.lambdafn.env_vars import EnvironmentVariables
 
 
 class FunctionConfig:
@@ -28,7 +29,11 @@ class FunctionConfig:
         architecture,
         memory=None,
         timeout=None,
+        runtime_management_config=None,
         env_vars=None,
+        code_real_path=None,
+        capacity_provider_configuration=None,
+        durable_config=None,
     ):
         """
         Parameters
@@ -42,7 +47,8 @@ class FunctionConfig:
         handler : str
             Handler method
         imageuri : str
-            Name of the Lambda Image which is of the form {image}:{tag}
+            Location of the Lambda Image which is of the form {image}:{tag}, sha256:{digest},
+            or a path to a local archive
         imageconfig : str
             Image configuration which can be used set to entrypoint, command and working dir for the container.
         packagetype : str
@@ -57,9 +63,13 @@ class FunctionConfig:
             Function memory limit in MB, by default None
         timeout : int, optional
             Function timeout in seconds, by default None
+        runtime_management_config: str, optional
+            Function's runtime management config
         env_vars : str, optional
             Environment variables, by default None
              If it not provided, this class will generate one for you based on the function properties
+        capacity_provider_configuration : object, optional
+            Capacity provider configuration for lmi functions, by default None
 
         Raises
         ------
@@ -75,11 +85,15 @@ class FunctionConfig:
         self.packagetype = packagetype
         self.handler = handler
         self.code_abs_path = code_abs_path
+        self.code_real_path = code_real_path
         self.layers = layers
         self.memory = memory or self._DEFAULT_MEMORY
         self.architecture = architecture
 
         self.timeout = timeout or self._DEFAULT_TIMEOUT_SECONDS
+        self.runtime_management_config = runtime_management_config
+        self.capacity_provider_configuration = capacity_provider_configuration
+        self.durable_config = durable_config
 
         if not isinstance(self.timeout, int):
             try:

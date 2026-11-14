@@ -1,26 +1,49 @@
+import io
+import json
 import os
+import pathlib
+import tempfile
+from contextlib import redirect_stdout
 from unittest import TestCase
-from unittest.mock import patch, Mock, ANY, call
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 from parameterized import parameterized
 
-from samcli.commands._utils.experimental import ExperimentalFlag
-from samcli.lib.build.build_graph import DEFAULT_DEPENDENCIES_DIR
-from samcli.lib.utils.osutils import BUILD_DIR_PERMISSIONS
-from samcli.lib.utils.packagetype import ZIP, IMAGE
-from samcli.local.lambdafn.exceptions import ResourceNotFound
 from samcli.commands.build.build_context import BuildContext
 from samcli.commands.build.exceptions import InvalidBuildDirException, MissingBuildMethodException
+from samcli.commands.build.utils import MountMode
 from samcli.commands.exceptions import UserException
 from samcli.lib.build.app_builder import (
-    BuildError,
-    UnsupportedBuilderLibraryVersionError,
-    BuildInsideContainerError,
-    ContainerBuildNotSupported,
     ApplicationBuildResult,
+    BuildError,
+    BuildInsideContainerError,
+    UnsupportedBuilderLibraryVersionError,
 )
-from samcli.lib.build.workflow_config import UnsupportedRuntimeException
-from samcli.local.lambdafn.exceptions import FunctionNotFound
+from samcli.lib.build.build_graph import DEFAULT_DEPENDENCIES_DIR
+from samcli.lib.build.bundler import EsbuildBundlerManager
+from samcli.lib.build.exceptions import InvalidBuildGraphException, MicrovmImageSourceError
+from samcli.lib.build.workflow_config import UnsupportedBuilderException, UnsupportedRuntimeException
+from samcli.lib.observability.util import OutputOption
+from samcli.lib.providers.provider import Function, MicrovmImage, ResourcesToBuildCollector, get_function_build_info
+from samcli.lib.telemetry.event import EventName, UsedFeature
+from samcli.lib.utils.osutils import BUILD_DIR_PERMISSIONS
+from samcli.lib.utils.packagetype import IMAGE, ZIP
+from samcli.local.lambdafn.exceptions import FunctionNotFound, ResourceNotFound
+
+_web_function_provider_patcher = None
+
+
+def setUpModule():
+    # These tests use Mock stacks; SamWebFunctionProvider is tested separately
+    global _web_function_provider_patcher
+    _web_function_provider_patcher = patch("samcli.commands.build.build_context.SamWebFunctionProvider")
+    provider_class_mock = _web_function_provider_patcher.start()
+    provider_class_mock.return_value.get.return_value = None
+    provider_class_mock.return_value.get_all.return_value = []
+
+
+def tearDownModule():
+    _web_function_provider_patcher.stop()
 
 
 class DeepWrap(Exception):
@@ -36,35 +59,60 @@ class DummyLayer:
         self.skip_build = skip_build
 
 
-class DummyFunction:
-    def __init__(
-        self,
-        name,
-        layers=[],
-        inlinecode=None,
-        codeuri="src",
-        imageuri="image:latest",
-        packagetype=ZIP,
-        metadata=None,
-        skip_build=False,
-        runtime=None,
-    ):
-        self.name = name
-        self.layers = layers
-        self.inlinecode = inlinecode
-        self.codeuri = codeuri
-        self.imageuri = imageuri
-        self.full_path = Mock()
-        self.packagetype = packagetype
-        self.metadata = metadata if metadata else {}
-        self.skip_build = skip_build
-        self.runtime = runtime
+def get_function(
+    name,
+    layers=None,
+    inlinecode=None,
+    codeuri="src",
+    imageuri="image:latest",
+    packagetype=ZIP,
+    metadata=None,
+    skip_build=False,
+    runtime=None,
+) -> Function:
+    layers = layers or []
+    metadata = metadata or {}
+    if skip_build:
+        metadata["SkipBuild"] = "True"
+    return Function(
+        function_id=name,
+        functionname=name,
+        name=name,
+        runtime=runtime,
+        memory=None,
+        timeout=None,
+        handler=None,
+        imageuri=imageuri,
+        packagetype=packagetype,
+        imageconfig=None,
+        codeuri=codeuri,
+        environment=None,
+        rolearn=None,
+        layers=layers,
+        events=None,
+        metadata=metadata,
+        inlinecode=inlinecode,
+        codesign_config_arn=None,
+        architectures=None,
+        function_url_config=None,
+        stack_path="",
+        runtime_management_config=None,
+        function_build_info=get_function_build_info(
+            "stack/function", packagetype, inlinecode, codeuri, imageuri, metadata
+        ),
+    )
+
+
+class DummyStack:
+    def __init__(self, resource):
+        self.resources = resource
 
 
 class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -73,10 +121,13 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         get_buildable_stacks_mock,
         get_template_data_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         template_dict = "template dict"
         stack = Mock()
         stack.template_dict = template_dict
@@ -88,7 +139,7 @@ class TestBuildContext__enter__(TestCase):
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
 
-        function1 = DummyFunction("func1")
+        function1 = get_function("func1")
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = function1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -138,16 +189,18 @@ class TestBuildContext__enter__(TestCase):
             "template_file",
             parameter_overrides={"overrides": "value"},
             global_parameter_overrides={"AWS::Region": "any_aws_region"},
+            language_extensions_enabled=False,
         )
-        SamFunctionProviderMock.assert_called_once_with([stack], False)
+        SamFunctionProviderMock.assert_called_once_with([stack], False, locate_layer_nested=False)
         pathlib_mock.Path.assert_called_once_with("template_file")
-        setup_build_dir_mock.assert_called_with("build_dir", True)
+        setup_build_dir_mock.assert_called_with("build_dir", True, "cache_dir", ["basedir", "basedir"])
         ContainerManagerMock.assert_called_once_with(docker_network_id="network", skip_pull_image=True)
         func_provider_mock.get.assert_called_once_with("function_identifier")
 
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -156,17 +209,20 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         get_buildable_stacks_mock,
         get_template_data_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         template_dict = "template dict"
         stack = Mock()
         stack.template_dict = template_dict
         get_buildable_stacks_mock.return_value = ([stack], [])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = None
-        func_provider_mock.get_all.return_value = [DummyFunction("func1"), DummyFunction("func2")]
+        func_provider_mock.get_all.return_value = [get_function("func1"), get_function("func2")]
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
 
         layer_provider_mock = Mock()
@@ -205,6 +261,7 @@ class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -213,10 +270,13 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         get_buildable_stacks_mock,
         get_template_data_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         template_dict = "template dict"
         stack = Mock()
         stack.template_dict = template_dict
@@ -260,6 +320,7 @@ class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -268,10 +329,13 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         get_buildable_stacks_mock,
         get_template_data_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         template_dict = "template dict"
         stack = Mock()
         stack.template_dict = template_dict
@@ -283,7 +347,7 @@ class TestBuildContext__enter__(TestCase):
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
 
-        func1 = DummyFunction("func1", [layer1, layer2])
+        func1 = get_function("func1", [layer1, layer2])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -321,6 +385,7 @@ class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -329,10 +394,13 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         get_buildable_stacks_mock,
         get_template_data_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         template_dict = "template dict"
         stack = Mock()
         stack.template_dict = template_dict
@@ -377,6 +445,7 @@ class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -385,10 +454,13 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         get_buildable_stacks_mock,
         get_template_data_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         """
         In this unit test, we also verify
         - inlinecode functions are skipped
@@ -400,15 +472,15 @@ class TestBuildContext__enter__(TestCase):
         stack = Mock()
         stack.template_dict = template_dict
         get_buildable_stacks_mock.return_value = ([stack], [])
-        func1 = DummyFunction("func1")
-        func2 = DummyFunction("func2")
-        func3_skipped = DummyFunction("func3", inlinecode="def handler(): pass", codeuri=None)
-        func4_skipped = DummyFunction("func4", codeuri="packaged_function.zip")
-        func5_skipped = DummyFunction("func5", codeuri=None, packagetype=IMAGE)
-        func6 = DummyFunction(
+        func1 = get_function("func1")
+        func2 = get_function("func2")
+        func3_skipped = get_function("func3", inlinecode="def handler(): pass", codeuri=None)
+        func4_skipped = get_function("func4", codeuri="packaged_function.zip")
+        func5_skipped = get_function("func5", codeuri=None, packagetype=IMAGE)
+        func6 = get_function(
             "func6", packagetype=IMAGE, metadata={"DockerContext": "/path", "Dockerfile": "DockerFile"}
         )
-        func7_skipped = DummyFunction("func7", skip_build=True)
+        func7_skipped = get_function("func7", skip_build=True)
 
         func_provider_mock = Mock()
         func_provider_mock.get_all.return_value = [
@@ -467,24 +539,127 @@ class TestBuildContext__enter__(TestCase):
         self.assertEqual(context.stacks, [stack])
         self.assertEqual(context.manifest_path_override, os.path.abspath("manifest_path"))
         self.assertEqual(context.mode, "buildmode")
+        self.assertFalse(context.use_base_dir)
         self.assertFalse(context.is_building_specific_resource)
         resources_to_build = context.resources_to_build
         self.assertEqual(resources_to_build.functions, [func1, func2, func6])
         self.assertEqual(resources_to_build.layers, [layer1])
         get_buildable_stacks_mock.assert_called_once_with(
-            "template_file", parameter_overrides={"overrides": "value"}, global_parameter_overrides=None
+            "template_file",
+            parameter_overrides={"overrides": "value"},
+            global_parameter_overrides=None,
+            language_extensions_enabled=False,
         )
-        SamFunctionProviderMock.assert_called_once_with([stack], False)
+        SamFunctionProviderMock.assert_called_once_with([stack], False, locate_layer_nested=False)
         pathlib_mock.Path.assert_called_once_with("template_file")
-        setup_build_dir_mock.assert_called_with("build_dir", True)
+        setup_build_dir_mock.assert_called_with("build_dir", True, "cache_dir", ["basedir", "basedir"])
         ContainerManagerMock.assert_called_once_with(docker_network_id="network", skip_pull_image=True)
         func_provider_mock.get_all.assert_called_once()
+
+    @parameterized.expand(
+        [
+            ([], None, None),
+            (["func1", "func2", "func3"], None, None),
+            ([], ("func1",), None),
+            (["func1", "func2", "func3"], ("func2",), None),
+            (["func1"], ("func1"), None),
+            (["func1", "func2", "func3"], ("func1", "func3"), None),
+            (["func1"], ("func1",), "func1"),
+            (["func1", "func2"], ("func2",), "func1"),
+        ]
+    )
+    @patch("samcli.commands.build.build_context.get_template_data")
+    @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
+    @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
+    @patch("samcli.commands.build.build_context.SamLayerProvider")
+    @patch("samcli.commands.build.build_context.pathlib")
+    @patch("samcli.commands.build.build_context.ContainerManager")
+    def test_must_exclude_functions_from_build(
+        self,
+        resources_to_build,
+        excluded_resources,
+        resource_identifier,
+        ContainerManagerMock,
+        pathlib_mock,
+        SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
+        SamFunctionProviderMock,
+        get_buildable_stacks_mock,
+        get_template_data_mock,
+    ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
+        template_dict = "template dict"
+        stack = Mock()
+        stack.template_dict = template_dict
+        get_buildable_stacks_mock.return_value = ([stack], [])
+
+        funcs = [get_function(f) for f in resources_to_build]
+        resource_to_exclude = None
+        for f in funcs:
+            if f.name == resource_identifier:
+                resource_to_exclude = f
+                break
+
+        func_provider_mock = Mock()
+        func_provider_mock.get_all.return_value = funcs
+        func_provider_mock.get.return_value = resource_to_exclude
+        func_provider_mock.layers.return_value = []
+        funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
+
+        context = BuildContext(
+            resource_identifier,
+            "template_file",
+            None,  # No base dir is provided
+            "build_dir",
+            manifest_path="manifest_path",
+            clean=True,
+            use_container=True,
+            docker_network="network",
+            parameter_overrides={"overrides": "value"},
+            skip_pull_image=True,
+            mode="buildmode",
+            cached=False,
+            cache_dir="cache_dir",
+            parallel=True,
+            excluded_resources=excluded_resources,
+        )
+        setup_build_dir_mock = Mock()
+        build_dir_result = setup_build_dir_mock.return_value = "my/new/build/dir"
+        context._setup_build_dir = setup_build_dir_mock
+
+        # call the enter method
+        result = context.__enter__()
+
+        self.assertEqual(result, context)  # __enter__ must return self
+        self.assertEqual(context.function_provider, funcprovider)
+        self.assertEqual(context.build_dir, build_dir_result)
+        self.assertEqual(context.stacks, [stack])
+        self.assertEqual(context.is_building_specific_resource, bool(resource_identifier))
+        ctx_resources_to_build = context.resources_to_build
+        non_excluded_resources = (
+            [x for x in resources_to_build if x not in excluded_resources] if excluded_resources else resources_to_build
+        )
+
+        if resource_identifier is not None and resource_identifier in excluded_resources:
+            # If building 1 and excluding it, build anyway
+            self.assertTrue(context.is_building_specific_resource)
+            self.assertIn(resource_to_exclude, ctx_resources_to_build.functions)
+        else:
+            named_funcs = [f.name for f in ctx_resources_to_build.functions]
+            if excluded_resources:
+                self.assertTrue(all([x not in named_funcs for x in excluded_resources]))
+                self.assertTrue(all([x in named_funcs for x in non_excluded_resources]))
+            else:
+                self.assertTrue(all([x in named_funcs for x in resources_to_build]))
 
     @parameterized.expand([(["remote_stack_1", "stack.remote_stack_2"], "print_warning"), ([], False)])
     @patch("samcli.commands.build.build_context.LOG")
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -495,11 +670,14 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         get_buildable_stacks_mock,
         get_template_data_mock,
         log_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         get_buildable_stacks_mock.return_value = ([], remote_stack_full_paths)
 
         context = BuildContext(
@@ -532,6 +710,7 @@ class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamApiProvider")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -541,8 +720,10 @@ class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
     def test_run_sync_build_context(
         self,
+        esbuild_bundler_manager_mock,
         os_mock,
         get_template_data_mock,
         move_template_mock,
@@ -552,11 +733,13 @@ class TestBuildContext__enter__(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         SamApiProviderMock,
         get_buildable_stacks_mock,
     ):
-
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         root_stack = Mock()
         root_stack.is_root_stack = True
         auto_dependency_layer = False
@@ -567,7 +750,7 @@ class TestBuildContext__enter__(TestCase):
             root_stack.stack_path: "./build_dir/template.yaml",
             child_stack.stack_path: "./build_dir/abcd/template.yaml",
         }
-        resources_mock.return_value = Mock()
+        resources_mock.return_value = MagicMock()
 
         builder_mock = ApplicationBuilderMock.return_value = Mock()
         artifacts = "artifacts"
@@ -581,7 +764,7 @@ class TestBuildContext__enter__(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -609,12 +792,11 @@ class TestBuildContext__enter__(TestCase):
             build_images={},
             create_auto_dependency_layer=auto_dependency_layer,
             print_success_message=False,
+            use_buildkit=False,
         ) as build_context:
-            with patch("samcli.commands.build.build_context.BuildContext.gen_success_msg") as mock_message:
-                with patch("samcli.commands.build.build_context.BuildContext._check_java_warning") as mock_java_warning:
-                    with patch("samcli.commands.build.build_context.BuildContext._check_esbuild_warning"):
-                        build_context.run()
-                        mock_message.assert_not_called()
+            with patch("samcli.commands.build.build_context.BuildContext._gen_success_msg") as mock_message:
+                build_context.run()
+                mock_message.assert_not_called()
 
 
 class TestBuildContext_setup_build_dir(TestCase):
@@ -624,6 +806,7 @@ class TestBuildContext_setup_build_dir(TestCase):
     def test_build_dir_exists_with_non_empty_dir(self, pathlib_patch, os_patch, shutil_patch):
         path_mock = Mock()
         pathlib_patch.Path.return_value = path_mock
+        os_patch.path.join.side_effect = os.path.join
         os_patch.path.abspath.side_effect = ["/somepath", "/cwd/path"]
         path_mock.cwd.return_value = "/cwd/path"
         os_patch.listdir.return_value = True
@@ -646,9 +829,27 @@ class TestBuildContext_setup_build_dir(TestCase):
     @patch("samcli.commands.build.build_context.shutil")
     @patch("samcli.commands.build.build_context.os")
     @patch("samcli.commands.build.build_context.pathlib")
+    def test_rmtree_oserror_is_converted_to_invalid_build_dir(self, pathlib_patch, os_patch, shutil_patch):
+        # A failure clearing the build dir (e.g. permission denied, file held open on Windows)
+        # must surface as InvalidBuildDirException so --output json still emits a JSON error.
+        path_mock = Mock()
+        pathlib_patch.Path.return_value = path_mock
+        os_patch.path.join.side_effect = os.path.join
+        os_patch.path.abspath.side_effect = ["/somepath", "/cwd/path"]
+        path_mock.exists.return_value = True
+        os_patch.listdir.return_value = True
+        shutil_patch.rmtree.side_effect = OSError("permission denied")
+
+        with self.assertRaises(InvalidBuildDirException):
+            BuildContext._setup_build_dir("/somepath", True)
+
+    @patch("samcli.commands.build.build_context.shutil")
+    @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.pathlib")
     def test_build_dir_exists_with_empty_dir(self, pathlib_patch, os_patch, shutil_patch):
         path_mock = Mock()
         pathlib_patch.Path.return_value = path_mock
+        os_patch.path.join.side_effect = os.path.join
         os_patch.listdir.return_value = False
         os_patch.path.abspath.side_effect = ["/somepath", "/cwd/path"]
         path_mock.cwd.return_value = "/cwd/path"
@@ -674,6 +875,7 @@ class TestBuildContext_setup_build_dir(TestCase):
     def test_build_dir_does_not_exist(self, pathlib_patch, os_patch, shutil_patch):
         path_mock = Mock()
         pathlib_patch.Path.return_value = path_mock
+        os_patch.path.join.side_effect = os.path.join
         os_patch.path.abspath.side_effect = ["/somepath", "/cwd/path"]
         path_mock.cwd.return_value = "/cwd/path"
         path_mock.resolve.return_value = "long/full/path"
@@ -698,6 +900,7 @@ class TestBuildContext_setup_build_dir(TestCase):
     def test_non_clean_build_when_dir_exists_with_non_empty_dir(self, pathlib_patch, os_patch, shutil_patch):
         path_mock = Mock()
         pathlib_patch.Path.return_value = path_mock
+        os_patch.path.join.side_effect = os.path.join
         os_patch.path.abspath.side_effect = ["/somepath", "/cwd/path"]
         path_mock.cwd.return_value = "/cwd/path"
         os_patch.listdir.return_value = True
@@ -723,6 +926,7 @@ class TestBuildContext_setup_build_dir(TestCase):
     def test_when_build_dir_is_cwd_raises_exception(self, pathlib_patch, os_patch, shutil_patch):
         path_mock = Mock()
         pathlib_patch.Path.return_value = path_mock
+        os_patch.path.join.side_effect = os.path.join
         os_patch.path.abspath.side_effect = ["/somepath", "/somepath"]
         path_mock.cwd.return_value = "/somepath"
         build_dir = "/somepath"
@@ -739,17 +943,125 @@ class TestBuildContext_setup_build_dir(TestCase):
         shutil_patch.rmtree.assert_not_called()
         pathlib_patch.Path.cwd.assert_called_once()
 
+    @parameterized.expand([("..",), (os.path.join("..", ".."),)])
+    def test_when_build_dir_is_parent_of_cwd_raises_and_removes_nothing(self, relative_build_dir):
+        with tempfile.TemporaryDirectory() as root:
+            project = pathlib.Path(root, "workspace", "project")
+            project.mkdir(parents=True)
+            template = project / "template.yaml"
+            template.write_text("Resources: {}")
+            sibling = pathlib.Path(root, "workspace", "sibling.txt")
+            sibling.write_text("unrelated")
+
+            with patch("samcli.commands.build.build_context.pathlib.Path.cwd", return_value=project):
+                with self.assertRaises(InvalidBuildDirException):
+                    BuildContext._setup_build_dir(str(project / relative_build_dir), True)
+
+            self.assertTrue(template.exists())
+            self.assertTrue(sibling.exists())
+
+    def test_when_build_dir_contains_template_dir_raises_and_removes_nothing(self):
+        # sam build -t proj/template.yaml --build-dir proj, run from proj's parent
+        with tempfile.TemporaryDirectory() as root:
+            cwd = pathlib.Path(root)
+            template = cwd / "proj" / "template.yaml"
+            template.parent.mkdir()
+            template.write_text("Resources: {}")
+
+            with patch("samcli.commands.build.build_context.pathlib.Path.cwd", return_value=cwd):
+                with self.assertRaises(InvalidBuildDirException):
+                    BuildContext._setup_build_dir(str(cwd / "proj"), True, None, [str(template.parent)])
+
+            self.assertTrue(template.exists())
+
+    @parameterized.expand(
+        [
+            (".aws-sam", None),
+            (os.path.join(".aws-sam", "cache"), os.path.join(".aws-sam", "cache")),
+            (os.path.join(".aws-sam", "deps"), os.path.join(".aws-sam", "cache")),
+            ("out", os.path.join("out", "cache")),
+            ("out", os.path.join("out", "nested", "cache")),
+        ]
+    )
+    def test_when_build_dir_contains_sam_state_warns(self, relative_build_dir, cache_dir):
+        with tempfile.TemporaryDirectory() as root:
+            project = pathlib.Path(root, "project")
+            (project / relative_build_dir).mkdir(parents=True)
+
+            with patch("samcli.commands.build.build_context.pathlib.Path.cwd", return_value=project):
+                with self.assertLogs("samcli.commands.build.build_context", level="WARNING") as logs:
+                    BuildContext._setup_build_dir(str(project / relative_build_dir), True, cache_dir)
+
+            self.assertIn("will not be supported in a future release", logs.output[0])
+            self.assertTrue((project / relative_build_dir).is_dir())
+
+    def test_when_build_dir_contains_sam_state_without_clean_does_not_warn(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = pathlib.Path(root, "project")
+            state_file = project / ".aws-sam" / "cache" / "marker"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text("state")
+
+            with patch("samcli.commands.build.build_context.pathlib.Path.cwd", return_value=project):
+                with patch("samcli.commands.build.build_context.LOG") as log_mock:
+                    BuildContext._setup_build_dir(str(project / ".aws-sam"), False, os.path.join(".aws-sam", "cache"))
+
+            log_mock.warning.assert_not_called()
+            self.assertTrue(state_file.exists())
+
+    @parameterized.expand(
+        [
+            (os.path.join(".aws-sam", "build"), os.path.join(".aws-sam", "cache")),
+            (os.path.join(".aws-sam", "auto-dependency-layer"), os.path.join(".aws-sam", "cache")),
+            ("out", os.path.join(".aws-sam", "cache")),
+            ("out", None),
+        ]
+    )
+    def test_build_dir_beside_sam_state_is_allowed(self, relative_build_dir, cache_dir):
+        with tempfile.TemporaryDirectory() as root:
+            project = pathlib.Path(root, "project")
+            project.mkdir()
+
+            with patch("samcli.commands.build.build_context.pathlib.Path.cwd", return_value=project):
+                with patch("samcli.commands.build.build_context.LOG") as log_mock:
+                    BuildContext._setup_build_dir(str(project / relative_build_dir), True, cache_dir)
+
+            log_mock.warning.assert_not_called()
+            self.assertTrue((project / relative_build_dir).is_dir())
+
+    def test_build_dir_inside_cwd_is_cleaned(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = pathlib.Path(root, "project")
+            build_dir = project / ".aws-sam" / "build"
+            build_dir.mkdir(parents=True)
+            (build_dir / "stale").write_text("old artifact")
+
+            with patch("samcli.commands.build.build_context.pathlib.Path.cwd", return_value=project):
+                BuildContext._setup_build_dir(str(build_dir), True)
+
+            self.assertTrue(build_dir.is_dir())
+            self.assertEqual(os.listdir(build_dir), [])
+
 
 class TestBuildContext_setup_cached_and_deps_dir(TestCase):
     @parameterized.expand([(True,), (False,)])
     @patch("samcli.commands.build.build_context.pathlib.Path")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     def test_cached_dir_and_deps_dir_creation(
-        self, cached, patched_layer, patched_function, patched_stack, patched_path
+        self,
+        cached,
+        patched_layer,
+        patched_microvm,
+        patched_function,
+        patched_stack,
+        patched_path,
     ):
         patched_stack.get_stacks.return_value = ([], None)
+        patched_microvm.return_value.get.return_value = None
+        patched_microvm.return_value.get_all.return_value = []
         build_context = BuildContext(
             resource_identifier="function_identifier",
             template_file="template_file",
@@ -784,9 +1096,12 @@ class TestBuildContext_setup_cached_and_deps_dir(TestCase):
 
 
 class TestBuildContext_run(TestCase):
+    @parameterized.expand([(True,), (False,)])
+    @patch("samcli.commands.build.build_context.NestedStackManager")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamApiProvider")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -795,10 +1110,17 @@ class TestBuildContext_run(TestCase):
     @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
+    @patch("samcli.commands.build.build_context.BuildContext._is_sam_template")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
+    @patch("samcli.commands.build.build_context.BuildContext._handle_build_pre_processing")
     def test_run_build_context(
         self,
+        auto_dependency_layer,
+        pre_processing_mock,
+        esbuild_bundler_manager_mock,
         os_mock,
+        is_sam_template_mock,
         get_template_data_mock,
         move_template_mock,
         resources_mock,
@@ -807,14 +1129,16 @@ class TestBuildContext_run(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         SamApiProviderMock,
         get_buildable_stacks_mock,
+        nested_stack_manager_mock,
     ):
-
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         root_stack = Mock()
         root_stack.is_root_stack = True
-        auto_dependency_layer = False
         root_stack.get_output_template_path = Mock(return_value="./build_dir/template.yaml")
         child_stack = Mock()
         child_stack.get_output_template_path = Mock(return_value="./build_dir/abcd/template.yaml")
@@ -822,11 +1146,11 @@ class TestBuildContext_run(TestCase):
             root_stack.stack_path: "./build_dir/template.yaml",
             child_stack.stack_path: "./build_dir/abcd/template.yaml",
         }
-        resources_mock.return_value = Mock(functions=[], layers=[])
+        resources_mock.return_value = Mock(functions=[], layers=[], microvm_images=[])
 
         builder_mock = ApplicationBuilderMock.return_value = Mock()
         artifacts = "artifacts"
-        builder_mock.build.return_value = ApplicationBuildResult(Mock(), artifacts)
+        application_build_result = builder_mock.build.return_value = ApplicationBuildResult(Mock(), artifacts)
         modified_template_root = "modified template 1"
         modified_template_child = "modified template 2"
         builder_mock.update_template.side_effect = [modified_template_root, modified_template_child]
@@ -836,13 +1160,29 @@ class TestBuildContext_run(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
         base_dir = pathlib_mock.Path.return_value.resolve.return_value.parent = "basedir"
         container_mgr_mock = ContainerManagerMock.return_value = Mock()
         build_dir_mock.return_value = "build_dir"
+
+        given_nested_stack_manager = Mock()
+        given_nested_stack_manager.generate_auto_dependency_layer_stack.side_effect = [
+            modified_template_root,
+            modified_template_child,
+        ]
+        nested_stack_manager_mock.return_value = given_nested_stack_manager
+
+        pre_processing_mock.return_value = [root_stack, child_stack]
+
+        esbuild_manager = EsbuildBundlerManager(Mock())
+        esbuild_manager.set_sourcemap_env_from_metadata = Mock()
+        esbuild_manager.set_sourcemap_env_from_metadata.side_effect = [modified_template_root, modified_template_child]
+        esbuild_manager.esbuild_configured = Mock()
+        esbuild_manager.esbuild_configured.return_value = False
+        esbuild_bundler_manager_mock.return_value = esbuild_manager
 
         with BuildContext(
             resource_identifier="function_identifier",
@@ -863,8 +1203,13 @@ class TestBuildContext_run(TestCase):
             container_env_var_file=None,
             build_images={},
             create_auto_dependency_layer=auto_dependency_layer,
+            build_in_source=False,
+            mount_with=MountMode.READ,
+            mount_symlinks=True,
+            use_buildkit=False,
         ) as build_context:
             build_context.run()
+            is_sam_template_mock.assert_called_once_with()
 
             ApplicationBuilderMock.assert_called_once_with(
                 ANY,
@@ -881,6 +1226,10 @@ class TestBuildContext_run(TestCase):
                 container_env_var_file=build_context._container_env_var_file,
                 build_images=build_context._build_images,
                 combine_dependencies=not auto_dependency_layer,
+                build_in_source=build_context._build_in_source,
+                mount_with_write=False,
+                mount_symlinks=True,
+                use_buildkit=False,
             )
             builder_mock.build.assert_called_once()
             builder_mock.update_template.assert_has_calls(
@@ -914,21 +1263,95 @@ class TestBuildContext_run(TestCase):
                 ]
             )
 
+            if auto_dependency_layer:
+                nested_stack_manager_mock.assert_has_calls(
+                    [
+                        call(root_stack, "", build_context.build_dir, modified_template_root, application_build_result),
+                        call(
+                            child_stack,
+                            "",
+                            build_context.build_dir,
+                            modified_template_child,
+                            application_build_result,
+                        ),
+                    ],
+                    any_order=True,
+                )
+                # assert that nested stack manager is called by both root stack and child stack
+                given_nested_stack_manager.generate_auto_dependency_layer_stack.assert_has_calls([call(), call()])
+
+    @patch("samcli.commands.build.build_context.SamLocalStackProvider.find_root_stack")
+    @patch("samcli.commands.build.build_context.BuildContext.set_up")
+    @patch("samcli.commands.build.build_context.BuildContext._handle_build_post_processing")
+    @patch("samcli.commands.build.build_context.BuildContext._handle_build_pre_processing")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    @patch("samcli.commands.build.build_context.BuildContext._is_sam_template", return_value=False)
+    @patch("samcli.commands.build.build_context.ApplicationBuilder")
+    def test_run_json_mode_emits_single_parseable_document(
+        self,
+        ApplicationBuilderMock,
+        is_sam_template_mock,
+        resources_mock,
+        pre_processing_mock,
+        post_processing_mock,
+        set_up_mock,
+        find_root_stack_mock,
+    ):
+        """run() in JSON mode must write exactly one parseable JSON document to stdout."""
+        resources_mock.return_value = Mock(
+            functions=[get_function("Fn", runtime="python3.12")], layers=[], microvm_images=[]
+        )
+        ApplicationBuilderMock.return_value.build.return_value = ApplicationBuildResult(Mock(), "artifacts")
+        find_root_stack_mock.return_value.get_output_template_path.return_value = "build_dir/template.yaml"
+
+        build_context = BuildContext(
+            resource_identifier=None,
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            cached=False,
+            parallel=False,
+            mode=None,
+            output="json",
+        )
+
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            build_context.run()
+
+        # Must be exactly one JSON document on stdout -- json.loads fails on any extra output
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["status"], "success")
+        self.assertIn("build_dir", result)
+        self.assertIn("resources", result)
+
     @parameterized.expand(
         [
-            (UnsupportedRuntimeException(), "UnsupportedRuntimeException"),
-            (BuildInsideContainerError(), "BuildInsideContainerError"),
-            (BuildError(wrapped_from=DeepWrap().__class__.__name__, msg="Test"), "DeepWrap"),
-            (ContainerBuildNotSupported(), "ContainerBuildNotSupported"),
+            # (exception, expected wrapped_from, expected resource_names)
+            # These reach run()'s handler untagged (ApplicationBuilder is mocked, so the build-strategy
+            # wrapper that would tag resource_names never runs). run() then resolves the requested
+            # identifier to its full path (the mocked function provider returns func1). In real runs the
+            # strategy wrapper tags these with the in-flight resources before run() sees them; that path is
+            # covered separately by the build_strategy tests.
+            (UnsupportedRuntimeException(), "UnsupportedRuntimeException", ["func1"]),
+            (UnsupportedBuilderException(), "UnsupportedBuilderException", ["func1"]),
+            (BuildInsideContainerError(), "BuildInsideContainerError", ["func1"]),
+            (BuildError(wrapped_from=DeepWrap().__class__.__name__, msg="Test"), "DeepWrap", ["func1"]),
             (
                 UnsupportedBuilderLibraryVersionError(container_name="name", error_msg="msg"),
                 "UnsupportedBuilderLibraryVersionError",
+                ["func1"],
             ),
+            # A corrupt build graph is not any single resource's fault, so it stays resource_names=None
+            # rather than blaming the requested identifier.
+            (InvalidBuildGraphException(msg="bad graph"), "InvalidBuildGraphException", None),
         ]
     )
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamApiProvider")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -938,10 +1361,13 @@ class TestBuildContext_run(TestCase):
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
     def test_must_catch_known_exceptions(
         self,
         exception,
         wrapped_exception,
+        expected_resource_names,
+        esbuild_bundler_manager_mock,
         os_mock,
         get_template_data_mock,
         move_template_mock,
@@ -951,13 +1377,15 @@ class TestBuildContext_run(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         SamApiProviderMock,
         get_buildable_stacks_mock,
     ):
-
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         stack = Mock()
-        resources_mock.return_value = Mock(functions=[], layers=[])
+        resources_mock.return_value = Mock(functions=[], layers=[], microvm_images=[])
 
         builder_mock = ApplicationBuilderMock.return_value = Mock()
         artifacts = builder_mock.build.return_value = "artifacts"
@@ -970,7 +1398,7 @@ class TestBuildContext_run(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -999,15 +1427,20 @@ class TestBuildContext_run(TestCase):
                 container_env_var={},
                 container_env_var_file=None,
                 build_images={},
+                use_buildkit=False,
             ) as build_context:
                 build_context.run()
 
         self.assertEqual(str(ctx.exception), str(exception))
         self.assertEqual(wrapped_exception, ctx.exception.wrapped_from)
+        # Resource-tied failures fall back to the requested resource id; a corrupt build graph
+        # keeps resource_names=None so no innocent resource is blamed.
+        self.assertEqual(ctx.exception.resource_names, expected_resource_names)
 
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamApiProvider")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
     @patch("samcli.commands.build.build_context.SamLayerProvider")
     @patch("samcli.commands.build.build_context.pathlib")
     @patch("samcli.commands.build.build_context.ContainerManager")
@@ -1017,8 +1450,10 @@ class TestBuildContext_run(TestCase):
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
     def test_must_catch_function_not_found_exception(
         self,
+        source_map_mock,
         os_mock,
         get_template_data_mock,
         move_template_mock,
@@ -1028,10 +1463,13 @@ class TestBuildContext_run(TestCase):
         ContainerManagerMock,
         pathlib_mock,
         SamLayerProviderMock,
+        SamMicrovmImageProviderMock,
         SamFunctionProviderMock,
         SamApiProviderMock,
         get_buildable_stacks_mock,
     ):
+        SamMicrovmImageProviderMock.return_value.get.return_value = None
+        SamMicrovmImageProviderMock.return_value.get_all.return_value = []
         stack = Mock()
         resources_mock.return_value = Mock()
 
@@ -1046,7 +1484,7 @@ class TestBuildContext_run(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -1075,32 +1513,164 @@ class TestBuildContext_run(TestCase):
                 container_env_var={},
                 container_env_var_file=None,
                 build_images={},
+                use_buildkit=False,
             ) as build_context:
                 build_context.run()
 
         self.assertEqual(str(ctx.exception), "Function Not Found")
 
+    @patch("samcli.lib.build.app_builder.get_validated_container_client")
+    @patch("samcli.commands.build.build_context.BuildContext._is_sam_template")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    @patch("samcli.commands.build.build_context.BuildContext._check_exclude_warning")
+    @patch("samcli.commands.build.build_context.BuildContext._check_build_method_experimental_flag")
+    @patch("samcli.lib.build.app_builder.ApplicationBuilder.build")
+    @patch("samcli.lib.telemetry.event.EventTracker.track_event")
+    def test_build_in_source_event_sent(
+        self,
+        mock_track_event,
+        mock_builder,
+        mock_experimental,
+        mock_warning,
+        mock_get_resources,
+        mock_is_sam_template,
+        mock_get_validated_client,
+    ):
+        mock_builder.side_effect = [FunctionNotFound()]
 
-class TestBuildContext_java_warning(TestCase):
+        # Mock the docker client
+        docker_client_mock = Mock()
+        mock_get_validated_client.return_value = docker_client_mock
+
+        context = BuildContext(
+            resource_identifier="",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            cached=False,
+            clean=False,
+            parallel=False,
+            mode="mode",
+            build_in_source=True,
+        )
+
+        with self.assertRaises(UserException):
+            context.run()
+
+        mock_track_event.assert_called_with(
+            EventName.USED_FEATURE.value, UsedFeature.BUILD_IN_SOURCE.value, "FunctionNotFound"
+        )
+
+    @patch("samcli.commands.build.build_context.prompt_user_to_enable_mount_with_write_if_needed")
+    @patch("samcli.commands.build.build_context.BuildContext._is_sam_template", return_value=False)
+    @patch("samcli.commands.build.build_context.BuildContext._handle_build_pre_processing")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    @patch("samcli.commands.build.build_context.BuildContext._check_exclude_warning")
+    @patch("samcli.commands.build.build_context.BuildContext._check_build_method_experimental_flag")
+    @patch("samcli.lib.build.app_builder.ApplicationBuilder.build")
+    def test_skips_mount_prompt_in_json_mode(
+        self, mock_build, mock_experimental, mock_warning, mock_get_resources, mock_pre_processing, _, mock_prompt
+    ):
+        # --use-container without --mount-with WRITE normally prompts on stdin. In JSON mode the
+        # interactive prompt is never used; when no resource requires a writable mount the build
+        # proceeds READ-only. build() raises to short-circuit right after the decision.
+        mock_build.side_effect = FunctionNotFound()
+        mock_get_resources.return_value = Mock(functions=[], layers=[])
+        context = BuildContext(
+            resource_identifier="",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            cached=False,
+            parallel=False,
+            mode="mode",
+            use_container=True,
+            mount_with=MountMode.READ.value,
+            output="json",
+        )
+
+        with self.assertRaises(UserException):
+            context.run()
+
+        mock_prompt.assert_not_called()
+
+    @patch("samcli.commands.build.build_context.resource_requiring_mount_with_write")
+    @patch("samcli.commands.build.build_context.BuildContext._is_sam_template", return_value=False)
+    @patch("samcli.commands.build.build_context.BuildContext._handle_build_pre_processing")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    def test_json_mode_write_mount_required_raises_actionable_error(
+        self, mock_get_resources, mock_pre_processing, _, mock_requires_write
+    ):
+        # A workflow that requires a writable mount (e.g. .NET) cannot fall back to READ-only in JSON
+        # mode; it must fail up front with a message pointing at --mount-with WRITE rather than
+        # proceeding and failing later with a cryptic in-container permission error.
+        mock_get_resources.return_value = Mock(functions=[], layers=[])
+        mock_requires_write.return_value = (Mock(), "/src/DotnetFn")
+        context = BuildContext(
+            resource_identifier="",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            cached=False,
+            parallel=False,
+            mode="mode",
+            use_container=True,
+            mount_with=MountMode.READ.value,
+            output="json",
+        )
+
+        with self.assertRaises(UserException) as ctx:
+            context.run()
+
+        self.assertIn("--mount-with WRITE", str(ctx.exception))
+        self.assertIn("/src/DotnetFn", str(ctx.exception))
+
+
+class TestBuildContext_is_sam_template(TestCase):
+    @parameterized.expand(
+        [
+            ({"Transform": "AWS::Serverless-2016-10-31"}, True),
+            ({"Transform": ["AWS::Serverless-2016-10-31"]}, True),
+            ({"Transform": ["AWS::Language::Extension", "AWS::Serverless-2016-10-31"]}, True),
+            ({"Transform": ["AWS::Language::Extension"]}, False),
+            ({"Transform": "AWS::Language::Extension"}, False),
+            ({"Transform": 123}, False),
+        ]
+    )
+    @patch("samcli.commands.build.build_context.get_template_data")
+    def test_is_sam_template(self, template_dict, expected_result, get_template_data_mock):
+        get_template_data_mock.return_value = template_dict
+
+        build_context = BuildContext(
+            resource_identifier="",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            cached=False,
+            clean=False,
+            parallel=False,
+            mode="mode",
+        )
+        result = build_context._is_sam_template()
+        self.assertEqual(result, expected_result)
+
+
+class TestBuildContext_exclude_warning(TestCase):
     @parameterized.expand(
         [
             ([], [], False),
-            ([DummyFunction("NonJavaFunction", runtime="nodejs14.x")], [], False),
-            ([], [DummyLayer("NonJavaLayer", build_method="nodejs14.x")], False),
-            (
-                [DummyFunction("NonJavaFunction", runtime="nodejs14.x")],
-                [DummyLayer("NonJavaLayer", build_method="nodejs14.x")],
-                False,
-            ),
-            ([DummyFunction("JavaFunction", runtime="java8")], [], True),
-            ([], [DummyLayer("JavaLayer", build_method="java11")], True),
-            ([DummyFunction("JavaFunction", runtime="java11")], [DummyLayer("JavaLayer", build_method="java8")], True),
+            ("Function", ("Function",), True),
+            ("Function", ("NotTheSameFunction",), False),
         ]
     )
-    @patch("samcli.commands.build.build_context.click.secho")
-    def test_check_java_warning(self, functions, layers, should_print, mocked_click):
+    @patch("samcli.commands.build.build_context.LOG")
+    def test_check_exclude_warning(self, resource_id, exclude, should_print, log_mock):
         build_context = BuildContext(
-            resource_identifier="function_identifier",
+            resource_identifier=resource_id,
             template_file="template_file",
             base_dir="base_dir",
             build_dir="build_dir",
@@ -1109,43 +1679,1505 @@ class TestBuildContext_java_warning(TestCase):
             clean=False,
             parallel=False,
             mode="mode",
+            excluded_resources=exclude,
         )
-        with patch.object(build_context, "get_resources_to_build") as mocked_resources_to_build:
-            mocked_resources_to_build.return_value = Mock(functions=functions, layers=layers)
-            build_context._check_java_warning()
-
-            if should_print:
-                mocked_click.assert_called_with(BuildContext._JAVA_BUILD_WARNING_MESSAGE, fg="yellow")
-            else:
-                mocked_click.assert_not_called()
-
-
-class TestBuildContext_esbuild_warning(TestCase):
-    @parameterized.expand(
-        [
-            ([], False),
-            ([DummyFunction("Esbuild", metadata={"BuildMethod": "esbuild"})], True),
-            ([DummyFunction("NotEsbuild", metadata={"BuildMethod": "Makefile"})], False),
-        ]
-    )
-    @patch("samcli.commands.build.build_context.prompt_experimental")
-    def test_check_esbuild_warning(self, functions, should_print, mocked_click):
-        build_context = BuildContext(
-            resource_identifier="function_identifier",
-            template_file="template_file",
-            base_dir="base_dir",
-            build_dir="build_dir",
-            cache_dir="cache_dir",
-            cached=False,
-            clean=False,
-            parallel=False,
-            mode="mode",
-        )
-        with patch.object(build_context, "get_resources_to_build") as mocked_resources_to_build:
-            mocked_resources_to_build.return_value = Mock(functions=functions)
-            build_context._check_esbuild_warning()
+        build_context._check_exclude_warning()
 
         if should_print:
-            mocked_click.assert_called_with(ExperimentalFlag.Esbuild, BuildContext._ESBUILD_WARNING_MESSAGE)
+            log_mock.warning.assert_called_once_with(BuildContext._EXCLUDE_WARNING_MESSAGE)
         else:
-            mocked_click.assert_not_called()
+            log_mock.warning.assert_not_called()
+
+
+class TestBuildContext_gen_success_msg(TestCase):
+    def setUp(self):
+        self.build_dir = "build_dir"
+        self.template_file = "template_file"
+
+        self.build_context = BuildContext(
+            resource_identifier="function_identifier",
+            template_file=self.template_file,
+            base_dir="base_dir",
+            build_dir=self.build_dir,
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+        )
+
+    def test_gen_message_with_non_default_build_without_hook_package(self):
+        self.build_context._hook_name = False
+
+        msg = self.build_context._gen_success_msg(self.build_dir, self.template_file, False)
+        expected_msg = (
+            f"""\nBuilt Artifacts  : build_dir
+Built Template   : template_file\n
+Commands you can use next
+=========================
+[*] Validate SAM template: sam validate{os.linesep}[*] Invoke Function: sam local invoke -t template_file"""
+            f"""{os.linesep}[*] Test Function in the Cloud: sam sync --stack-name {"{{stack-name}}"} --watch"""
+            f"""{os.linesep}[*] Deploy: sam deploy --guided --template-file template_file"""
+        )
+
+        self.assertEqual(msg, expected_msg)
+
+    def test_gen_message_with_non_default_build_with_hook_package(self):
+        self.build_context._hook_name = "iac"
+
+        msg = self.build_context._gen_success_msg(self.build_dir, self.template_file, False)
+        expected_msg = (
+            f"""\nBuilt Artifacts  : build_dir
+Built Template   : template_file
+
+Commands you can use next
+=========================
+[*] Invoke Function: sam local invoke --hook-name iac{os.linesep}[*] Emulate local Lambda functions: sam """
+            """local start-lambda --hook-name iac"""
+        )
+
+        self.assertEqual(msg, expected_msg)
+
+
+class TestBuildContext_gen_success_msg_microvm_images(TestCase):
+    def setUp(self):
+        self.build_context = BuildContext(
+            resource_identifier=None,
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+        )
+        self.build_context._hook_name = False
+        self.images = [
+            MicrovmImage(name="MyImage", code_uri="./app", architecture="arm64"),
+            MicrovmImage(name="Other", code_uri="./other", architecture="arm64", stack_path="Child"),
+        ]
+        self.build_context._build_result = ApplicationBuildResult(
+            Mock(), {"MyImage": "myimage:latest", "Child/Other": "child-other:latest"}
+        )
+
+    def _collector(self, functions=(), layers=(), images=()):
+        collector = ResourcesToBuildCollector()
+        collector.add_functions(list(functions))
+        collector.add_layers(list(layers))
+        collector.add_microvm_images(list(images))
+        return collector
+
+    def test_lists_built_microvm_images_with_tag_and_platform(self):
+        msg = self.build_context._gen_success_msg(
+            "build_dir", "template_file", True, self._collector(images=self.images)
+        )
+
+        self.assertIn(
+            "\nBuilt MicrovmImages\n===================\n"
+            f"[*] MyImage -> myimage:latest (linux/arm64){os.linesep}"
+            "[*] Child/Other -> child-other:latest (linux/arm64)\n",
+            msg,
+        )
+
+    def test_image_only_build_drops_local_invoke_but_keeps_sync_and_deploy(self):
+        msg = self.build_context._gen_success_msg(
+            "build_dir", "template_file", True, self._collector(images=self.images)
+        )
+
+        self.assertNotIn("sam local invoke", msg)
+        self.assertIn("sam validate", msg)
+        self.assertIn("sam sync", msg)
+        self.assertIn("sam deploy --guided", msg)
+
+    def test_mixed_build_keeps_local_invoke(self):
+        function = Mock()
+        msg = self.build_context._gen_success_msg(
+            "build_dir", "template_file", True, self._collector(functions=[function], images=self.images)
+        )
+
+        self.assertIn("sam local invoke", msg)
+        self.assertIn("Built MicrovmImages", msg)
+
+    def test_no_microvm_images_leaves_message_unchanged(self):
+        with_collector = self.build_context._gen_success_msg(
+            "build_dir", "template_file", True, self._collector(functions=[Mock()])
+        )
+        without_collector = self.build_context._gen_success_msg("build_dir", "template_file", True)
+
+        self.assertEqual(with_collector, without_collector)
+        self.assertNotIn("Built MicrovmImages", with_collector)
+
+
+class TestBuildContext_print_build_success(TestCase):
+    def setUp(self):
+        self.build_dir = ".aws-sam/build"
+        self.template_file = "template_file"
+
+        self.build_context = BuildContext(
+            resource_identifier="function_identifier",
+            template_file=self.template_file,
+            base_dir="base_dir",
+            build_dir=self.build_dir,
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+            output="json",
+        )
+        self.build_context._hook_name = False
+
+    @staticmethod
+    def _collector(functions=None, layers=None):
+        collector = ResourcesToBuildCollector()
+        collector.add_functions(functions or [])
+        collector.add_layers(layers or [])
+        return collector
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_json_with_functions_and_layers(self, echo_mock, secho_mock):
+        collector = self._collector(
+            functions=[get_function("Fn", runtime="python3.12")],
+            layers=[DummyLayer("Lyr", "python3.12")],
+        )
+        collector.layers[0].full_path = "Lyr"
+        collector.layers[0].compatible_runtimes = ["python3.12", "python3.11"]
+
+        self.build_context._print_build_success("artifacts", "out_template", collector)
+
+        # JSON goes to click.echo; text-mode secho must not be used
+        self.assertEqual(echo_mock.call_count, 1)
+        secho_mock.assert_not_called()
+
+        result = json.loads(echo_mock.call_args[0][0])
+        # Shared cross-command contract: a `type` discriminator plus a lowercase status.
+        self.assertEqual(result["type"], "result")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["build_dir"], "artifacts")
+        self.assertEqual(result["template_file"], "out_template")
+        # Order is functions first, then layers
+        self.assertEqual(result["resources"][0]["type"], "function")
+        self.assertEqual(result["resources"][0]["resource_id"], "Fn")
+        self.assertEqual(result["resources"][1]["type"], "layer")
+        self.assertEqual(result["resources"][1]["resource_id"], "Lyr")
+        self.assertEqual(result["resources"][1]["compatible_runtimes"], ["python3.12", "python3.11"])
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_json_reports_the_microvm_image_tag(self, echo_mock, secho_mock):
+        collector = self._collector()
+        collector.add_microvm_image(MicrovmImage("MyImage", "src", "arm64", stack_path="Child"))
+        self.build_context._build_result = ApplicationBuildResult(
+            build_graph=Mock(), artifacts={"Child/MyImage": "child-myimage:latest"}
+        )
+
+        self.build_context._print_build_success("artifacts", "out_template", collector)
+
+        result = json.loads(echo_mock.call_args[0][0])
+        self.assertEqual(
+            result["resources"],
+            [
+                {
+                    "resource_id": "Child/MyImage",
+                    "type": "microvm_image",
+                    "architecture": "arm64",
+                    "image_tag": "child-myimage:latest",
+                }
+            ],
+        )
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_json_reports_absolute_paths_unchanged(self, echo_mock, secho_mock):
+        # JSON must report the absolute paths it is handed, never relpath'd, so a machine consumer
+        # does not have to guess the process cwd (relpath is a text-banner-only affordance).
+        abs_build_dir = os.path.abspath(".aws-sam/build")
+        abs_template = os.path.abspath(".aws-sam/build/template.yaml")
+
+        self.build_context._print_build_success(abs_build_dir, abs_template, self._collector())
+
+        result = json.loads(echo_mock.call_args[0][0])
+        self.assertEqual(result["build_dir"], abs_build_dir)
+        self.assertEqual(result["template_file"], abs_template)
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_text_mode_relpaths_the_paths(self, echo_mock, secho_mock):
+        # Text mode keeps the human-readability relpath transform on the absolute paths it receives.
+        self.build_context._output = OutputOption.text
+        abs_build_dir = os.path.abspath(".aws-sam/build")
+
+        self.build_context._print_build_success(abs_build_dir, abs_build_dir, self._collector())
+
+        printed = " ".join(str(c.args[0]) for c in secho_mock.call_args_list)
+        self.assertIn(os.path.relpath(abs_build_dir), printed)
+
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_json_empty_collector(self, echo_mock):
+        self.build_context._print_build_success("artifacts", "out_template", self._collector())
+
+        result = json.loads(echo_mock.call_args[0][0])
+        self.assertEqual(result["resources"], [])
+
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_json_image_function_has_package_type_discriminator(self, echo_mock):
+        # Image functions have runtime: None; package_type lets a consumer distinguish them
+        # from a malformed Zip entry.
+        image_fn = get_function("ImgFn", runtime=None, packagetype=IMAGE)
+        collector = self._collector(functions=[image_fn])
+
+        self.build_context._print_build_success("artifacts", "out_template", collector)
+
+        resource = json.loads(echo_mock.call_args[0][0])["resources"][0]
+        self.assertEqual(resource["package_type"], "Image")
+        self.assertIsNone(resource["runtime"])
+
+    @parameterized.expand(
+        [
+            # (explicit architectures, expected reported value) - absent defaults to x86_64.
+            (None, "x86_64"),
+            (["arm64"], "arm64"),
+        ]
+    )
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_json_reports_function_architecture(self, architectures, expected, echo_mock):
+        function = get_function("Fn", runtime="python3.12")
+        if architectures is not None:
+            function = function._replace(architectures=architectures)
+        collector = self._collector(functions=[function])
+
+        self.build_context._print_build_success("artifacts", "out_template", collector)
+
+        result = json.loads(echo_mock.call_args[0][0])
+        self.assertEqual(result["resources"][0]["architecture"], expected)
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_text_mode_prints_banner_and_message(self, echo_mock, secho_mock):
+        self.build_context._output = OutputOption.text
+        collector = self._collector(functions=[get_function("Fn", runtime="python3.12")])
+
+        self.build_context._print_build_success("artifacts", "out_template", collector)
+
+        # Text mode uses secho, never echo
+        echo_mock.assert_not_called()
+        secho_mock.assert_any_call("\nBuild Succeeded", fg="green")
+        self.assertEqual(secho_mock.call_count, 2)
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_text_mode_banner_only_when_success_message_disabled(self, echo_mock, secho_mock):
+        self.build_context._output = OutputOption.text
+        self.build_context._print_success_message = False
+
+        self.build_context._print_build_success("artifacts", "out_template", self._collector())
+
+        echo_mock.assert_not_called()
+        secho_mock.assert_called_once_with("\nBuild Succeeded", fg="green")
+
+
+class TestBuildContext_print_build_failure(TestCase):
+    def setUp(self):
+        self.build_context = BuildContext(
+            resource_identifier="function_identifier",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+            output="json",
+        )
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_text_mode_prints_banner(self, echo_mock, secho_mock):
+        self.build_context._output = OutputOption.text
+
+        self.build_context._print_build_failure()
+
+        echo_mock.assert_not_called()
+        secho_mock.assert_called_once_with("\nBuild Failed", fg="red")
+
+    @patch("samcli.commands.build.build_context.click.secho")
+    @patch("samcli.commands.build.build_context.click.echo")
+    def test_json_mode_stays_silent(self, echo_mock, secho_mock):
+        # In JSON mode _print_build_failure emits nothing (do_cli serializes the failure).
+        self.build_context._output = OutputOption.json
+
+        self.build_context._print_build_failure()
+
+        echo_mock.assert_not_called()
+        secho_mock.assert_not_called()
+
+    def test_resolves_bare_id_to_full_path(self):
+        # A nested-stack function's full_path differs from the bare CLI id; resolving keeps
+        # error.resources in the same namespace as the success document's resource_id.
+        nested = get_function("MyFn")._replace(stack_path="ChildStack")
+        self.build_context._function_provider = Mock()
+        self.build_context._function_provider.get.return_value = nested
+        self.build_context._layer_provider = Mock()
+        self.build_context._layer_provider.get.return_value = None
+
+        self.assertEqual(self.build_context._resolve_resource_full_paths("MyFn"), ["ChildStack/MyFn"])
+
+
+class TestBuildContext_check_build_method_experimental_flag(TestCase):
+    def setUp(self):
+        self.build_context = BuildContext(
+            resource_identifier="function_identifier",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+        )
+
+    @patch("samcli.commands.build.build_context.prompt_experimental")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    def test_check_build_method_experimental_flag_python_uv(self, mock_get_resources, mock_prompt):
+        mock_function = Mock()
+        mock_function.metadata = {"BuildMethod": "python-uv"}
+        mock_resources = Mock()
+        mock_resources.functions = [mock_function]
+        mock_get_resources.return_value = mock_resources
+
+        self.build_context._check_build_method_experimental_flag()
+
+        mock_prompt.assert_called_once()
+
+    @patch("samcli.commands.build.build_context.prompt_experimental")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    def test_check_build_method_experimental_flag_no_experimental_method(self, mock_get_resources, mock_prompt):
+        mock_function = Mock()
+        mock_function.metadata = {"BuildMethod": "python-pip"}
+        mock_resources = Mock()
+        mock_resources.functions = [mock_function]
+        mock_get_resources.return_value = mock_resources
+
+        self.build_context._check_build_method_experimental_flag()
+
+        mock_prompt.assert_not_called()
+
+    @patch("samcli.commands.build.build_context.prompt_experimental")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    def test_check_build_method_experimental_flag_no_metadata(self, mock_get_resources, mock_prompt):
+        mock_function = Mock()
+        mock_function.metadata = None
+        mock_resources = Mock()
+        mock_resources.functions = [mock_function]
+        mock_get_resources.return_value = mock_resources
+
+        self.build_context._check_build_method_experimental_flag()
+
+        mock_prompt.assert_not_called()
+
+    @patch("samcli.commands.build.build_context.is_experimental_enabled", return_value=False)
+    @patch("samcli.commands.build.build_context.prompt_experimental")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    def test_skips_beta_prompt_in_json_mode_when_not_enabled(self, mock_get_resources, mock_prompt, _):
+        # A JSON consumer cannot answer the confirm; skip it (rather than aborting on EOF) and let the
+        # non-gating beta build proceed. If the flag were already enabled, prompt_experimental would run
+        # to update telemetry context - covered by is_experimental_enabled=False here.
+        self.build_context._output = OutputOption.json
+        mock_function = Mock()
+        mock_function.metadata = {"BuildMethod": "python-uv"}
+        mock_resources = Mock()
+        mock_resources.functions = [mock_function]
+        mock_get_resources.return_value = mock_resources
+
+        self.build_context._check_build_method_experimental_flag()
+
+        mock_prompt.assert_not_called()
+
+
+class TestBuildContext_get_template_for_output(TestCase):
+    """Tests for the _get_template_for_output method that handles original template preservation."""
+
+    def setUp(self):
+        self.build_context = BuildContext(
+            resource_identifier="function_identifier",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+        )
+
+    def test_returns_modified_template_when_no_original_template(self):
+        """When stack has no original_template_dict, return the modified template."""
+        stack = Mock()
+        stack.original_template_dict = None
+        modified_template = {"Resources": {"Function": {"Type": "AWS::Serverless::Function"}}}
+        artifacts = {}
+
+        result = self.build_context._get_template_for_output(stack, modified_template, artifacts)
+
+        self.assertEqual(result, modified_template)
+
+    def test_returns_modified_template_when_original_template_is_not_dict(self):
+        """When stack.original_template_dict is not a dict (e.g., Mock), return the modified template."""
+        stack = Mock()
+        # Mock objects are not dicts, so this should return modified_template
+        modified_template = {"Resources": {"Function": {"Type": "AWS::Serverless::Function"}}}
+        artifacts = {}
+
+        result = self.build_context._get_template_for_output(stack, modified_template, artifacts)
+
+        self.assertEqual(result, modified_template)
+
+    def test_returns_original_template_when_present(self):
+        """When stack has original_template_dict, return a copy of it with updated paths."""
+        stack = Mock()
+        stack.location = "/path/to/template.yaml"
+        stack.stack_path = ""
+        original_template = {
+            "Resources": {
+                "Fn::ForEach::Functions": [
+                    "Name",
+                    ["Alpha", "Beta"],
+                    {
+                        "${Name}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "CodeUri": "./src",
+                                "Handler": "${Name}.handler",
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        stack.original_template_dict = original_template
+        modified_template = {
+            "Resources": {
+                "AlphaFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "../build/AlphaFunction",
+                        "Handler": "Alpha.handler",
+                    },
+                },
+                "BetaFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "../build/BetaFunction",
+                        "Handler": "Beta.handler",
+                    },
+                },
+            }
+        }
+        artifacts = {"AlphaFunction": "/built/AlphaFunction", "BetaFunction": "/built/BetaFunction"}
+
+        result = self.build_context._get_template_for_output(stack, modified_template, artifacts)
+
+        # Should return the original template structure with Fn::ForEach
+        self.assertIn("Fn::ForEach::Functions", result.get("Resources", {}))
+        # The CodeUri should be updated from the modified template
+        foreach_body = result["Resources"]["Fn::ForEach::Functions"][2]
+        self.assertEqual(
+            foreach_body["${Name}Function"]["Properties"]["CodeUri"],
+            "../build/AlphaFunction",  # Updated from modified template
+        )
+
+    def test_original_template_is_deep_copied(self):
+        """Ensure the original template is deep copied and not modified in place."""
+        stack = Mock()
+        stack.location = "/path/to/template.yaml"
+        stack.stack_path = ""
+        original_template = {
+            "Resources": {
+                "Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "./src",
+                    },
+                }
+            }
+        }
+        stack.original_template_dict = original_template
+        modified_template = {
+            "Resources": {
+                "Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "../build/Function",
+                    },
+                }
+            }
+        }
+        # Function was built — ensure the merge is not skipped by the #9029 guard.
+        artifacts = {"Function": "/path/to/built/Function"}
+
+        result = self.build_context._get_template_for_output(stack, modified_template, artifacts)
+
+        # Original template should not be modified
+        self.assertEqual(original_template["Resources"]["Function"]["Properties"]["CodeUri"], "./src")
+        # Result should have updated path
+        self.assertEqual(result["Resources"]["Function"]["Properties"]["CodeUri"], "../build/Function")
+
+    def test_dynamic_codeuri_generates_mappings_in_output(self):
+        """When Fn::ForEach has dynamic CodeUri, the output template should have Mappings."""
+        stack = Mock()
+        stack.location = "/path/to/template.yaml"
+        stack.stack_path = ""
+        original_template = {
+            "Resources": {
+                "Fn::ForEach::Functions": [
+                    "FunctionName",
+                    ["Alpha", "Beta"],
+                    {
+                        "${FunctionName}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "CodeUri": "./${FunctionName}",
+                                "Handler": "index.handler",
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        stack.original_template_dict = original_template
+        modified_template = {
+            "Resources": {
+                "AlphaFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "AlphaFunction",
+                        "Handler": "index.handler",
+                    },
+                },
+                "BetaFunction": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "BetaFunction",
+                        "Handler": "index.handler",
+                    },
+                },
+            }
+        }
+        artifacts = {"AlphaFunction": "/built/AlphaFunction", "BetaFunction": "/built/BetaFunction"}
+
+        result = self.build_context._get_template_for_output(stack, modified_template, artifacts)
+
+        # Should have Mappings section
+        self.assertIn("Mappings", result)
+        self.assertIn("SAMCodeUriFunctions", result["Mappings"])
+        self.assertEqual(result["Mappings"]["SAMCodeUriFunctions"]["Alpha"]["CodeUri"], "AlphaFunction")
+        self.assertEqual(result["Mappings"]["SAMCodeUriFunctions"]["Beta"]["CodeUri"], "BetaFunction")
+
+        # CodeUri should be Fn::FindInMap
+        foreach_body = result["Resources"]["Fn::ForEach::Functions"][2]
+        code_uri = foreach_body["${FunctionName}Function"]["Properties"]["CodeUri"]
+        self.assertIsInstance(code_uri, dict)
+        self.assertEqual(code_uri["Fn::FindInMap"], ["SAMCodeUriFunctions", {"Ref": "FunctionName"}, "CodeUri"])
+
+
+class TestBuildContext_update_foreach_artifact_paths(TestCase):
+    """Tests for the _update_foreach_artifact_paths method."""
+
+    def setUp(self):
+        self.build_context = BuildContext(
+            resource_identifier="function_identifier",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+        )
+
+    def test_updates_static_codeuri_in_foreach_body(self):
+        """Test that static CodeUri is updated in Fn::ForEach body from expanded resources."""
+
+        foreach_key = "Fn::ForEach::Functions"
+        foreach_value = [
+            "Name",
+            ["Alpha", "Beta"],
+            {
+                "${Name}Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "./src",
+                        "Handler": "${Name}.handler",
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "AlphaFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "CodeUri": "../build/AlphaFunction",
+                    "Handler": "Alpha.handler",
+                },
+            },
+            "BetaFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "CodeUri": "../build/BetaFunction",
+                    "Handler": "Beta.handler",
+                },
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={"AlphaFunction": "/built/AlphaFunction", "BetaFunction": "/built/BetaFunction"},
+        )
+
+        # Static CodeUri: should be updated to first matching expanded resource's path
+        self.assertEqual(foreach_value[2]["${Name}Function"]["Properties"]["CodeUri"], "../build/AlphaFunction")
+        # No Mappings should be generated for static properties
+        self.assertEqual(mappings, {})
+
+    def test_dynamic_codeuri_generates_mappings(self):
+        """Test that dynamic CodeUri generates Mappings with per-function build paths."""
+
+        foreach_key = "Fn::ForEach::Functions"
+        foreach_value = [
+            "FunctionName",
+            ["Alpha", "Beta"],
+            {
+                "${FunctionName}Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "./${FunctionName}",
+                        "Handler": "index.handler",
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "AlphaFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "CodeUri": "AlphaFunction",
+                    "Handler": "index.handler",
+                },
+            },
+            "BetaFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "CodeUri": "BetaFunction",
+                    "Handler": "index.handler",
+                },
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={"AlphaFunction": "/built/AlphaFunction", "BetaFunction": "/built/BetaFunction"},
+        )
+
+        # Mappings should be generated
+        self.assertIn("SAMCodeUriFunctions", mappings)
+        self.assertEqual(mappings["SAMCodeUriFunctions"]["Alpha"]["CodeUri"], "AlphaFunction")
+        self.assertEqual(mappings["SAMCodeUriFunctions"]["Beta"]["CodeUri"], "BetaFunction")
+
+        # CodeUri should be replaced with Fn::FindInMap
+        code_uri = foreach_value[2]["${FunctionName}Function"]["Properties"]["CodeUri"]
+        self.assertIsInstance(code_uri, dict)
+        self.assertIn("Fn::FindInMap", code_uri)
+        self.assertEqual(code_uri["Fn::FindInMap"], ["SAMCodeUriFunctions", {"Ref": "FunctionName"}, "CodeUri"])
+
+        # Fn::ForEach structure should be preserved
+        self.assertEqual(foreach_value[0], "FunctionName")
+        self.assertEqual(foreach_value[1], ["Alpha", "Beta"])
+
+    def test_handles_invalid_foreach_structure(self):
+        """Test that invalid Fn::ForEach structures are handled gracefully."""
+
+        foreach_key = "Fn::ForEach::Functions"
+        modified_resources = {}
+
+        # Invalid structure - not a list
+        result = self.build_context._update_foreach_artifact_paths(foreach_key, "invalid", modified_resources)
+        self.assertEqual(result, {})
+
+        # Invalid structure - list too short
+        result = self.build_context._update_foreach_artifact_paths(foreach_key, ["Name", ["Alpha"]], modified_resources)
+        self.assertEqual(result, {})
+
+    def test_handles_layer_resources(self):
+        """Test that layer ContentUri is updated in Fn::ForEach body."""
+
+        foreach_key = "Fn::ForEach::Layers"
+        foreach_value = [
+            "Name",
+            ["Layer1", "Layer2"],
+            {
+                "${Name}Layer": {
+                    "Type": "AWS::Serverless::LayerVersion",
+                    "Properties": {
+                        "ContentUri": "./layer",
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "Layer1Layer": {
+                "Type": "AWS::Serverless::LayerVersion",
+                "Properties": {
+                    "ContentUri": "../build/Layer1Layer",
+                },
+            }
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={"Layer1Layer": "/built/Layer1Layer", "Layer2Layer": "/built/Layer2Layer"},
+        )
+
+        self.assertEqual(foreach_value[2]["${Name}Layer"]["Properties"]["ContentUri"], "../build/Layer1Layer")
+        self.assertEqual(mappings, {})
+
+    def test_dynamic_codeuri_with_fn_sub(self):
+        """Test that dynamic CodeUri using Fn::Sub generates Mappings."""
+
+        foreach_key = "Fn::ForEach::Services"
+        foreach_value = [
+            "Name",
+            ["Users", "Orders"],
+            {
+                "${Name}Service": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": {"Fn::Sub": "./services/${Name}"},
+                        "Handler": "index.handler",
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "UsersService": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "CodeUri": "UsersService",
+                    "Handler": "index.handler",
+                },
+            },
+            "OrdersService": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "CodeUri": "OrdersService",
+                    "Handler": "index.handler",
+                },
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={"UsersService": "/built/UsersService", "OrdersService": "/built/OrdersService"},
+        )
+
+        self.assertIn("SAMCodeUriServices", mappings)
+        self.assertEqual(mappings["SAMCodeUriServices"]["Users"]["CodeUri"], "UsersService")
+        self.assertEqual(mappings["SAMCodeUriServices"]["Orders"]["CodeUri"], "OrdersService")
+
+    def test_parameter_ref_collection_resolves_to_values(self):
+        """Test that a Ref-based collection is resolved via parameter values."""
+
+        template = {
+            "Parameters": {
+                "FunctionNames": {
+                    "Type": "CommaDelimitedList",
+                    "Default": "Alpha,Beta",
+                }
+            },
+            "Resources": {},
+        }
+        foreach_key = "Fn::ForEach::Functions"
+        foreach_value = [
+            "FunctionName",
+            {"Ref": "FunctionNames"},
+            {
+                "${FunctionName}Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "./${FunctionName}",
+                        "Handler": "index.handler",
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "AlphaFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "AlphaFunction", "Handler": "index.handler"},
+            },
+            "BetaFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "BetaFunction", "Handler": "index.handler"},
+            },
+        }
+        parameter_values = {"FunctionNames": "Alpha,Beta"}
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            template=template,
+            parameter_values=parameter_values,
+            artifacts={"AlphaFunction": "/built/AlphaFunction", "BetaFunction": "/built/BetaFunction"},
+        )
+
+        # Should resolve the Ref collection and generate mappings
+        self.assertIn("SAMCodeUriFunctions", mappings)
+        self.assertEqual(mappings["SAMCodeUriFunctions"]["Alpha"]["CodeUri"], "AlphaFunction")
+        self.assertEqual(mappings["SAMCodeUriFunctions"]["Beta"]["CodeUri"], "BetaFunction")
+
+    def test_parameter_ref_collection_without_params_produces_empty(self):
+        """Test that a Ref-based collection with no parameter values produces no mappings."""
+
+        foreach_key = "Fn::ForEach::Functions"
+        foreach_value = [
+            "FunctionName",
+            {"Ref": "FunctionNames"},
+            {
+                "${FunctionName}Function": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "CodeUri": "./${FunctionName}",
+                        "Handler": "index.handler",
+                    },
+                }
+            },
+        ]
+        modified_resources = {}
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+        )
+
+        # No parameter values provided, collection can't be resolved
+        self.assertEqual(mappings, {})
+
+    def test_nested_foreach_compound_keys_when_property_references_outer_var(self):
+        """Test that nested ForEach with property referencing both outer and inner vars uses compound keys."""
+
+        foreach_key = "Fn::ForEach::Envs"
+        foreach_value = [
+            "Env",
+            ["Dev", "Prod"],
+            {
+                "Fn::ForEach::Services": [
+                    "Svc",
+                    ["Api", "Worker"],
+                    {
+                        "${Env}${Svc}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "CodeUri": "./services/${Env}/${Svc}",
+                                "Handler": "index.handler",
+                            },
+                        }
+                    },
+                ]
+            },
+        ]
+        modified_resources = {
+            "DevApiFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "DevApiFunction", "Handler": "index.handler"},
+            },
+            "DevWorkerFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "DevWorkerFunction", "Handler": "index.handler"},
+            },
+            "ProdApiFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "ProdApiFunction", "Handler": "index.handler"},
+            },
+            "ProdWorkerFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "ProdWorkerFunction", "Handler": "index.handler"},
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={
+                "DevApiFunction": "/built/DevApiFunction",
+                "DevWorkerFunction": "/built/DevWorkerFunction",
+                "ProdApiFunction": "/built/ProdApiFunction",
+                "ProdWorkerFunction": "/built/ProdWorkerFunction",
+            },
+        )
+
+        # Mappings should use compound keys (outer-inner) and nesting path
+        self.assertIn("SAMCodeUriEnvsServices", mappings)
+        self.assertIn("Dev-Api", mappings["SAMCodeUriEnvsServices"])
+        self.assertIn("Dev-Worker", mappings["SAMCodeUriEnvsServices"])
+        self.assertIn("Prod-Api", mappings["SAMCodeUriEnvsServices"])
+        self.assertIn("Prod-Worker", mappings["SAMCodeUriEnvsServices"])
+        self.assertEqual(mappings["SAMCodeUriEnvsServices"]["Dev-Api"]["CodeUri"], "DevApiFunction")
+        self.assertEqual(mappings["SAMCodeUriEnvsServices"]["Prod-Worker"]["CodeUri"], "ProdWorkerFunction")
+
+        # FindInMap should use Fn::Join for compound lookup
+        inner_body = foreach_value[2]["Fn::ForEach::Services"][2]
+        code_uri = inner_body["${Env}${Svc}Function"]["Properties"]["CodeUri"]
+        self.assertIn("Fn::FindInMap", code_uri)
+        find_in_map = code_uri["Fn::FindInMap"]
+        self.assertEqual(find_in_map[0], "SAMCodeUriEnvsServices")
+        # Second arg should be Fn::Join for compound key
+        self.assertIn("Fn::Join", find_in_map[1])
+        self.assertEqual(find_in_map[1]["Fn::Join"][0], "-")
+        self.assertEqual(find_in_map[1]["Fn::Join"][1], [{"Ref": "Env"}, {"Ref": "Svc"}])
+        self.assertEqual(find_in_map[2], "CodeUri")
+
+    def test_nested_foreach_simple_keys_when_property_references_inner_only(self):
+        """Test that nested ForEach with property referencing only inner var uses simple keys."""
+
+        foreach_key = "Fn::ForEach::Envs"
+        foreach_value = [
+            "Env",
+            ["Dev", "Prod"],
+            {
+                "Fn::ForEach::Services": [
+                    "Svc",
+                    ["Api", "Worker"],
+                    {
+                        "${Env}${Svc}Function": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "CodeUri": "./services/${Svc}",
+                                "Handler": "index.handler",
+                            },
+                        }
+                    },
+                ]
+            },
+        ]
+        modified_resources = {
+            "DevApiFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "ApiFunction", "Handler": "index.handler"},
+            },
+            "DevWorkerFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "WorkerFunction", "Handler": "index.handler"},
+            },
+            "ProdApiFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "ApiFunction", "Handler": "index.handler"},
+            },
+            "ProdWorkerFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"CodeUri": "WorkerFunction", "Handler": "index.handler"},
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={
+                "DevApiFunction": "/built/DevApiFunction",
+                "DevWorkerFunction": "/built/DevWorkerFunction",
+                "ProdApiFunction": "/built/ProdApiFunction",
+                "ProdWorkerFunction": "/built/ProdWorkerFunction",
+            },
+        )
+
+        # Mappings should use simple keys (inner only) and nesting path
+        self.assertIn("SAMCodeUriEnvsServices", mappings)
+        self.assertIn("Api", mappings["SAMCodeUriEnvsServices"])
+        self.assertIn("Worker", mappings["SAMCodeUriEnvsServices"])
+        self.assertNotIn("Dev-Api", mappings["SAMCodeUriEnvsServices"])
+
+        # FindInMap should use simple Ref (no Fn::Join)
+        inner_body = foreach_value[2]["Fn::ForEach::Services"][2]
+        code_uri = inner_body["${Env}${Svc}Function"]["Properties"]["CodeUri"]
+        find_in_map = code_uri["Fn::FindInMap"]
+        self.assertEqual(find_in_map[1], {"Ref": "Svc"})
+
+    def test_static_dotted_glue_script_location(self):
+        """Static Command.ScriptLocation must be copied via dotted path (no clobbering siblings)."""
+
+        foreach_key = "Fn::ForEach::Jobs"
+        foreach_value = [
+            "Name",
+            ["Etl1", "Etl2"],
+            {
+                "${Name}Job": {
+                    "Type": "AWS::Glue::Job",
+                    "Properties": {
+                        "Command": {"Name": "glueetl", "ScriptLocation": "./scripts/job.py"},
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "Etl1Job": {
+                "Type": "AWS::Glue::Job",
+                "Properties": {"Command": {"Name": "glueetl", "ScriptLocation": "../build/Etl1Job/job.py"}},
+            },
+            "Etl2Job": {
+                "Type": "AWS::Glue::Job",
+                "Properties": {"Command": {"Name": "glueetl", "ScriptLocation": "../build/Etl2Job/job.py"}},
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={"Etl1Job": "/built/Etl1Job", "Etl2Job": "/built/Etl2Job"},
+        )
+
+        body = foreach_value[2]
+        self.assertEqual(body["${Name}Job"]["Properties"]["Command"]["ScriptLocation"], "../build/Etl1Job/job.py")
+        # Sibling key preserved
+        self.assertEqual(body["${Name}Job"]["Properties"]["Command"]["Name"], "glueetl")
+        # No literal "Command.ScriptLocation" key was created
+        self.assertNotIn("Command.ScriptLocation", body["${Name}Job"]["Properties"])
+        # Static path: no Mapping
+        self.assertEqual(mappings, {})
+
+    def test_dynamic_dotted_glue_script_location_generates_mapping(self):
+        """Dynamic Command.ScriptLocation generates a Mapping with the leaf name and a FindInMap reference."""
+
+        foreach_key = "Fn::ForEach::Jobs"
+        foreach_value = [
+            "Name",
+            ["Etl1", "Etl2"],
+            {
+                "${Name}Job": {
+                    "Type": "AWS::Glue::Job",
+                    "Properties": {
+                        "Command": {"Name": "glueetl", "ScriptLocation": "./scripts/${Name}.py"},
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "Etl1Job": {
+                "Type": "AWS::Glue::Job",
+                "Properties": {"Command": {"Name": "glueetl", "ScriptLocation": "Etl1.py"}},
+            },
+            "Etl2Job": {
+                "Type": "AWS::Glue::Job",
+                "Properties": {"Command": {"Name": "glueetl", "ScriptLocation": "Etl2.py"}},
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={"Etl1Job": "/built/Etl1Job", "Etl2Job": "/built/Etl2Job"},
+        )
+
+        # Mapping name uses the leaf "ScriptLocation", not "Command.ScriptLocation"
+        self.assertIn("SAMScriptLocationJobs", mappings)
+        self.assertEqual(mappings["SAMScriptLocationJobs"]["Etl1"], {"ScriptLocation": "Etl1.py"})
+        self.assertEqual(mappings["SAMScriptLocationJobs"]["Etl2"], {"ScriptLocation": "Etl2.py"})
+
+        # ScriptLocation should be replaced with Fn::FindInMap at the dotted path
+        body = foreach_value[2]
+        script_location = body["${Name}Job"]["Properties"]["Command"]["ScriptLocation"]
+        self.assertEqual(
+            script_location, {"Fn::FindInMap": ["SAMScriptLocationJobs", {"Ref": "Name"}, "ScriptLocation"]}
+        )
+        # Sibling key preserved
+        self.assertEqual(body["${Name}Job"]["Properties"]["Command"]["Name"], "glueetl")
+        # No literal "Command.ScriptLocation" key
+        self.assertNotIn("Command.ScriptLocation", body["${Name}Job"]["Properties"])
+
+    def test_dynamic_dotted_lambda_image_uri_generates_mapping(self):
+        """Dynamic Code.ImageUri (Lambda image function) generates a leaf-named Mapping."""
+
+        foreach_key = "Fn::ForEach::Funcs"
+        foreach_value = [
+            "Name",
+            ["Alpha", "Beta"],
+            {
+                "${Name}Function": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Code": {"ImageUri": "local-image-${Name}:latest"},
+                        "PackageType": "Image",
+                    },
+                }
+            },
+        ]
+        modified_resources = {
+            "AlphaFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "Code": {"ImageUri": "111.dkr.ecr.us-east-1.amazonaws.com/r:Alpha"},
+                    "PackageType": "Image",
+                },
+            },
+            "BetaFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "Code": {"ImageUri": "111.dkr.ecr.us-east-1.amazonaws.com/r:Beta"},
+                    "PackageType": "Image",
+                },
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={"AlphaFunction": "/built/AlphaFunction", "BetaFunction": "/built/BetaFunction"},
+        )
+
+        # Mapping name uses leaf "ImageUri", not "Code.ImageUri"
+        self.assertIn("SAMImageUriFuncs", mappings)
+        self.assertEqual(
+            mappings["SAMImageUriFuncs"]["Alpha"], {"ImageUri": "111.dkr.ecr.us-east-1.amazonaws.com/r:Alpha"}
+        )
+
+        body = foreach_value[2]
+        image_uri = body["${Name}Function"]["Properties"]["Code"]["ImageUri"]
+        self.assertEqual(image_uri, {"Fn::FindInMap": ["SAMImageUriFuncs", {"Ref": "Name"}, "ImageUri"]})
+        # PackageType sibling preserved
+        self.assertEqual(body["${Name}Function"]["Properties"]["PackageType"], "Image")
+
+    def test_leaf_collision_across_resource_types_disambiguates_mapping_name(self):
+        """A Serverless::Function (ImageUri) and a Lambda::Function (Code.ImageUri) in the
+        same ForEach body share the same leaf "ImageUri" but different dotted paths.
+        Their generated Mapping names must NOT collide — the resource-key suffix should
+        be applied so neither set of entries silently overwrites the other.
+        """
+        foreach_key = "Fn::ForEach::Funcs"
+        foreach_value = [
+            "Name",
+            ["Alpha", "Beta"],
+            {
+                "${Name}Sam": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "ImageUri": "sam-${Name}:latest",
+                        "PackageType": "Image",
+                    },
+                },
+                "${Name}Lambda": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Code": {"ImageUri": "lambda-${Name}:latest"},
+                        "PackageType": "Image",
+                    },
+                },
+            },
+        ]
+        modified_resources = {
+            "AlphaSam": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"ImageUri": "111.dkr.ecr.us-east-1.amazonaws.com/sam:Alpha"},
+            },
+            "BetaSam": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"ImageUri": "111.dkr.ecr.us-east-1.amazonaws.com/sam:Beta"},
+            },
+            "AlphaLambda": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {"Code": {"ImageUri": "111.dkr.ecr.us-east-1.amazonaws.com/lambda:Alpha"}},
+            },
+            "BetaLambda": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {"Code": {"ImageUri": "111.dkr.ecr.us-east-1.amazonaws.com/lambda:Beta"}},
+            },
+        }
+
+        mappings = self.build_context._update_foreach_artifact_paths(
+            foreach_key,
+            foreach_value,
+            modified_resources,
+            artifacts={
+                "AlphaSam": "/built/AlphaSam",
+                "BetaSam": "/built/BetaSam",
+                "AlphaLambda": "/built/AlphaLambda",
+                "BetaLambda": "/built/BetaLambda",
+            },
+        )
+
+        # Two distinct Mapping names should exist — one per resource — disambiguated
+        # by the resource-key suffix because both leaf to "ImageUri".
+        sam_image_mappings = sorted(name for name in mappings if name.startswith("SAMImageUriFuncs"))
+        self.assertEqual(
+            len(sam_image_mappings),
+            2,
+            f"Expected two distinct SAMImageUriFuncs* mappings (one per resource type); got {sam_image_mappings}.",
+        )
+        # And neither set of entries should be lost: every collection value appears
+        # exactly once in each of the two distinct mappings.
+        for name in sam_image_mappings:
+            self.assertEqual(set(mappings[name].keys()), {"Alpha", "Beta"})
+
+
+class TestBuildContext_contains_loop_variable(TestCase):
+    """Tests for the contains_loop_variable shared function."""
+
+    def test_string_with_loop_variable(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import contains_loop_variable
+
+        self.assertTrue(contains_loop_variable("./${Name}", "Name"))
+
+    def test_string_without_loop_variable(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import contains_loop_variable
+
+        self.assertFalse(contains_loop_variable("./src", "Name"))
+
+    def test_fn_sub_with_loop_variable(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import contains_loop_variable
+
+        self.assertTrue(contains_loop_variable({"Fn::Sub": "./${Name}"}, "Name"))
+
+    def test_fn_sub_list_with_loop_variable(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import contains_loop_variable
+
+        self.assertTrue(contains_loop_variable({"Fn::Sub": ["./${Name}", {}]}, "Name"))
+
+    def test_nested_dict_with_loop_variable(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import contains_loop_variable
+
+        self.assertTrue(contains_loop_variable({"key": "./${Name}"}, "Name"))
+
+    def test_list_with_loop_variable(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import contains_loop_variable
+
+        self.assertTrue(contains_loop_variable(["./${Name}"], "Name"))
+
+    def test_non_string_value(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import contains_loop_variable
+
+        self.assertFalse(contains_loop_variable(42, "Name"))
+
+
+class TestBuildContext_substitute_loop_variable(TestCase):
+    """Tests for the substitute_loop_variable shared function."""
+
+    def test_substitutes_variable(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import substitute_loop_variable
+
+        self.assertEqual(substitute_loop_variable("${Name}Function", "Name", "Alpha"), "AlphaFunction")
+
+    def test_no_variable_present(self):
+        from samcli.lib.cfn_language_extensions.sam_integration import substitute_loop_variable
+
+        self.assertEqual(substitute_loop_variable("StaticFunction", "Name", "Alpha"), "StaticFunction")
+
+
+class TestBuildContextLanguageExtensions(TestCase):
+    """language_extensions kwarg resolves to a bool stored on the context."""
+
+    def _ctx(self, **kwargs):
+        from samcli.commands.build.build_context import BuildContext
+
+        defaults = dict(
+            resource_identifier=None,
+            template_file="template.yaml",
+            base_dir=None,
+            build_dir="build",
+            cache_dir=".cache",
+            cached=False,
+            parallel=False,
+            mode=None,
+        )
+        defaults.update(kwargs)
+        return BuildContext(**defaults)
+
+    def test_default_is_false(self):
+        ctx = self._ctx()
+        assert ctx.language_extensions_enabled is False
+
+    def test_explicit_true(self):
+        ctx = self._ctx(language_extensions=True)
+        assert ctx.language_extensions_enabled is True
+
+    def test_explicit_false_overrides_env(self):
+        with patch.dict(os.environ, {"SAM_CLI_ENABLE_LANGUAGE_EXTENSIONS": "1"}, clear=False):
+            ctx = self._ctx(language_extensions=False)
+            assert ctx.language_extensions_enabled is False
+
+    def test_none_with_env_truthy(self):
+        with patch.dict(os.environ, {"SAM_CLI_ENABLE_LANGUAGE_EXTENSIONS": "true"}, clear=False):
+            ctx = self._ctx(language_extensions=None)
+            assert ctx.language_extensions_enabled is True
+
+
+class TestMicrovmImageBuildability(TestCase):
+    """Tests for is_microvm_image_buildable and MicrovmImage collection logic."""
+
+    def test_is_buildable_with_valid_image(self):
+        from samcli.lib.providers.provider import MicrovmImage
+
+        image = MicrovmImage(name="MyImage", code_uri="./app", architecture="arm64")
+        buildable, reason = BuildContext.is_microvm_image_buildable(image)
+        self.assertTrue(buildable)
+        self.assertEqual(reason, "")
+
+    def test_is_not_buildable_zip_codeuri(self):
+        from samcli.lib.providers.provider import MicrovmImage
+
+        image = MicrovmImage(name="MyImage", code_uri="app.zip", architecture="arm64")
+        buildable, reason = BuildContext.is_microvm_image_buildable(image)
+        self.assertFalse(buildable)
+        self.assertIn(".zip", reason)
+
+    def test_is_not_buildable_skip_build(self):
+        from samcli.lib.providers.provider import MicrovmImage
+
+        image = MicrovmImage(name="MyImage", code_uri="./app", architecture="arm64", metadata={"SkipBuild": True})
+        buildable, reason = BuildContext.is_microvm_image_buildable(image)
+        self.assertFalse(buildable)
+        self.assertIn("SkipBuild", reason)
+
+    def test_is_not_buildable_none_architecture(self):
+        from samcli.lib.providers.provider import MicrovmImage
+
+        image = MicrovmImage(name="MyImage", code_uri="./app", architecture=None)
+        buildable, reason = BuildContext.is_microvm_image_buildable(image)
+        self.assertFalse(buildable)
+        self.assertIn("architecture", reason)
+
+
+class TestCollectSingleMicrovmImage(TestCase):
+    """Tests for _collect_single_microvm_image."""
+
+    def _make_context(self):
+        ctx = BuildContext(
+            resource_identifier="MyImage",
+            template_file="template.yaml",
+            base_dir=None,
+            build_dir="build",
+            cache_dir=".cache",
+            cached=False,
+            parallel=False,
+            mode=None,
+        )
+        return ctx
+
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
+    def test_collect_adds_image_unconditionally(self, mock_provider_cls):
+        from samcli.lib.providers.provider import MicrovmImage
+
+        image = MicrovmImage(name="MyImage", code_uri="./app", architecture="arm64", metadata={"SkipBuild": True})
+        ctx = self._make_context()
+        mock_provider = Mock()
+        mock_provider.get.return_value = image
+        ctx._microvm_image_provider = mock_provider
+
+        collector = ResourcesToBuildCollector()
+        ctx._collect_single_microvm_image("MyImage", collector)
+
+        self.assertEqual(len(collector.microvm_images), 1)
+        self.assertEqual(collector.microvm_images[0], image)
+
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
+    def test_collect_raises_build_error_for_none_architecture(self, mock_provider_cls):
+        from samcli.lib.providers.provider import MicrovmImage
+
+        image = MicrovmImage(name="MyImage", code_uri="./app", architecture=None)
+        ctx = self._make_context()
+        mock_provider = Mock()
+        mock_provider.get.return_value = image
+        ctx._microvm_image_provider = mock_provider
+
+        collector = ResourcesToBuildCollector()
+        with self.assertRaises(BuildError) as cm:
+            ctx._collect_single_microvm_image("MyImage", collector)
+        self.assertIn("unsupported architecture", str(cm.exception))
+
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
+    def test_collect_returns_when_image_not_found(self, mock_provider_cls):
+        ctx = self._make_context()
+        mock_provider = Mock()
+        mock_provider.get.return_value = None
+        ctx._microvm_image_provider = mock_provider
+
+        collector = ResourcesToBuildCollector()
+        ctx._collect_single_microvm_image("NonExistent", collector)
+
+        self.assertEqual(len(collector.microvm_images), 0)
+
+    def test_collect_reports_why_a_skipped_image_is_not_buildable(self):
+        ctx = self._make_context()
+        mock_provider = Mock()
+        mock_provider.get.return_value = None
+        mock_provider.get_skip_reason.return_value = "CodeUri is an S3 location; sam build only builds a local source"
+        ctx._microvm_image_provider = mock_provider
+
+        with self.assertRaisesRegex(
+            MicrovmImageSourceError, "MicrovmImage 'MyImage' is not buildable: CodeUri is an S3"
+        ):
+            ctx._collect_single_microvm_image("MyImage", ResourcesToBuildCollector())
+
+    def test_collect_does_not_report_skipped_image_when_a_function_matched(self):
+        ctx = self._make_context()
+        mock_provider = Mock()
+        mock_provider.get.return_value = None
+        mock_provider.get_skip_reason.return_value = "CodeUri is an S3 location"
+        ctx._microvm_image_provider = mock_provider
+        collector = ResourcesToBuildCollector()
+        collector.add_function(Mock())
+
+        ctx._collect_single_microvm_image("MyImage", collector)
+
+        self.assertEqual(len(collector.microvm_images), 0)
+
+
+class TestCollectAllMicrovmImages(TestCase):
+    """Tests for collect_all_build_resources MicrovmImage filtering."""
+
+    @patch("samcli.commands.build.build_context.BuildContext._is_container_runtime_available", return_value=True)
+    @patch("samcli.commands.build.build_context.SamMicrovmImageProvider")
+    @patch("samcli.commands.build.build_context.SamLayerProvider")
+    @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    def test_collect_all_skips_unbuildable_with_warning(
+        self, mock_func_prov, mock_layer_prov, mock_mvm_prov, mock_runtime_available
+    ):
+        from samcli.lib.providers.provider import MicrovmImage
+
+        buildable_image = MicrovmImage(name="Good", code_uri="./app", architecture="arm64")
+        unbuildable_image = MicrovmImage(name="Bad", code_uri="./app", architecture=None)
+
+        ctx = BuildContext(
+            resource_identifier=None,
+            template_file="template.yaml",
+            base_dir=None,
+            build_dir="build",
+            cache_dir=".cache",
+            cached=False,
+            parallel=False,
+            mode=None,
+        )
+        mock_mvm = Mock()
+        mock_mvm.get_all.return_value = [buildable_image, unbuildable_image]
+        ctx._microvm_image_provider = mock_mvm
+
+        mock_func = Mock()
+        mock_func.get_all.return_value = []
+        ctx._function_provider = mock_func
+
+        mock_layer = Mock()
+        mock_layer.get_all.return_value = []
+        ctx._layer_provider = mock_layer
+
+        result = ctx.collect_all_build_resources()
+
+        self.assertEqual(len(result.microvm_images), 1)
+        self.assertEqual(result.microvm_images[0].name, "Good")

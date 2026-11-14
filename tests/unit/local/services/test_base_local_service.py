@@ -1,5 +1,6 @@
+import signal
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, ANY
 
 from parameterized import parameterized, param
 
@@ -9,14 +10,14 @@ from samcli.local.services.base_local_service import BaseLocalService, LambdaOut
 class TestLocalHostRunner(TestCase):
     def test_runtime_error_raised_when_app_not_created(self):
         is_debugging = False
-        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1")
+        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1", ssl_context=None)
 
         with self.assertRaises(RuntimeError):
             service.run()
 
     def test_run_starts_service_multithreaded(self):
         is_debugging = False  # multithreaded
-        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1")
+        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1", ssl_context=None)
 
         service._app = Mock()
         app_run_mock = Mock()
@@ -24,11 +25,11 @@ class TestLocalHostRunner(TestCase):
 
         service.run()
 
-        app_run_mock.assert_called_once_with(threaded=True, host="127.0.0.1", port=3000)
+        app_run_mock.assert_called_once_with(threaded=True, host="127.0.0.1", port=3000, ssl_context=None)
 
     def test_run_starts_service_singlethreaded(self):
         is_debugging = True  # singlethreaded
-        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1")
+        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1", ssl_context=None)
 
         service._app = Mock()
         app_run_mock = Mock()
@@ -36,7 +37,7 @@ class TestLocalHostRunner(TestCase):
 
         service.run()
 
-        app_run_mock.assert_called_once_with(threaded=False, host="127.0.0.1", port=3000)
+        app_run_mock.assert_called_once_with(threaded=False, host="127.0.0.1", port=3000, ssl_context=None)
 
     @patch("samcli.local.services.base_local_service.Response")
     def test_service_response(self, flask_response_patch):
@@ -53,11 +54,25 @@ class TestLocalHostRunner(TestCase):
         flask_response_patch.assert_called_once_with("this is the body")
 
         self.assertEqual(actual_response.status_code, 200)
-        self.assertEqual(actual_response.headers, {"Content-Type": "application/json"})
+        flask_response_mock.headers.update.assert_called_once_with({"Content-Type": "application/json"})
+
+    @patch("samcli.local.services.base_local_service.signal.signal")
+    def test_service_registers_sigterm_interrupt(self, signal_mock):
+        service = BaseLocalService(is_debugging=False, port=3000, host="127.0.0.1", ssl_context=None)
+
+        service._app = Mock()
+        app_run_mock = Mock()
+        service._app.run = app_run_mock
+
+        service.run()
+
+        signal_mock.assert_called_once_with(signal.SIGTERM, ANY)
+
+        app_run_mock.assert_called_once_with(threaded=True, host="127.0.0.1", port=3000, ssl_context=None)
 
     def test_create_returns_not_implemented(self):
         is_debugging = False
-        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1")
+        service = BaseLocalService(is_debugging=is_debugging, port=3000, host="127.0.0.1", ssl_context=None)
 
         with self.assertRaises(NotImplementedError):
             service.create()
@@ -66,30 +81,26 @@ class TestLocalHostRunner(TestCase):
 class TestLambdaOutputParser(TestCase):
     @parameterized.expand(
         [
+            param("with mixed data and json response", 'data\n{"a": "b"}', 'data\n{"a": "b"}'),
+            param("with response as string", "response", "response"),
+            param("with json response only", '{"a": "b"}', '{"a": "b"}'),
+            param("with one new line and json", '\n{"a": "b"}', '\n{"a": "b"}'),
+            param("with response only as string", "this is the response line", "this is the response line"),
+            param("with whitespaces", 'data\n{"a": "b"}  \n\n\n', 'data\n{"a": "b"}  \n\n\n'),
+            param("with empty data", "", ""),
+            param("with just new lines", "\n\n", "\n\n"),
             param(
-                "with both logs and response", b'this\nis\nlog\ndata\n{"a": "b"}', b"this\nis\nlog\ndata", '{"a": "b"}'
-            ),
-            param("with response as string", b"logs\nresponse", b"logs", "response"),
-            param("with response only", b'{"a": "b"}', None, '{"a": "b"}'),
-            param("with one new line and response", b'\n{"a": "b"}', b"", '{"a": "b"}'),
-            param("with response only as string", b"this is the response line", None, "this is the response line"),
-            param("with whitespaces", b'log\ndata\n{"a": "b"}  \n\n\n', b"log\ndata", '{"a": "b"}'),
-            param("with empty data", b"", None, ""),
-            param("with just new lines", b"\n\n", None, ""),
-            param(
-                "with no data but with whitespaces",
-                b"\n   \n   \n",
-                b"\n   ",
-                "",  # Log data with whitespaces will be in the output unchanged
+                "with whitespaces",
+                "\n   \n   \n",
+                "\n   \n   \n",
             ),
         ]
     )
-    def test_get_lambda_output_extracts_response(self, test_case_name, stdout_data, expected_logs, expected_response):
+    def test_get_lambda_output_extracts_response(self, test_case_name, stdout_data, expected_response):
         stdout = Mock()
         stdout.getvalue.return_value = stdout_data
 
-        response, logs, is_customer_error = LambdaOutputParser.get_lambda_output(stdout)
-        self.assertEqual(logs, expected_logs)
+        response, is_customer_error = LambdaOutputParser.get_lambda_output(stdout)
         self.assertEqual(response, expected_response)
         self.assertFalse(is_customer_error)
 

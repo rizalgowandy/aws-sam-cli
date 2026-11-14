@@ -1,18 +1,20 @@
 """Base SyncFlow for StepFunctions"""
+
+import hashlib
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, TYPE_CHECKING, cast, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-
-from samcli.lib.providers.provider import Stack, get_resource_by_id, ResourceIdentifier
-from samcli.lib.sync.sync_flow import SyncFlow, ResourceAPICall
-from samcli.lib.sync.exceptions import InfraSyncRequiredError
 from samcli.lib.providers.exceptions import MissingLocalDefinition
-
+from samcli.lib.providers.provider import ResourceIdentifier, Stack, get_resource_by_id
+from samcli.lib.sync.exceptions import InfraSyncRequiredError
+from samcli.lib.sync.sync_flow import ResourceAPICall, SyncFlow, get_definition_path
+from samcli.lib.utils.hash import str_checksum
 
 if TYPE_CHECKING:  # pragma: no cover
-    from samcli.commands.deploy.deploy_context import DeployContext
     from samcli.commands.build.build_context import BuildContext
+    from samcli.commands.deploy.deploy_context import DeployContext
+    from samcli.commands.sync.sync_context import SyncContext
 
 LOG = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ class StepFunctionsSyncFlow(SyncFlow):
     _state_machine_identifier: str
     _stepfunctions_client: Any
     _stacks: List[Stack]
-    _definition_uri: Optional[str]
+    _definition_uri: Optional[Path]
     _states_definition: Optional[str]
 
     def __init__(
@@ -29,6 +31,7 @@ class StepFunctionsSyncFlow(SyncFlow):
         state_machine_identifier: str,
         build_context: "BuildContext",
         deploy_context: "DeployContext",
+        sync_context: "SyncContext",
         physical_id_mapping: Dict[str, str],
         stacks: List[Stack],
     ):
@@ -41,6 +44,8 @@ class StepFunctionsSyncFlow(SyncFlow):
             BuildContext used for build related parameters
         deploy_context : BuildContext
             DeployContext used for this deploy related parameters
+        sync_context: SyncContext
+            SyncContext object that obtains sync information.
         physical_id_mapping : Dict[str, str]
             Mapping between resource logical identifier and physical identifier
         stacks : List[Stack], optional
@@ -49,6 +54,7 @@ class StepFunctionsSyncFlow(SyncFlow):
         super().__init__(
             build_context,
             deploy_context,
+            sync_context,
             physical_id_mapping,
             log_name="StepFunctions " + state_machine_identifier,
             stacks=stacks,
@@ -58,6 +64,16 @@ class StepFunctionsSyncFlow(SyncFlow):
         self._stepfunctions_client = None
         self._definition_uri = None
         self._states_definition = None
+
+    @property
+    def sync_state_identifier(self) -> str:
+        """
+        Sync state is the unique identifier for each sync flow
+        In sync state toml file we will store
+        Key as StepFunctionsSyncFlow:StepFunctionsLogicalId
+        Value as state machine definition hash
+        """
+        return self.__class__.__name__ + ":" + self._state_machine_identifier
 
     def set_up(self) -> None:
         super().set_up()
@@ -71,22 +87,26 @@ class StepFunctionsSyncFlow(SyncFlow):
             raise InfraSyncRequiredError(self._state_machine_identifier, "DefinitionSubstitutions field is specified.")
         self._definition_uri = self._get_definition_file(self._state_machine_identifier)
         self._states_definition = self._process_definition_file()
+        if self._states_definition:
+            self._local_sha = str_checksum(self._states_definition, hashlib.sha256())
 
     def _process_definition_file(self) -> Optional[str]:
         if self._definition_uri is None:
             return None
-        with open(self._definition_uri, "r", encoding="utf-8") as states_file:
+        with open(str(self._definition_uri), "r", encoding="utf-8") as states_file:
             states_data = states_file.read()
             return states_data
 
-    def _get_definition_file(self, state_machine_identifier: str) -> Optional[str]:
-        if self._resource is None:
+    def _get_definition_file(self, state_machine_identifier: str) -> Optional[Path]:
+        if not self._resource:
             return None
-        properties = self._resource.get("Properties", {})
-        definition_file = properties.get("DefinitionUri")
-        if self._build_context.base_dir:
-            definition_file = str(Path(self._build_context.base_dir).joinpath(definition_file))
-        return cast(Optional[str], definition_file)
+        return get_definition_path(
+            self._resource,
+            state_machine_identifier,
+            self._build_context.use_base_dir,
+            self._build_context.base_dir,
+            self._stacks,
+        )
 
     def compare_remote(self) -> bool:
         # Not comparing with remote right now, instead only making update api calls

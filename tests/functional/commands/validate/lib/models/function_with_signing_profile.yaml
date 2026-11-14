@@ -5,18 +5,18 @@ Resources:
     Properties:
       CodeUri: s3://sam-demo-bucket/member_portal.zip
       Handler: index.gethtml
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       CodeSigningConfigArn: !Ref MySignedFunctionCodeSigningConfig
 
   MySignedFunctionCodeSigningConfig:
     Type: AWS::Lambda::CodeSigningConfig
     Properties:
-      Description: "Code Signing for MySignedLambdaFunction"
+      Description: Code Signing for MySignedLambdaFunction
       AllowedPublishers:
         SigningProfileVersionArns:
-          - !GetAtt SigningProfile.ProfileVersionArn
+        - !GetAtt SigningProfile.ProfileVersionArn
       CodeSigningPolicies:
-        UntrustedArtifactOnDeployment: "Enforce"
+        UntrustedArtifactOnDeployment: Enforce
 
   SigningProfile:
     Type: AWS::Signer::SigningProfile

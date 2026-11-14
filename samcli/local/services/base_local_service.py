@@ -1,16 +1,20 @@
 """Base class for all Services that interact with Local Lambda"""
 
+import io
 import json
 import logging
-import os
+import signal
+from typing import Dict, Optional, Tuple, Union
 
 from flask import Response
+
+from samcli.local.docker.exceptions import ProcessSigTermException
 
 LOG = logging.getLogger(__name__)
 
 
 class BaseLocalService:
-    def __init__(self, is_debugging, port, host):
+    def __init__(self, is_debugging, port, host, ssl_context):
         """
         Creates a BaseLocalService class
 
@@ -22,10 +26,13 @@ class BaseLocalService:
             Optional. port for the service to start listening on Defaults to 3000
         host str
             Optional. host to start the service on Defaults to '127.0.0.1
+        ssl_context tuple(str, str)
+            Optional. path to ssl certificate and key files to start service in https
         """
         self.is_debugging = is_debugging
         self.port = port
         self.host = host
+        self.ssl_context = ssl_context
         self._app = None
 
     def create(self):
@@ -56,14 +63,23 @@ class BaseLocalService:
 
         LOG.debug("Localhost server is starting up. Multi-threading = %s", multi_threaded)
 
-        # This environ signifies we are running a main function for Flask. This is true, since we are using it within
-        # our cli and not on a production server.
-        os.environ["WERKZEUG_RUN_MAIN"] = "true"
+        # Suppress flask dev server output
+        # See: https://github.com/cs01/gdbgui/issues/425#issuecomment-1119836533
+        import flask.cli
 
-        self._app.run(threaded=multi_threaded, host=self.host, port=self.port)
+        flask.cli.show_server_banner = lambda *args: None
+
+        def interrupt_handler(sig, frame):
+            LOG.debug("Caught SIGTERM interrupt")
+            raise ProcessSigTermException()
+
+        LOG.debug("Setting SIGTERM interrupt handler")
+        signal.signal(signal.SIGTERM, interrupt_handler)
+
+        self._app.run(threaded=multi_threaded, host=self.host, port=self.port, ssl_context=self.ssl_context)
 
     @staticmethod
-    def service_response(body, headers, status_code):
+    def service_response(body: str, headers: Dict[str, str], status_code: int) -> Response:
         """
         Constructs a Flask Response from the body, headers, and status_code.
 
@@ -73,14 +89,16 @@ class BaseLocalService:
         :return: Flask Response
         """
         response = Response(body)
-        response.headers = headers
+        response.headers.update(headers)
         response.status_code = status_code
         return response
 
 
 class LambdaOutputParser:
     @staticmethod
-    def get_lambda_output(stdout_stream):
+    def get_lambda_output(
+        stdout_stream_str: io.StringIO, stdout_stream_bytes: Optional[io.BytesIO] = None
+    ) -> Tuple[Union[str, bytes], bool]:
         """
         This method will extract read the given stream and return the response from Lambda function separated out
         from any log statements it might have outputted. Logs end up in the stdout stream if the Lambda function
@@ -88,38 +106,22 @@ class LambdaOutputParser:
 
         Parameters
         ----------
-        stdout_stream : io.BaseIO
+        stdout_stream_str : io.BaseIO
             Stream to fetch data from
+
+        stdout_stream_bytes : Optional[io.BytesIO], optional
+            Stream to fetch raw bytes data from
 
         Returns
         -------
         str
             String data containing response from Lambda function
-        str
-            String data containng logs statements, if any.
         bool
             If the response is an error/exception from the container
         """
-        # We only want the last line of stdout, because it's possible that
-        # the function may have written directly to stdout using
-        # System.out.println or similar, before docker-lambda output the result
-        stdout_data = stdout_stream.getvalue().rstrip(b"\n")
-
-        # Usually the output is just one line and contains response as JSON string, but if the Lambda function
-        # wrote anything directly to stdout, there will be additional lines. So just extract the last line as
-        # response and everything else as log output.
-        lambda_response = stdout_data
-        lambda_logs = None
-
-        last_line_position = stdout_data.rfind(b"\n")
-        if last_line_position >= 0:
-            # So there are multiple lines. Separate them out.
-            # Everything but the last line are logs
-            lambda_logs = stdout_data[:last_line_position]
-            # Last line is Lambda response. Make sure to strip() so we get rid of extra whitespaces & newlines around
-            lambda_response = stdout_data[last_line_position:].strip()
-
-        lambda_response = lambda_response.decode("utf-8")
+        lambda_response: Union[str, bytes] = stdout_stream_str.getvalue()
+        if stdout_stream_bytes and not lambda_response:
+            lambda_response = stdout_stream_bytes.getvalue()
 
         # When the Lambda Function returns an Error/Exception, the output is added to the stdout of the container. From
         # our perspective, the container returned some value, which is not always true. Since the output is the only
@@ -127,7 +129,7 @@ class LambdaOutputParser:
         # error
         is_lambda_user_error_response = LambdaOutputParser.is_lambda_error_response(lambda_response)
 
-        return lambda_response, lambda_logs, is_lambda_user_error_response
+        return lambda_response, is_lambda_user_error_response
 
     @staticmethod
     def is_lambda_error_response(lambda_response):
@@ -145,6 +147,9 @@ class LambdaOutputParser:
             True if the output matches the Error/Exception Dictionary otherwise False
         """
         is_lambda_user_error_response = False
+        lambda_response_error_dict_len = 2
+        lambda_response_error_with_stacktrace_dict_len = 3
+
         try:
             lambda_response_dict = json.loads(lambda_response)
 
@@ -157,13 +162,13 @@ class LambdaOutputParser:
             # 'errorMessage' and 'errorType', for languages with different error signatures
             if (
                 isinstance(lambda_response_dict, dict)
-                and len(lambda_response_dict.keys() & {"errorMessage", "errorType"}) == 2
+                and len(lambda_response_dict.keys() & {"errorMessage", "errorType"}) == lambda_response_error_dict_len
                 and (
                     (
                         len(lambda_response_dict.keys() & {"errorMessage", "errorType", "stackTrace", "cause"})
                         == len(lambda_response_dict)
                     )
-                    or (len(lambda_response_dict) == 3)
+                    or (len(lambda_response_dict) == lambda_response_error_with_stacktrace_dict_len)
                 )
             ):
                 is_lambda_user_error_response = True

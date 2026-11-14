@@ -3,24 +3,21 @@ import tempfile
 import uuid
 import time
 from subprocess import Popen, PIPE, TimeoutExpired
-from unittest import skipIf
 
 import boto3
 from parameterized import parameterized
 
 from tests.regression.deploy.regression_deploy_base import DeployRegressionBase
 from tests.regression.package.regression_package_base import PackageRegressionBase
-from tests.testing_utils import RUNNING_ON_CI, RUNNING_TEST_FOR_MASTER_ON_CI, RUN_BY_CANARY
+import pytest
 
-# Package Regression tests require credentials and CI/CD will only add credentials to the env if the PR is from the same repo.
-# This is to restrict package tests to run outside of CI/CD, when the branch is not master and tests are not run by Canary.
-SKIP_DEPLOY_REGRESSION_TESTS = RUNNING_ON_CI and RUNNING_TEST_FOR_MASTER_ON_CI and not RUN_BY_CANARY
+# These tests require AWS credentials; they are gated by the requires_credential marker.
 CFN_SLEEP = 3
 TIMEOUT = 300
 # Only testing return codes to be equivalent
 
 
-@skipIf(SKIP_DEPLOY_REGRESSION_TESTS, "Skip deploy regression tests in CI/CD only")
+@pytest.mark.requires_credential
 class TestDeployRegression(PackageRegressionBase, DeployRegressionBase):
     def setUp(self):
         self.sns_arn = os.environ.get("AWS_SNS")
@@ -53,7 +50,6 @@ class TestDeployRegression(PackageRegressionBase, DeployRegressionBase):
 
     @parameterized.expand(["aws-serverless-function.yaml"])
     def test_deploy_with_all_args(self, template_file):
-
         output_template_file = self.prepare_package(template_file=template_file)
 
         sam_stack_name = "a" + str(uuid.uuid4()).replace("-", "")[:10]
@@ -92,7 +88,8 @@ class TestDeployRegression(PackageRegressionBase, DeployRegressionBase):
             "tags": "integ=true clarity=yes",
         }
 
-        self.deploy_regression_check(arguments, sam_return_code=2, aws_return_code=2)
+        # AWS CLI v2 returns 252 for missing required arguments (command line parsing error)
+        self.deploy_regression_check(arguments, sam_return_code=2, aws_return_code=252)
 
     @parameterized.expand(["aws-serverless-function.yaml"])
     def test_deploy_with_no_capabilities(self, template_file):
@@ -136,7 +133,8 @@ class TestDeployRegression(PackageRegressionBase, DeployRegressionBase):
             "tags": "integ=true clarity=yes",
         }
         # if no template file is specified, sam cli looks for a template.yaml in the current working directory.
-        self.deploy_regression_check(arguments, sam_return_code=1, aws_return_code=2)
+        # AWS CLI v2 returns 252 for missing required arguments (command line parsing error)
+        self.deploy_regression_check(arguments, sam_return_code=1, aws_return_code=252)
 
     @parameterized.expand(["aws-serverless-function.yaml"])
     def test_deploy_with_no_changes(self, template_file):

@@ -8,22 +8,21 @@ Resources:
       Description: Created by SAM
       Handler: index.handler
       MemorySize: 1024
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Timeout: 3
       FunctionUrlConfig:
         AuthType: AWS_IAM
         Cors:
-            AllowOrigins: 
-              - "https://example.com"
-              - "example1.com"
-              - "example2.com"
-              - "example2.com"
-            AllowMethods: 
-              - "GET"
-            AllowCredentials: true
-            AllowHeaders: 
-              - "x-Custom-Header"
-            ExposeHeaders: 
-              - "x-amzn-header"
-            MaxAge: 10
-
+          AllowOrigins:
+          - https://example.com
+          - example1.com
+          - example2.com
+          - example2.com
+          AllowMethods:
+          - GET
+          AllowCredentials: true
+          AllowHeaders:
+          - x-Custom-Header
+          ExposeHeaders:
+          - x-amzn-header
+          MaxAge: 10

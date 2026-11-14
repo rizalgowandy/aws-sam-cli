@@ -1,6 +1,7 @@
 """
 Contains mapper implementations of XRay events
 """
+
 import json
 from copy import deepcopy
 from datetime import datetime
@@ -8,12 +9,12 @@ from typing import List
 
 from samcli.lib.observability.observability_info_puller import ObservabilityEventMapper
 from samcli.lib.observability.xray_traces.xray_events import (
+    XRayGraphServiceInfo,
+    XRayServiceGraphEvent,
     XRayTraceEvent,
     XRayTraceSegment,
-    XRayServiceGraphEvent,
-    XRayGraphServiceInfo,
 )
-from samcli.lib.utils.time import to_utc, utc_to_timestamp, timestamp_to_iso
+from samcli.lib.utils.time import timestamp_to_iso, to_utc, utc_to_timestamp
 
 
 class XRayTraceConsoleMapper(ObservabilityEventMapper[XRayTraceEvent]):
@@ -24,10 +25,9 @@ class XRayTraceConsoleMapper(ObservabilityEventMapper[XRayTraceEvent]):
     def map(self, event: XRayTraceEvent) -> XRayTraceEvent:
         formatted_segments = self.format_segments(event.segments)
         iso_formatted_timestamp = datetime.fromtimestamp(event.timestamp).isoformat()
-        mapped_message = (
-            f"\nXRay Event at ({iso_formatted_timestamp}) with id ({event.id}) and duration ({event.duration:.3f}s)"
-            f"{formatted_segments}"
-        )
+        revision_info = f"[revision {event.revision}] " if event.revision else ""
+        mapped_message = f"\nXRay Event {revision_info}at ({iso_formatted_timestamp}) with \
+id ({event.id}) and duration ({event.duration:.3f}s)" f"{formatted_segments}"
         event.message = mapped_message
 
         return event

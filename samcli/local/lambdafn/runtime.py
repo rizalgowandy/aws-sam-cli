@@ -1,22 +1,31 @@
 """
 Classes representing a local Lambda runtime
 """
+
 import copy
+import logging
 import os
 import shutil
-import tempfile
 import signal
-import logging
+import tempfile
 import threading
-from typing import Optional, Union, Dict
+from typing import Dict, Optional, Union
 
-from samcli.local.docker.lambda_container import LambdaContainer
-from samcli.lib.utils.file_observer import LambdaFunctionObserver
-from samcli.lib.utils.packagetype import ZIP
+from samcli.commands.exceptions import UserException
+from samcli.lib.providers.provider import LayerVersion
 from samcli.lib.telemetry.metric import capture_parameter
-from .zip import unzip
-from ...lib.providers.provider import LayerVersion
-from ...lib.utils.stream_writer import StreamWriter
+from samcli.lib.utils.file_observer import LambdaFunctionObserver
+from samcli.lib.utils.invocation_type import EVENT, REQUEST_RESPONSE
+from samcli.lib.utils.packagetype import ZIP
+from samcli.lib.utils.stream_writer import StreamWriter
+from samcli.local.docker.container import Container, ContainerContext
+from samcli.local.docker.container_analyzer import ContainerAnalyzer
+from samcli.local.docker.durable_functions_emulator_container import DurableFunctionsEmulatorContainer
+from samcli.local.docker.durable_lambda_container import DurableLambdaContainer
+from samcli.local.docker.exceptions import ContainerCreationFailedException, ContainerFailureError
+from samcli.local.docker.lambda_container import LambdaContainer
+from samcli.local.lambdafn.exceptions import UnsupportedInvocationType
+from samcli.local.lambdafn.zip import unzip
 
 LOG = logging.getLogger(__name__)
 
@@ -30,7 +39,7 @@ class LambdaRuntime:
 
     SUPPORTED_ARCHIVE_EXTENSIONS = (".zip", ".jar", ".ZIP", ".JAR")
 
-    def __init__(self, container_manager, image_builder):
+    def __init__(self, container_manager, image_builder, mount_symlinks=False, no_mem_limit=False):
         """
         Initialize the Local Lambda runtime
 
@@ -40,12 +49,35 @@ class LambdaRuntime:
             Instance of the ContainerManager class that can run a local Docker container
         image_builder samcli.local.docker.lambda_image.LambdaImage
             Instance of the LambdaImage class that can create am image
+        mount_symlinks bool
+            Optional. True is symlinks should be mounted in the container
         """
         self._container_manager = container_manager
+        self._container = None  # Track current container
         self._image_builder = image_builder
         self._temp_uncompressed_paths_to_be_cleaned = []
+        self._lock = threading.Lock()
+        self._mount_symlinks = mount_symlinks
+        self._no_mem_limit = no_mem_limit
 
-    def create(self, function_config, debug_context=None, container_host=None, container_host_interface=None):
+        """
+        Reference to an instance of the durable executions emulator container. Each instance of a lambda runtime may 
+        have an emulator container created (if the runtime is for a durable function), however, we implement a 
+        reattachment mechanism so that each instance is using the same underlying container.
+        """
+        self._durable_execution_emulator_container = None
+        # Warm containers are created in parallel, and only one of them may start the emulator
+        self._emulator_lock = threading.Lock()
+
+    def create(
+        self,
+        function_config,
+        debug_context=None,
+        container_host=None,
+        container_host_interface=None,
+        extra_hosts=None,
+        container_dns=None,
+    ):
         """
         Create a new Container for the passed function, then store it in a dictionary using the function name,
         so it can be retrieved later and used in the other functions. Make sure to use the debug_context only
@@ -59,6 +91,12 @@ class LambdaRuntime:
             Debugging context for the function (includes port, args, and path)
         container_host string
             Host of locally emulated Lambda container
+        container_host_interface string
+            Optional. Interface that Docker host binds ports to
+        extra_hosts Dict
+            Optional. Dict of hostname to IP resolutions
+        container_dns tuple
+            Optional. Tuple of DNS server IP addresses for the container
 
         Returns
         -------
@@ -70,7 +108,18 @@ class LambdaRuntime:
 
         code_dir = self._get_code_dir(function_config.code_abs_path)
         layers = [self._unarchived_layer(layer) for layer in function_config.layers]
-        container = LambdaContainer(
+        if function_config.runtime_management_config and function_config.runtime_management_config.get(
+            "RuntimeVersionArn"
+        ):
+            sam_accelerate_link = "https://s12d.com/accelerate"
+            LOG.info(
+                "This function will be invoked using the latest available runtime, which may differ from your "
+                "Runtime Management Configuration. To test this function with a pinned runtime, test on AWS with "
+                "`sam sync -–help`. Learn more here: %s",
+                sam_accelerate_link,
+            )
+
+        container_args = (
             function_config.runtime,
             function_config.imageuri,
             function_config.handler,
@@ -80,23 +129,59 @@ class LambdaRuntime:
             layers,
             self._image_builder,
             function_config.architecture,
-            memory_mb=function_config.memory,
-            env_vars=env_vars,
-            debug_options=debug_context,
-            container_host=container_host,
-            container_host_interface=container_host_interface,
-            function_full_path=function_config.full_path,
         )
+
+        container_kwargs = {
+            "memory_mb": None if self._no_mem_limit else function_config.memory,
+            "env_vars": env_vars,
+            "debug_options": debug_context,
+            "container_host": container_host,
+            "container_host_interface": container_host_interface,
+            "extra_hosts": extra_hosts,
+            "function_full_path": function_config.full_path,
+            "mount_symlinks": self._mount_symlinks,
+            "container_dns": container_dns,
+        }
+
+        # Check if this is a durable function and create appropriate container type
+        if function_config.durable_config:
+            emulator_container = self.get_or_create_emulator_container()
+            is_warm_runtime = isinstance(self, WarmLambdaRuntime)
+            container = DurableLambdaContainer(
+                *container_args,
+                emulator_container=emulator_container,
+                durable_config=function_config.durable_config,
+                is_warm_runtime=is_warm_runtime,
+                **container_kwargs,
+            )
+        else:
+            container = LambdaContainer(*container_args, **container_kwargs)
+
+        self._container = container
+
         try:
             # create the container.
-            self._container_manager.create(container)
+            self._container_manager.create(container, ContainerContext.INVOKE)
             return container
+
+        except ContainerCreationFailedException:
+            LOG.warning("Failed to create container for function %s", function_config.full_path)
+            raise
 
         except KeyboardInterrupt:
             LOG.debug("Ctrl+C was pressed. Aborting container creation")
             raise
 
-    def run(self, container, function_config, debug_context, container_host=None, container_host_interface=None):
+    def run(
+        self,
+        container,
+        function_config,
+        debug_context,
+        container_host=None,
+        container_host_interface=None,
+        extra_hosts=None,
+        container_dns=None,
+    ):
         """
         Find the created container for the passed Lambda function, then using the
         ContainerManager run this container.
@@ -114,6 +199,10 @@ class LambdaRuntime:
             Host of locally emulated Lambda container
         container_host_interface string
             Optional. Interface that Docker host binds ports to
+        extra_hosts Dict
+            Optional. Dict of hostname to IP resolutions
+        container_dns tuple
+            Optional. Tuple of DNS server IP addresses for the container
 
         Returns
         -------
@@ -122,7 +211,14 @@ class LambdaRuntime:
         """
 
         if not container:
-            container = self.create(function_config, debug_context, container_host, container_host_interface)
+            container = self.create(
+                function_config=function_config,
+                debug_context=debug_context,
+                container_host=container_host,
+                container_host_interface=container_host_interface,
+                extra_hosts=extra_hosts,
+                container_dns=container_dns,
+            )
 
         if container.is_running():
             LOG.info("Lambda function '%s' is already running", function_config.full_path)
@@ -130,7 +226,7 @@ class LambdaRuntime:
 
         try:
             # start the container.
-            self._container_manager.run(container)
+            self._container_manager.run(container, ContainerContext.INVOKE)
             return container
 
         except KeyboardInterrupt:
@@ -142,12 +238,17 @@ class LambdaRuntime:
         self,
         function_config,
         event,
+        tenant_id=None,
+        invocation_type: str = "RequestResponse",
+        durable_execution_name: Optional[str] = None,
         debug_context=None,
         stdout: Optional[StreamWriter] = None,
         stderr: Optional[StreamWriter] = None,
         container_host=None,
         container_host_interface=None,
-    ):
+        extra_hosts=None,
+        container_dns=None,
+    ) -> Optional[Dict[str, str]]:
         """
         Invoke the given Lambda function locally.
 
@@ -157,6 +258,9 @@ class LambdaRuntime:
         method in a web-server or in contexts where your application needs to be responsive when function is running,
         take care to invoke the function in a separate thread. Co-Routines or micro-threads might not perform well
         because the underlying implementation essentially blocks on a socket, which is synchronous.
+
+        Note: Concurrency control is now handled at the container level. Each container manages its own
+        semaphore based on AWS_LAMBDA_MAX_CONCURRENCY environment variable.
 
         :param FunctionConfig function_config: Configuration of the function to invoke
         :param event: String input event passed to Lambda function
@@ -169,20 +273,33 @@ class LambdaRuntime:
             Host of locally emulated Lambda container
         :param string container_host_interface: Optional.
             Interface that Docker host binds ports to
+        :param dict extra_hosts: Optional.
+            Dict of hostname to IP resolutions
+        :param tuple container_dns: Optional.
+            Tuple of DNS server IP addresses for the container
+        :returns: Optional[Dict[str, str]]
+            HTTP headers dict if this was a durable function invocation, None otherwise
         :raises Keyboard
         """
-        timer = None
         container = None
+        headers = None
         try:
             # Start the container. This call returns immediately after the container starts
-            container = self.create(function_config, debug_context, container_host, container_host_interface)
-            container = self.run(container, function_config, debug_context)
-            # Setup appropriate interrupt - timeout or Ctrl+C - before function starts executing.
-            #
-            # Start the timer **after** container starts. Container startup takes several seconds, only after which,
-            # our Lambda function code will run. Starting the timer is a reasonable approximation that function has
-            # started running.
-            timer = self._configure_interrupt(
+            container = self.create(
+                function_config, debug_context, container_host, container_host_interface, extra_hosts, container_dns
+            )
+            container = self.run(
+                container,
+                function_config,
+                debug_context,
+                container_host,
+                container_host_interface,
+                extra_hosts,
+                container_dns,
+            )
+            # Setup appropriate interrupt - timeout or Ctrl+C - before function starts executing and
+            # get callback function to start timeout timer
+            start_timer = self._configure_interrupt(
                 function_config.full_path, function_config.timeout, container, bool(debug_context)
             )
 
@@ -190,7 +307,34 @@ class LambdaRuntime:
             # Block on waiting for result from the init process on the container, below method also
             # starts another thread to stream logs. This method will terminate
             # either successfully or be killed by one of the interrupt handlers above.
-            container.wait_for_result(full_path=function_config.full_path, event=event, stdout=stdout, stderr=stderr)
+
+            if isinstance(container, DurableLambdaContainer):
+                headers = container.wait_for_result(
+                    full_path=function_config.full_path,
+                    event=event,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_timer=start_timer,
+                    durable_execution_name=durable_execution_name,
+                    invocation_type=invocation_type,
+                )
+            else:
+                # Only RequestResponse supported for regular Lambda functions
+                if invocation_type not in [EVENT, REQUEST_RESPONSE]:
+                    raise UnsupportedInvocationType(
+                        f"invocation-type: {invocation_type} is not supported. "
+                        "Only Event and RequestResponse are supported."
+                    )
+
+                # The container handles concurrency control internally via its semaphore.
+                container.wait_for_result(
+                    full_path=function_config.full_path,
+                    event=event,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_timer=start_timer,
+                    tenant_id=tenant_id,
+                )
 
         except KeyboardInterrupt:
             # When user presses Ctrl+C, we receive a Keyboard Interrupt. This is especially very common when
@@ -200,12 +344,10 @@ class LambdaRuntime:
 
         finally:
             # We will be done with execution, if either the execution completed or an interrupt was fired
-            # Any case, cleanup the timer and container.
-            #
-            # If we are in debugging mode, timer would not be created. So skip cleanup of the timer
-            if timer:
-                timer.cancel()
+            # Any case, cleanup the container.
             self._on_invoke_done(container)
+
+        return headers
 
     def _on_invoke_done(self, container):
         """
@@ -217,8 +359,29 @@ class LambdaRuntime:
            The current running container
         """
         if container:
+            self._check_exit_state(container)
             self._container_manager.stop(container)
         self._clean_decompressed_paths()
+
+    def _check_exit_state(self, container: Container):
+        """
+        Check and validate the exit state of the invoke container.
+
+        Parameters
+        ----------
+        container: Container
+            Docker container to be checked
+
+        Raises
+        -------
+        ContainerFailureError
+            If the exit reason is due to out-of-memory, return exit code 1
+
+        """
+        container_analyzer = ContainerAnalyzer(self._container_manager, container)
+        exit_state = container_analyzer.inspect()
+        if exit_state.out_of_memory:
+            raise ContainerFailureError("Container invocation failed due to maximum memory usage")
 
     def _configure_interrupt(self, function_full_path, timeout, container, is_debugging):
         """
@@ -230,8 +393,15 @@ class LambdaRuntime:
         :param integer timeout: Timeout in seconds
         :param samcli.local.docker.container.Container container: Instance of a container to terminate
         :param bool is_debugging: Are we debugging?
-        :return threading.Timer: Timer object, if we setup a timer. None otherwise
+        :return func: function to start timer, if we set one up. None otherwise
         """
+
+        def start_timer():
+            # Start a timer, we'll use this to abort the function if it runs beyond the specified timeout
+            LOG.debug("Starting a timer for %s seconds for function '%s'", timeout, function_full_path)
+            timer = threading.Timer(timeout, timer_handler, ())
+            timer.start()
+            return timer
 
         def timer_handler():
             # NOTE: This handler runs in a separate thread. So don't try to mutate any non-thread-safe data structures
@@ -248,11 +418,7 @@ class LambdaRuntime:
             signal.signal(signal.SIGTERM, signal_handler)
             return None
 
-        # Start a timer, we'll use this to abort the function if it runs beyond the specified timeout
-        LOG.debug("Starting a timer for %s seconds for function '%s'", timeout, function_full_path)
-        timer = threading.Timer(timeout, timer_handler, ())
-        timer.start()
-        return timer
+        return start_timer
 
     def _get_code_dir(self, code_path: str) -> str:
         """
@@ -262,8 +428,7 @@ class LambdaRuntime:
         This method handles a few different cases for ``code_path``:
             - ``code_path``is a existent zip/jar file: Unzip in a temp directory and return the temp directory
             - ``code_path`` is a existent directory: Return this immediately
-            - ``code_path`` is a file/dir that does not exist: Return it as is. May be this method is not clever to
-                detect the existence of the path
+            - ``code_path`` is a file/dir that does not exist: Log a warning and return it as is
 
         Parameters
         ----------
@@ -277,8 +442,16 @@ class LambdaRuntime:
             Directory containing Lambda function code. It can be mounted directly in container
         """
 
+        if code_path and not os.path.exists(code_path):
+            LOG.warning(
+                "Local code path '%s' does not exist. It will be mounted as an empty directory in the "
+                "container, which will likely cause the invocation to fail. Verify the CodeUri/ContentUri "
+                "of your function or layer, or run 'sam build' if the path is a build artifact.",
+                code_path,
+            )
+
         if code_path and os.path.isfile(code_path) and code_path.endswith(self.SUPPORTED_ARCHIVE_EXTENSIONS):
-            decompressed_dir: str = _unzip_file(code_path)
+            decompressed_dir: str = _unzip_file(code_path, mount_symlinks=self._mount_symlinks)
             self._temp_uncompressed_paths_to_be_cleaned += [decompressed_dir]
             return decompressed_dir
 
@@ -311,9 +484,53 @@ class LambdaRuntime:
         Clean the temporary decompressed code dirs
         """
         LOG.debug("Cleaning all decompressed code dirs")
-        for decompressed_dir in self._temp_uncompressed_paths_to_be_cleaned:
-            shutil.rmtree(decompressed_dir)
-        self._temp_uncompressed_paths_to_be_cleaned = []
+        with self._lock:
+            for decompressed_dir in self._temp_uncompressed_paths_to_be_cleaned:
+                shutil.rmtree(decompressed_dir)
+            self._temp_uncompressed_paths_to_be_cleaned = []
+
+    def get_or_create_emulator_container(self):
+        """
+        Get or create emulator container. Provides singleton behavior for all runtime types.
+
+        Returns:
+            DurableFunctionsEmulatorContainer: The singleton emulator container
+        """
+        with self._emulator_lock:
+            if self._durable_execution_emulator_container is None:
+                emulator_container = DurableFunctionsEmulatorContainer(
+                    skip_pull_image=self._container_manager.skip_pull_image,
+                )
+                emulator_container.start_or_attach()
+                # Only share the emulator once it started, so a failed start is retried by the next caller
+                self._durable_execution_emulator_container = emulator_container
+                LOG.debug("Created and started durable functions emulator container")
+            return self._durable_execution_emulator_container
+
+    def clean_runtime_containers(self):
+        """
+        Clean up any containers created during the runtime which haven't already been cleaned.
+
+        This is only used for durable executions since we defer the container management to
+        the durable lambda container implementation. This method is a catch-all called from
+        InvokeContext.__exit__ to ensure that we *always* cleanup the runtime container resources.
+        """
+        # Clean up lambda container
+        if self._container and isinstance(self._container, DurableLambdaContainer):
+            try:
+                self._container._stop()
+                self._container._delete()
+            except Exception as e:
+                LOG.error("Error stopping durable lambda container: %s", e)
+            finally:
+                self._container = None
+
+        # Clean up durable execution emulator container
+        with self._emulator_lock:
+            if self._durable_execution_emulator_container:
+                LOG.debug("Stopping durable functions emulator container")
+                self._durable_execution_emulator_container.stop()
+                self._durable_execution_emulator_container = None
 
 
 class WarmLambdaRuntime(LambdaRuntime):
@@ -322,7 +539,9 @@ class WarmLambdaRuntime(LambdaRuntime):
     warm containers life cycle.
     """
 
-    def __init__(self, container_manager, image_builder):
+    def __init__(
+        self, container_manager, image_builder, observer=None, mount_symlinks=False, no_mem_limit=False, no_watch=False
+    ):
         """
         Initialize the Local Lambda runtime
 
@@ -332,17 +551,36 @@ class WarmLambdaRuntime(LambdaRuntime):
             Instance of the ContainerManager class that can run a local Docker container
         image_builder samcli.local.docker.lambda_image.LambdaImage
             Instance of the LambdaImage class that can create am image
-        warm_containers bool
-            Determines if the warm containers is enabled or not.
+        observer
+            Optional observer for file watching
+        mount_symlinks bool
+            Optional. True if symlinks should be mounted in the container
+        no_mem_limit bool
+            Optional. True if memory limit should be disabled
+        no_watch bool
+            Optional. True if file watching should be disabled
         """
         self._function_configs = {}
         self._containers = {}
+        self._no_watch = no_watch
+        self._container_lock = threading.Lock()  # Thread-safe container creation
 
-        self._observer = LambdaFunctionObserver(self._on_code_change)
+        if no_watch:
+            self._observer = None
+        else:
+            self._observer = observer if observer else LambdaFunctionObserver(self._on_code_change)
 
-        super().__init__(container_manager, image_builder)
+        super().__init__(container_manager, image_builder, mount_symlinks=mount_symlinks, no_mem_limit=no_mem_limit)
 
-    def create(self, function_config, debug_context=None, container_host=None, container_host_interface=None):
+    def create(
+        self,
+        function_config,
+        debug_context=None,
+        container_host=None,
+        container_host_interface=None,
+        extra_hosts=None,
+        container_dns=None,
+    ):
         """
         Create a new Container for the passed function, then store it in a dictionary using the function name,
         so it can be retrieved later and used in the other functions. Make sure to use the debug_context only
@@ -358,6 +596,8 @@ class WarmLambdaRuntime(LambdaRuntime):
             Host of locally emulated Lambda container
         container_host_interface string
             Interface that Docker host binds ports to
+        container_dns tuple
+            Optional. Tuple of DNS server IP addresses for the container
 
         Returns
         -------
@@ -365,42 +605,57 @@ class WarmLambdaRuntime(LambdaRuntime):
             the created container
         """
 
-        # reuse the cached container if it is created, and if the function configuration is not changed
-        exist_function_config = self._function_configs.get(function_config.full_path, None)
-        container = self._containers.get(function_config.full_path, None)
-        if exist_function_config and _require_container_reloading(exist_function_config, function_config):
-            LOG.info(
-                "Lambda Function '%s' definition has been changed in the stack template, "
-                "terminate the created warm container.",
-                function_config.full_path,
+        # Thread-safe container check and creation
+        with self._container_lock:
+            function_path = function_config.full_path
+
+            # Filter debug_context: only apply if this function is the debug target
+            effective_debug_context = None
+            if debug_context and debug_context.debug_function == function_config.name:
+                effective_debug_context = debug_context
+
+            # Check existing container and whether it needs reloading
+            exist_function_config = self._function_configs.get(function_path, None)
+            container = self._containers.get(function_path, None)
+
+            # Check if we need to reload the container
+            needs_reload = _should_reload_container(
+                exist_function_config, function_config, container, effective_debug_context
             )
-            self._function_configs.pop(exist_function_config.full_path, None)
-            if container:
-                self._container_manager.stop(container)
-                self._containers.pop(exist_function_config.full_path, None)
-            self._observer.unwatch(exist_function_config)
-        elif container and container.is_created():
-            LOG.info("Reuse the created warm container for Lambda function '%s'", function_config.full_path)
+
+            if needs_reload:
+                # Clean up existing container
+                self._function_configs.pop(function_path, None)
+                if container:
+                    self._container_manager.stop(container)
+                    self._containers.pop(function_path, None)
+                if exist_function_config and self._observer is not None:
+                    self._observer.unwatch(exist_function_config)
+                container = None
+
+            # Reuse existing container if available and compatible
+            elif container and container.is_created():
+                return container
+
+            # Create new container; only watch/start observer when file watching is enabled
+            if self._observer is not None:
+                self._observer.watch(function_config)
+                self._observer.start()
+
+            container = super().create(
+                function_config,
+                effective_debug_context,
+                container_host,
+                container_host_interface,
+                extra_hosts,
+                container_dns,
+            )
+
+            # Store container and config
+            self._function_configs[function_path] = function_config
+            self._containers[function_path] = container
+
             return container
-
-        # debug_context should be used only if the function name is the one defined
-        # in debug-function option
-        if debug_context and debug_context.debug_function != function_config.name:
-            LOG.debug(
-                "Disable the debugging for Lambda Function %s, as the passed debug function is %s",
-                function_config.name,
-                debug_context.debug_function,
-            )
-            debug_context = None
-
-        self._observer.watch(function_config)
-        self._observer.start()
-
-        container = super().create(function_config, debug_context, container_host, container_host_interface)
-        self._function_configs[function_config.full_path] = function_config
-        self._containers[function_config.full_path] = container
-
-        return container
 
     def _on_invoke_done(self, container):
         """
@@ -437,6 +692,13 @@ class WarmLambdaRuntime(LambdaRuntime):
             Timer object, if we setup a timer. None otherwise
         """
 
+        def start_timer():
+            # Start a timer, we'll use this to abort the function if it runs beyond the specified timeout
+            LOG.debug("Starting a timer for %s seconds for function '%s'", timeout, function_full_path)
+            timer = threading.Timer(timeout, timer_handler, ())
+            timer.start()
+            return timer
+
         def timer_handler():
             # NOTE: This handler runs in a separate thread. So don't try to mutate any non-thread-safe data structures
             LOG.info("Function '%s' timed out after %d seconds", function_full_path, timeout)
@@ -450,11 +712,7 @@ class WarmLambdaRuntime(LambdaRuntime):
             signal.signal(signal.SIGTERM, signal_handler)
             return None
 
-        # Start a timer, we'll use this to abort the function if it runs beyond the specified timeout
-        LOG.debug("Starting a timer for %s seconds for function '%s'", timeout, function_full_path)
-        timer = threading.Timer(timeout, timer_handler, ())
-        timer.start()
-        return timer
+        return start_timer
 
     def clean_running_containers_and_related_resources(self):
         """
@@ -464,8 +722,14 @@ class WarmLambdaRuntime(LambdaRuntime):
         for function_name, container in self._containers.items():
             LOG.debug("Terminate running warm container for Lambda Function '%s'", function_name)
             self._container_manager.stop(container)
+
+        # Clear all stored state
+        self._containers.clear()
+        self._function_configs.clear()
+
         self._clean_decompressed_paths()
-        self._observer.stop()
+        if self._observer is not None:
+            self._observer.stop()
 
     def _on_code_change(self, functions):
         """
@@ -486,7 +750,8 @@ class WarmLambdaRuntime(LambdaRuntime):
                 function_full_path,
                 resource,
             )
-            self._observer.unwatch(function_config)
+            if self._observer is not None:
+                self._observer.unwatch(function_config)
             self._function_configs.pop(function_full_path, None)
             container = self._containers.get(function_full_path, None)
             if container:
@@ -494,11 +759,12 @@ class WarmLambdaRuntime(LambdaRuntime):
                 self._containers.pop(function_full_path, None)
 
 
-def _unzip_file(filepath):
+def _unzip_file(filepath, mount_symlinks=False):
     """
     Helper method to unzip a file to a temporary directory
 
     :param string filepath: Absolute path to this file
+    :param bool mount_symlinks: If True, allow symlinks pointing outside extraction directory
     :return string: Path to the temporary directory where it was unzipped
     """
 
@@ -508,8 +774,10 @@ def _unzip_file(filepath):
         os.chmod(temp_dir, 0o755)
 
     LOG.info("Decompressing %s", filepath)
-
-    unzip(filepath, temp_dir)
+    try:
+        unzip(filepath, temp_dir, mount_symlinks=mount_symlinks)
+    except ValueError as ex:
+        raise UserException(str(ex), wrapped_from=ex.__class__.__name__) from ex
 
     # The directory that Python returns might have symlinks. The Docker File sharing settings will not resolve
     # symlinks. Hence get the real path before passing to Docker.
@@ -530,3 +798,34 @@ def _require_container_reloading(exist_function_config, function_config):
         or sorted(exist_function_config.layers, key=lambda x: x.full_path)
         != sorted(function_config.layers, key=lambda x: x.full_path)
     )
+
+
+def _should_reload_container(exist_function_config, function_config, container, effective_debug_context):
+    """
+    Determine if a container needs to be reloaded based on configuration changes or debug context changes.
+
+    Parameters
+    ----------
+    exist_function_config : FunctionConfig or None
+        The existing function configuration, if any
+    function_config : FunctionConfig
+        The new function configuration
+    container : Container or None
+        The existing container, if any
+    effective_debug_context : DebugContext or None
+        The effective debug context for this function
+
+    Returns
+    -------
+    bool
+        True if the container needs to be reloaded, False otherwise
+    """
+    # Check if function configuration has changed
+    if exist_function_config and _require_container_reloading(exist_function_config, function_config):
+        return True
+
+    # Check if debug context has changed
+    if container and container.debug_options != effective_debug_context:
+        return True
+
+    return False

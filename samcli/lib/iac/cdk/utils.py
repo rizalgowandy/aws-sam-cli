@@ -2,9 +2,13 @@
 Utils for CDK-based projects
 """
 
+import logging
 import os
 from typing import Dict
 
+from samcli.lib.cfn_language_extensions.utils import is_foreach_key
+
+LOG = logging.getLogger(__name__)
 CDK_METADATA_TYPE_VALUE = "AWS::CDK::Metadata"
 CDK_PATH_METADATA_KEY = "aws:cdk:path"
 
@@ -19,7 +23,7 @@ def is_cdk_project(template: Dict) -> bool:
         CFN template to look through
 
     """
-    resources = template.get("Resources", {})
+    resources = template.get("Resources", {}) if template else {}
     cdk_project_conditions = any(
         [
             _resource_level_metadata_exists(resources),
@@ -40,7 +44,9 @@ def _resource_level_metadata_exists(resources: Dict) -> bool:
         Dict of resources to look through
 
     """
-    for _, resource in resources.items():
+    for resource_key, resource in resources.items():
+        if is_foreach_key(resource_key) or not isinstance(resource, dict):
+            continue
         if resource.get("Type", "") == CDK_METADATA_TYPE_VALUE:
             return True
     return False
@@ -56,7 +62,9 @@ def _cdk_path_metadata_exists(resources: Dict) -> bool:
         Dict of resources to look through
 
     """
-    for _, resource in resources.items():
+    for resource_key, resource in resources.items():
+        if is_foreach_key(resource_key) or not isinstance(resource, dict):
+            continue
         metadata = resource.get("Metadata", {})
         if metadata and CDK_PATH_METADATA_KEY in metadata:
             return True
@@ -70,5 +78,9 @@ def _relevant_cdk_files_are_present() -> bool:
     relevant_cdk_files = ["manifest.json", "tree.json", "cdk.json"]
     # In case a customer runs `cdk synth --no-staging > template.yaml` the template
     # will be in the project root and it's entirely possible to find the cdk.json there
-    project_files = os.listdir(os.getcwd())
-    return any(cdk_file in project_files for cdk_file in relevant_cdk_files)
+    try:
+        project_files = os.listdir(os.getcwd())
+        return any(cdk_file in project_files for cdk_file in relevant_cdk_files)
+    except FileNotFoundError as e:
+        LOG.debug("Error listing CWD: %s", e)
+        return False

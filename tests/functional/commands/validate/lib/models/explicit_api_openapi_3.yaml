@@ -14,7 +14,7 @@ Resources:
         Bucket: sam-demo-bucket
         Key: webpage.zip
       Handler: index.gethtml
-      Runtime: nodejs12.x
+      Runtime: nodejs18.x
       Policies: AmazonDynamoDBReadOnlyAccess
       Events:
         GetHtml:
@@ -46,5 +46,5 @@ Resources:
         Ref: MyStageName
       OpenApiVersion: '3.0'
       DefinitionBody:
-        "this": "is"
-        "a": "inline swagger"
+        this: is
+        a: inline swagger

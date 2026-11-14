@@ -2,11 +2,11 @@
 Methods to expose the event types and generate the event jsons for use in SAM CLI generate-event
 """
 
-import os
-import json
 import base64
+import json
+import os
 import warnings
-from typing import Dict, cast
+from typing import Any, Dict, Optional
 from urllib.parse import quote as url_quote
 
 with warnings.catch_warnings():
@@ -21,7 +21,6 @@ from samcli.lib.utils.hash import str_checksum
 
 
 class Events:
-
     """
     Events library class that loads and customizes event json files
 
@@ -43,7 +42,7 @@ class Events:
         with open(file_name) as f:
             self.event_mapping = json.load(f)
 
-    def transform(self, tags, values_to_sub):
+    def transform(self, tags: Dict[str, Any], values_to_sub: Dict[str, Any]) -> Dict[str, Any]:
         """
         transform (if needed) values_to_sub with given tags
 
@@ -69,7 +68,7 @@ class Events:
                     values_to_sub[child_tag] = child_val
         return values_to_sub
 
-    def transform_val(self, properties, val):
+    def transform_val(self, properties: Dict[str, Any], val: Optional[str]) -> str:
         """
         transform (if needed) given val with given properties
 
@@ -77,13 +76,17 @@ class Events:
         ----------
         properties: dict
             set of properties to be used for transformation
-        val: string
+        val: string or None
             the value to undergo transformation
         Returns
         -------
         transformed
-            the transformed value
+            the transformed value (always a string for template rendering)
         """
+        # Handle None values by using the default
+        if val is None:
+            val = properties.get("default", "")
+
         transformed = val
 
         # encode if needed
@@ -95,6 +98,9 @@ class Events:
         hashing = properties.get("hashing")
         if hashing is not None:
             transformed = self.hash(hashing, transformed)
+
+        # Note: dict type is handled separately in generate_event() using placeholders
+        # to avoid JSON escaping issues during template rendering
 
         return transformed
 
@@ -167,6 +173,15 @@ class Events:
 
         # set variables for easy calling
         tags = self.event_mapping[service_name][event_type]["tags"]
+
+        # Store original dict-type values before transformation
+        dict_type_values = {}
+        for tag_name, tag_properties in tags.items():
+            if tag_properties.get("type") == "dict" and tag_name in values_to_sub:
+                dict_type_values[tag_name] = values_to_sub[tag_name]
+                # Replace with a placeholder for safe template rendering
+                values_to_sub[tag_name] = f"__DICT_PLACEHOLDER_{tag_name}__"
+
         values_to_sub = self.transform(tags, values_to_sub)
 
         # construct the path to the Events json file
@@ -180,6 +195,25 @@ class Events:
 
         data = json.dumps(data, indent=2)
 
-        # return the substituted file
-        # According to chevron's code, it returns a str (A string containing the rendered template.)
-        return cast("str", renderer.render(data, values_to_sub))
+        # return the substituted file (A string containing the rendered template.)
+        rendered = renderer.render(data, values_to_sub)
+
+        # Parse the rendered result
+        rendered_json = json.loads(rendered)
+
+        # Replace placeholders with actual dict values
+        key_map = {k.lower(): k for k in rendered_json.keys()}
+        for tag_name, original_value in dict_type_values.items():
+            original_key = key_map.get(tag_name.lower())
+            if original_key:
+                placeholder = f"__DICT_PLACEHOLDER_{tag_name}__"
+                if isinstance(rendered_json[original_key], str) and rendered_json[original_key] == placeholder:
+                    try:
+                        # Parse the original JSON string value to a dict
+                        rendered_json[original_key] = json.loads(original_value)
+                    except (json.JSONDecodeError, TypeError):
+                        # If parsing fails, keep the original string value
+                        rendered_json[original_key] = original_value
+
+        # Return the final JSON with proper dictionary values
+        return json.dumps(rendered_json, indent=2)

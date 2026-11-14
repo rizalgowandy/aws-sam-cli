@@ -1,29 +1,47 @@
-from samcli.lib.utils.osutils import stderr
-from unittest import TestCase
+import platform
+import time
+import signal
+import pytest
+
+from click.testing import CliRunner
+
+from samcli.cli.global_config import GlobalConfig
+from samcli.commands.init import cli as init_cmd
+from samcli.commands.init.command import NON_INTERACTIVE_PARAM_COMBINATIONS, REQUIRED_PARAMS_HINT
+from unittest import TestCase, skipIf
 
 from parameterized import parameterized
-from subprocess import STDOUT, Popen, TimeoutExpired, PIPE
+from subprocess import Popen, TimeoutExpired, PIPE
+import json
 import os
 import shutil
 import tempfile
+
+from samcli.commands.init.init_templates import APP_TEMPLATES_REPO_NAME_WINDOWS, APP_TEMPLATES_REPO_NAME
+from samcli.lib.config.samconfig import DEFAULT_CONFIG_FILE_NAME
 from samcli.lib.utils.packagetype import IMAGE, ZIP
 
 from pathlib import Path
+
+from tests.integration.init.test_init_base import InitIntegBase
+from tests.testing_utils import get_sam_command, IS_WINDOWS, run_command
 
 TIMEOUT = 300
 
 COMMIT_ERROR = "WARN: Commit not exist:"
 
 
+@pytest.mark.xdist_group(name="sam_init")
 class TestBasicInitCommand(TestCase):
+    @pytest.mark.tier1
     def test_init_command_passes_and_dir_created(self):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "nodejs14.x",
+                    "nodejs18.x",
                     "--dependency-manager",
                     "npm",
                     "--architecture",
@@ -50,16 +68,181 @@ class TestBasicInitCommand(TestCase):
             self.assertTrue(Path(temp, "sam-app").is_dir())
             self.assertNotIn(COMMIT_ERROR, stderr)
 
+    def test_init_command_output_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs18.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                    "--output",
+                    "json",
+                ],
+                stdout=PIPE,
+                stderr=PIPE,
+            )
+            try:
+                stdout_data, stderr_data = process.communicate(timeout=TIMEOUT)
+                stdout = stdout_data.decode("utf-8")
+                stderr = stderr_data.decode("utf-8")
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+
+            # stdout must hold nothing but the single result document, so a consumer can parse it
+            self.assertEqual(len(stdout.splitlines()), 1)
+            document = json.loads(stdout)
+
+            self.assertEqual(document["type"], "result")
+            self.assertEqual(document["status"], "success")
+
+            # The reported paths must be absolute and must actually exist. Compare against
+            # abspath rather than resolve(), since the command does not resolve symlinks
+            # (on macOS /var is a symlink to /private/var).
+            self.assertEqual(document["project_directory"], os.path.abspath(os.path.join(temp, "sam-app")))
+            self.assertTrue(Path(document["project_directory"]).is_dir())
+            self.assertTrue(Path(document["template_file"]).is_file())
+
+            self.assertNotIn(COMMIT_ERROR, stderr)
+
+    def test_init_command_output_json_location_names_project_directory(self):
+        """A --location template names its own project directory, so output_dir/name is not the answer.
+
+        Kept free of hooks so it also covers the packaged CLI, where Python hooks are rejected.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            template_dir = Path(temp, "plain-template")
+            template_project_dir = Path(template_dir, "{{cookiecutter.project_name}}")
+            template_project_dir.mkdir(parents=True)
+            Path(template_dir, "cookiecutter.json").write_text(json.dumps({"project_name": "template-chosen-app"}))
+            Path(template_project_dir, "template.yaml").write_text("Resources: {}\n")
+
+            out_dir = Path(temp, "out")
+            out_dir.mkdir()
+
+            process = Popen(
+                [get_sam_command(), "init", "--location", str(template_dir), "-o", str(out_dir), "--output", "json"],
+                stdout=PIPE,
+                stderr=PIPE,
+            )
+            try:
+                stdout_data, _ = process.communicate(timeout=TIMEOUT)
+                stdout = stdout_data.decode("utf-8")
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+
+            result = [json.loads(line) for line in stdout.splitlines()][-1]
+            self.assertEqual(result["type"], "result")
+            self.assertEqual(result["status"], "success")
+
+            # The reported directory is the nested one the template named, not the parent
+            self.assertEqual(result["project_directory"], os.path.join(str(out_dir), "template-chosen-app"))
+            self.assertNotEqual(result["project_directory"], str(out_dir))
+            self.assertTrue(Path(result["project_directory"]).is_dir())
+            self.assertTrue(Path(result["template_file"]).is_file())
+
+    # Only the packaged macOS and Linux CLI rejects Python hooks. The Windows installer ships an
+    # embedded interpreter, so hooks run there and this must keep covering it.
+    @skipIf(
+        not os.environ.get("SAM_CLI_DEV") and not IS_WINDOWS,
+        "Python template hooks are rejected by the packaged macOS and Linux CLI",
+    )
+    def test_init_command_output_json_with_template_hook_output(self):
+        """A template hook runs as a subprocess writing to our stdout; stdout must stay parseable.
+
+        Also covers a --location template naming its own project directory, so output_dir/name
+        is not the answer. No --name is passed, which is why --no-interactive is absent too.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            template_dir = Path(temp, "hook-template")
+            template_project_dir = Path(template_dir, "{{cookiecutter.project_name}}")
+            template_project_dir.mkdir(parents=True)
+            Path(template_dir, "cookiecutter.json").write_text(json.dumps({"project_name": "template-chosen-app"}))
+            Path(template_project_dir, "template.yaml").write_text("Resources: {}\n")
+
+            hooks_dir = Path(template_dir, "hooks")
+            hooks_dir.mkdir()
+            # print() covers ordinary hook output; os.write covers a hook writing to the descriptor
+            Path(hooks_dir, "post_gen_project.py").write_text(
+                'import os\nprint("hook said hello")\nos.write(1, b"raw descriptor write\\n")\n'
+            )
+
+            out_dir = Path(temp, "out")
+            out_dir.mkdir()
+
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--location",
+                    str(template_dir),
+                    "-o",
+                    str(out_dir),
+                    "--output",
+                    "json",
+                ],
+                stdout=PIPE,
+                stderr=PIPE,
+            )
+            try:
+                stdout_data, _ = process.communicate(timeout=TIMEOUT)
+                stdout = stdout_data.decode("utf-8")
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+
+            # THEN every line of stdout is valid JSON, so a consumer reading line by line survives
+            lines = stdout.splitlines()
+            documents = [json.loads(line) for line in lines]
+
+            # AND the hook output is reported rather than dropped or left raw on stdout
+            info_documents = [document for document in documents if document["type"] == "info"]
+            self.assertEqual(len(info_documents), 1)
+            self.assertEqual(info_documents[0]["source"], "template")
+            self.assertIn("hook said hello", info_documents[0]["message"])
+            self.assertIn("raw descriptor write", info_documents[0]["message"])
+
+            # AND the result document is last, so it remains the terminal document
+            result = documents[-1]
+            self.assertEqual(result["type"], "result")
+            self.assertEqual(result["status"], "success")
+
+            # AND the reported directory is the nested one the template named, not the parent
+            self.assertEqual(result["project_directory"], os.path.join(str(out_dir), "template-chosen-app"))
+            self.assertNotEqual(result["project_directory"], str(out_dir))
+            self.assertTrue(Path(result["project_directory"]).is_dir())
+
+            # AND the template inside it is found rather than reported as absent
+            self.assertIsNotNone(result["template_file"])
+            self.assertTrue(Path(result["template_file"]).is_file())
+
     def test_init_command_passes_and_dir_created_image(self):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--package-type",
                     IMAGE,
                     "--base-image",
-                    "amazon/nodejs14.x-base",
+                    "amazon/nodejs22.x-base",
                     "--dependency-manager",
                     "npm",
                     "--name",
@@ -82,10 +265,10 @@ class TestBasicInitCommand(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "nodejs14.x",
+                    "nodejs22.x",
                     "--dependency-manager",
                     "npm",
                     "--app-template",
@@ -114,10 +297,10 @@ class TestBasicInitCommand(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "java8",
+                    "java21",
                     "--dependency-manager",
                     "maven",
                     "--app-template",
@@ -146,10 +329,10 @@ class TestBasicInitCommand(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "java8",
+                    "java21",
                     "--dependency-manager",
                     "gradle",
                     "--app-template",
@@ -174,14 +357,46 @@ class TestBasicInitCommand(TestCase):
             self.assertTrue(Path(temp, "sam-app-gradle").is_dir())
             self.assertNotIn(COMMIT_ERROR, stderr)
 
+    def test_init_command_go_provided_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--app-template",
+                    "hello-world-lambda-image",
+                    "--name",
+                    "sam-app-go-image",
+                    "--package-type",
+                    "Image",
+                    "--base-image",
+                    "amazon/go-provided.al2-base",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                ],
+                stdout=PIPE,
+                stderr=PIPE,
+            )
+            try:
+                stdout_data, stderr_data = process.communicate(timeout=TIMEOUT)
+                stderr = stderr_data.decode("utf-8")
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(Path(temp, "sam-app-go-image").is_dir())
+            self.assertNotIn(COMMIT_ERROR, stderr)
+
     def test_init_command_with_extra_context_parameter(self):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "java8",
+                    "java21",
                     "--dependency-manager",
                     "maven",
                     "--app-template",
@@ -212,10 +427,10 @@ class TestBasicInitCommand(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "nodejs14.x",
+                    "nodejs18.x",
                     "--dependency-manager",
                     "npm",
                     "--app-template",
@@ -246,10 +461,10 @@ class TestBasicInitCommand(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "nodejs14.x",
+                    "nodejs18.x",
                     "--dependency-manager",
                     "npm",
                     "--app-template",
@@ -280,10 +495,10 @@ class TestBasicInitCommand(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "nodejs14.x",
+                    "nodejs18.x",
                     "--dependency-manager",
                     "npm",
                     "--app-template",
@@ -309,33 +524,238 @@ class TestBasicInitCommand(TestCase):
             msg = "Invalid value for '-a' / '--architecture': invalid choice: unknown_arch. (choose from arm64, x86_64)"
             self.assertIn(capture_output, msg)
 
+    def test_init_command_passes_with_enabled_tracing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs22.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                    "--tracing",
+                ]
+            )
+            try:
+                process.communicate(timeout=TIMEOUT)
+            except TimeoutExpired:
+                process.kill()
+                raise
 
-MISSING_REQUIRED_PARAM_MESSAGE = """Error: Missing required parameters, with --no-interactive set.
-Must provide one of the following required parameter combinations:
-\t--name, --location
-\t--name, --package-type, --base-image
-\t--name, --runtime, --dependency-manager, --app-template
-You can also re-run without the --no-interactive flag to be prompted for required values.
-"""
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(Path(temp, "sam-app").is_dir())
+            self._assert_template_with_cfn_lint(Path(temp, "sam-app"))
 
-INCOMPATIBLE_PARAM_MESSAGE = """Error: You must not provide both the --{0} and --{1} parameters.
-You can run 'sam init' without any options for an interactive initialization flow, or you can provide one of the following required parameter combinations:
-\t--name, --location, or
-\t--name, --package-type, --base-image, or
-\t--name, --runtime, --app-template, --dependency-manager
-"""
+    def test_init_command_passes_with_disabled_tracing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs22.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                    "--no-tracing",
+                ]
+            )
+            try:
+                process.communicate(timeout=TIMEOUT)
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(Path(temp, "sam-app").is_dir())
+            self._assert_template_with_cfn_lint(Path(temp, "sam-app"))
+
+    def test_init_command_passes_with_enabled_application_insights(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs22.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                    "--application-insights",
+                ]
+            )
+            try:
+                process.communicate(timeout=TIMEOUT)
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(Path(temp, "sam-app").is_dir())
+            self._assert_template_with_cfn_lint(Path(temp, "sam-app"))
+
+    def test_init_command_passes_with_disabled_application_insights(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs22.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                    "--no-application-insights",
+                ]
+            )
+            try:
+                process.communicate(timeout=TIMEOUT)
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(Path(temp, "sam-app").is_dir())
+            self._assert_template_with_cfn_lint(Path(temp, "sam-app"))
+
+    def test_init_command_passes_with_structured_logging(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs18.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                    "--tracing",
+                    "--structured-logging",
+                ]
+            )
+            try:
+                process.communicate(timeout=TIMEOUT)
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(Path(temp, "sam-app").is_dir())
+            # TODO: ungate once cfn-lint support `Structured Logging`
+            # self._assert_template_with_cfn_lint(Path(temp, "sam-app"))
+
+    def test_init_command_passes_with_no_structured_logging(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs22.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                    "--no-tracing",
+                    "--no-structured-logging",
+                ]
+            )
+            try:
+                process.communicate(timeout=TIMEOUT)
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(Path(temp, "sam-app").is_dir())
+            self._assert_template_with_cfn_lint(Path(temp, "sam-app"))
+
+    def _assert_template_with_cfn_lint(self, cwd):
+        """Assert if the generated project passes cfn-lint"""
+        cmd_list = [
+            get_sam_command(),
+            "validate",
+            "--lint",
+        ]
+        result = run_command(cmd_list, cwd=cwd)
+        self.assertEqual(result.process.returncode, 0)
 
 
+# The accepted combinations are re-rendered from the command so that changing them cannot leave
+# these expectations behind, while the wording around them stays written out here to be asserted.
+def _render_combinations(separator: str) -> str:
+    return (
+        separator.join(
+            "\t" + ", ".join(f"--{param.replace('_', '-')}" for param in combination)
+            for combination in NON_INTERACTIVE_PARAM_COMBINATIONS
+        )
+        + "\n"
+    )
+
+
+MISSING_REQUIRED_PARAM_MESSAGE = (
+    "Error: Missing required parameters, with --no-interactive set.\n"
+    "Must provide one of the following required parameter combinations:\n"
+    + _render_combinations("\n")
+    + REQUIRED_PARAMS_HINT
+)
+
+INCOMPATIBLE_PARAM_MESSAGE = (
+    "Error: You must not provide both the --{0} and --{1} parameters.\n"
+    "You can run 'sam init' without any options for an interactive initialization flow, "
+    "or you can provide one of the following required parameter combinations:\n" + _render_combinations(", or\n")
+)
+
+
+@pytest.mark.xdist_group(name="sam_init")
+@pytest.mark.pr_skip
 class TestInitForParametersCompatibility(TestCase):
     def test_init_command_no_interactive_missing_name(self):
         stderr = None
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "nodejs14.x",
+                    "nodejs18.x",
                     "--dependency-manager",
                     "npm",
                     "--app-template",
@@ -356,14 +776,14 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
 
-            self.assertEqual(MISSING_REQUIRED_PARAM_MESSAGE.strip(), "\n".join(stderr.strip().splitlines()))
+            self.assertIn(MISSING_REQUIRED_PARAM_MESSAGE.strip(), "\n".join(stderr.strip().splitlines()))
 
     def test_init_command_no_interactive_apptemplate_location(self):
         stderr = None
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--app-template",
                     "hello-world",
@@ -385,7 +805,7 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
 
-            self.assertEqual(
+            self.assertIn(
                 INCOMPATIBLE_PARAM_MESSAGE.strip().format("app-template", "location"),
                 "\n".join(stderr.strip().splitlines()),
             )
@@ -395,10 +815,10 @@ class TestInitForParametersCompatibility(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--runtime",
-                    "nodejs14.x",
+                    "nodejs18.x",
                     "--no-interactive",
                     "--location",
                     "some_location",
@@ -417,7 +837,7 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
 
-            self.assertEqual(
+            self.assertIn(
                 INCOMPATIBLE_PARAM_MESSAGE.strip().format("runtime", "location"), "\n".join(stderr.strip().splitlines())
             )
 
@@ -426,10 +846,10 @@ class TestInitForParametersCompatibility(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--base-image",
-                    "amazon/nodejs14.x-base",
+                    "amazon/nodejs18.x-base",
                     "--no-interactive",
                     "--location",
                     "some_location",
@@ -448,7 +868,7 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
 
-            self.assertEqual(
+            self.assertIn(
                 INCOMPATIBLE_PARAM_MESSAGE.strip().format("base-image", "location"),
                 "\n".join(stderr.strip().splitlines()),
             )
@@ -458,12 +878,12 @@ class TestInitForParametersCompatibility(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--package-type",
                     IMAGE,
                     "--base-image",
-                    "amazon/nodejs14.x-base",
+                    "amazon/nodejs18.x-base",
                     "--no-interactive",
                     "-o",
                     temp,
@@ -480,14 +900,14 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
 
-            self.assertEqual(MISSING_REQUIRED_PARAM_MESSAGE.strip(), "\n".join(stderr.strip().splitlines()))
+            self.assertIn(MISSING_REQUIRED_PARAM_MESSAGE.strip(), "\n".join(stderr.strip().splitlines()))
 
     def test_init_command_no_interactive_packagetype_location(self):
         stderr = None
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--package-type",
                     ZIP,
@@ -509,7 +929,7 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
 
-            self.assertEqual(
+            self.assertIn(
                 INCOMPATIBLE_PARAM_MESSAGE.strip().format("package-type", "location"),
                 "\n".join(stderr.strip().splitlines()),
             )
@@ -519,10 +939,10 @@ class TestInitForParametersCompatibility(TestCase):
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--base-image",
-                    "amazon/nodejs14.x-base",
+                    "amazon/nodejs18.x-base",
                     "--no-interactive",
                     "-o",
                     temp,
@@ -539,14 +959,14 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
 
-            self.assertEqual(MISSING_REQUIRED_PARAM_MESSAGE.strip(), "\n".join(stderr.strip().splitlines()))
+            self.assertIn(MISSING_REQUIRED_PARAM_MESSAGE.strip(), "\n".join(stderr.strip().splitlines()))
 
     def test_init_command_wrong_packagetype(self):
         stderr = None
         with tempfile.TemporaryDirectory() as temp:
             process = Popen(
                 [
-                    _get_command(),
+                    get_sam_command(),
                     "init",
                     "--package-type",
                     "WrongPT",
@@ -565,17 +985,13 @@ class TestInitForParametersCompatibility(TestCase):
 
             self.assertEqual(process.returncode, 2)
             errmsg = """
-Usage: {0} init [OPTIONS]
-Try '{0} init -h' for help.
+Error: Invalid value for '-p' / '--package-type': 'WrongPT' is not one of 'Zip', 'Image'.
+            """
 
-Error: Invalid value for '-p' / '--package-type': invalid choice: WrongPT. (choose from Zip, Image)
-                        """.format(
-                _get_command()
-            )
-
-            self.assertEqual(errmsg.strip(), "\n".join(stderr.strip().splitlines()))
+            self.assertIn(errmsg.strip(), "\n".join(stderr.strip().splitlines()))
 
 
+@pytest.mark.xdist_group(name="sam_init")
 class TestInitWithArbitraryProject(TestCase):
     def setUp(self):
         self.tempdir = tempfile.mkdtemp()
@@ -591,10 +1007,18 @@ class TestInitWithArbitraryProject(TestCase):
     def tearDown(self):
         shutil.rmtree(self.tempdir)
 
+    def _validate_expected_files_exist(self, output_folder: Path, config_exists: bool = True):
+        self.assertTrue(output_folder.exists())
+        self.assertEqual(
+            set(os.listdir(str(output_folder))),
+            set(["test.txt"] + [DEFAULT_CONFIG_FILE_NAME] if config_exists else ["test.txt"]),
+        )
+        self.assertEqual(Path(output_folder, "test.txt").read_text(), "hello world")
+
     @parameterized.expand([(None,), ("project_name",)])
     def test_arbitrary_project(self, project_name):
         with tempfile.TemporaryDirectory() as temp:
-            args = [_get_command(), "init", "--location", self.zip_path, "-o", temp]
+            args = [get_sam_command(), "init", "--location", self.zip_path, "-o", temp]
             if project_name:
                 args.extend(["--name", project_name])
 
@@ -606,14 +1030,13 @@ class TestInitWithArbitraryProject(TestCase):
                 raise
 
             expected_output_folder = Path(temp, project_name) if project_name else Path(temp)
+
             self.assertEqual(process.returncode, 0)
-            self.assertTrue(expected_output_folder.exists())
-            self.assertEqual(os.listdir(str(expected_output_folder)), ["test.txt"])
-            self.assertEqual(Path(expected_output_folder, "test.txt").read_text(), "hello world")
+            self._validate_expected_files_exist(expected_output_folder, config_exists=True if project_name else False)
 
     def test_zip_not_exists(self):
         with tempfile.TemporaryDirectory() as temp:
-            args = [_get_command(), "init", "--location", str(Path("invalid", "zip", "path")), "-o", temp]
+            args = [get_sam_command(), "init", "--location", str(Path("invalid", "zip", "path")), "-o", temp]
 
             process = Popen(args)
             try:
@@ -624,9 +1047,277 @@ class TestInitWithArbitraryProject(TestCase):
 
             self.assertEqual(process.returncode, 1)
 
+    def test_location_with_no_interactive_and_name(self):
+        project_name = "test-project"
 
-def _get_command():
-    command = "sam"
-    if os.getenv("SAM_CLI_DEV"):
-        command = "samdev"
-    return command
+        with tempfile.TemporaryDirectory() as tmp:
+            args = [
+                get_sam_command(),
+                "init",
+                "--name",
+                project_name,
+                "--location",
+                self.zip_path,
+                "--no-interactive",
+                "-o",
+                tmp,
+            ]
+            process = Popen(args)
+
+            try:
+                process.communicate(timeout=TIMEOUT)
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            self.assertEqual(process.returncode, 0)
+            self._validate_expected_files_exist(Path(tmp, project_name))
+
+
+@pytest.mark.xdist_group(name="sam_init")
+class TestInteractiveInit(TestCase):
+    @pytest.mark.timeout(300)
+    def test_interactive_init(self):
+        # 1: AWS Quick Start Templates
+        # 1: Hello World Example
+        # N: Use the most popular runtime and package type? (Python and zip) [y/N]
+        # 18: nodejs20.x
+        # 1: Zip
+        # 1: Hello World Example
+        # N: Would you like to enable X-Ray tracing on the function(s) in your application?  [y/N]
+        # Y: Would you like to enable monitoring using Cloudwatch Application Insights? [y/N]
+        # Y: Would you like to set Structured Logging in JSON format on your Lambda functions? [y/N]
+        user_input = """
+1
+1
+N
+18
+1
+1
+N
+Y
+Y
+sam-interactive-init-app
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            runner = CliRunner()
+            result = runner.invoke(init_cmd, ["--output-dir", temp, "--debug"], input=user_input)
+
+            self.assertFalse(result.exception)
+            expected_output_folder = Path(temp, "sam-interactive-init-app")
+            self.assertTrue(expected_output_folder.exists)
+            self.assertTrue(expected_output_folder.is_dir())
+            self.assertTrue(Path(expected_output_folder, "hello-world").is_dir())
+            self.assertTrue(Path(expected_output_folder, "hello-world", "app.mjs").is_file())
+
+    @pytest.mark.timeout(300)
+    def test_interactive_init_default_runtime(self):
+        user_input = """
+1
+1
+Y
+N
+N
+N
+sam-interactive-init-app-default-runtime
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            runner = CliRunner()
+            result = runner.invoke(init_cmd, ["--output-dir", temp, "--debug"], input=user_input)
+
+            self.assertFalse(result.exception)
+            expected_output_folder = Path(temp, "sam-interactive-init-app-default-runtime")
+            self.assertTrue(expected_output_folder.exists)
+            self.assertTrue(expected_output_folder.is_dir())
+            self.assertTrue(Path(expected_output_folder, "hello_world").is_dir())
+            self.assertTrue(Path(expected_output_folder, "hello_world", "app.py").is_file())
+
+
+@pytest.mark.xdist_group(name="sam_init")
+class TestSubsequentInitCaching(TestCase):
+    def test_subsequent_init_skips_cloning(self):
+        from platform import system
+
+        os_name = system().lower()
+        cloned_folder_name = APP_TEMPLATES_REPO_NAME_WINDOWS if os_name == "windows" else APP_TEMPLATES_REPO_NAME
+
+        with tempfile.TemporaryDirectory() as temp:
+            project_directory = Path(temp, "sam-app")
+            cache_dir = GlobalConfig().config_dir / cloned_folder_name
+
+            # Run the first time, get cache last modification time
+            self._run_init(temp)
+            first_modification_time = self._last_modification_time(cache_dir)
+            self.assertTrue(project_directory.is_dir())
+            shutil.rmtree(project_directory)
+
+            # Run init again, get the second modification time
+            self._run_init(temp)
+            second_modification_time = self._last_modification_time(cache_dir)
+            self.assertTrue(project_directory.is_dir())
+
+            self.assertEqual(first_modification_time, second_modification_time)
+
+    def _run_init(self, cwd):
+        process = Popen(
+            [
+                get_sam_command(),
+                "init",
+                "--runtime",
+                "nodejs18.x",
+                "--dependency-manager",
+                "npm",
+                "--architecture",
+                "arm64",
+                "--app-template",
+                "hello-world",
+                "--name",
+                "sam-app",
+                "--no-interactive",
+                "-o",
+                cwd,
+            ],
+            stdout=PIPE,
+            stderr=PIPE,
+        )
+        try:
+            stdout_data, stderr_data = process.communicate(timeout=TIMEOUT)
+            stderr = stderr_data.decode("utf-8")
+        except TimeoutExpired:
+            process.kill()
+            raise
+
+        self.assertEqual(process.returncode, 0)
+        self.assertNotIn(COMMIT_ERROR, stderr)
+
+    @staticmethod
+    def _last_modification_time(file):
+        return os.path.getmtime(file)
+
+
+@pytest.mark.xdist_group(name="sam_init")
+class TestInitProducesSamconfigFile(TestCase):
+    def test_zip_template_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--runtime",
+                    "nodejs18.x",
+                    "--dependency-manager",
+                    "npm",
+                    "--architecture",
+                    "arm64",
+                    "--app-template",
+                    "hello-world",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                ],
+                stdout=PIPE,
+                stderr=PIPE,
+            )
+            try:
+                stdout_data, stderr_data = process.communicate(timeout=TIMEOUT)
+                stderr = stderr_data.decode("utf-8")
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            project_directory = Path(temp, "sam-app")
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(project_directory.is_dir())
+            self.assertNotIn(COMMIT_ERROR, stderr)
+            self._validate_zip_samconfig(project_directory)
+
+    def test_image_template_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            process = Popen(
+                [
+                    get_sam_command(),
+                    "init",
+                    "--package-type",
+                    IMAGE,
+                    "--base-image",
+                    "amazon/nodejs22.x-base",
+                    "--dependency-manager",
+                    "npm",
+                    "--name",
+                    "sam-app",
+                    "--no-interactive",
+                    "-o",
+                    temp,
+                ],
+                stdout=PIPE,
+                stderr=PIPE,
+            )
+            try:
+                stdout_data, stderr_data = process.communicate(timeout=TIMEOUT)
+                stderr = stderr_data.decode("utf-8")
+            except TimeoutExpired:
+                process.kill()
+                raise
+
+            project_directory = Path(temp, "sam-app")
+
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(project_directory.is_dir())
+            self.assertNotIn(COMMIT_ERROR, stderr)
+            self._validate_image_samconfig(project_directory)
+
+    def _validate_image_samconfig(self, project_path):
+        text = self._read_config(project_path)
+
+        self._validate_common_properties(text)
+
+        self.assertFalse(self._check_property("cached = true", text))
+        self.assertTrue(self._check_property("resolve_s3 = true", text))
+        self.assertTrue(self._check_property("resolve_image_repos = true", text))
+
+    def _validate_zip_samconfig(self, project_path):
+        text = self._read_config(project_path)
+
+        self._validate_common_properties(text)
+
+        self.assertTrue(self._check_property("cached = true", text))
+        self.assertTrue(self._check_property("resolve_s3 = true", text))
+        self.assertFalse(self._check_property("resolve_image_repos = true", text))
+
+    def _validate_common_properties(self, text):
+        self.assertTrue(self._check_property("parallel = true", text))
+        self.assertTrue(self._check_property('warm_containers = "EAGER"', text))
+        self.assertTrue(self._check_property('stack_name = "sam-app"', text))
+        self.assertTrue(self._check_property("watch = true", text))
+        self.assertTrue(self._check_property('capabilities = "CAPABILITY_IAM"', text))
+
+    @staticmethod
+    def _check_property(to_find, container):
+        return any(to_find in line for line in container)
+
+    @staticmethod
+    def _read_config(project_path):
+        with open(Path(project_path, "samconfig.toml"), "r") as f:
+            text = f.readlines()
+        return text
+
+
+@pytest.mark.xdist_group(name="sam_init")
+class TestInitCommand(InitIntegBase):
+    def test_graceful_exit(self):
+        # Run the Base Command
+        command_list = self.get_command()
+        process_execute = Popen(command_list, stdout=PIPE, stderr=PIPE)
+
+        # Wait for binary to be ready before sending interrupts.
+        time.sleep(self.BINARY_READY_WAIT_TIME)
+
+        # Send SIGINT signal
+        process_execute.send_signal(signal.CTRL_C_EVENT if platform.system().lower() == "windows" else signal.SIGINT)
+        _, stderr = process_execute.communicate(timeout=20)
+        # Process should exit gracefully with an exit code of 1.
+        self.assertEqual(process_execute.returncode, 1)
+        self.assertIn("Aborted!", stderr.decode("utf-8"))

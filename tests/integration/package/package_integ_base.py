@@ -9,12 +9,15 @@ import boto3
 from botocore.exceptions import ClientError
 
 from samcli.lib.bootstrap.companion_stack.data_types import CompanionStack
-from tests.testing_utils import method_to_stack_name
+from tests.testing_utils import method_to_stack_name, get_sam_command
 
 SLEEP = 3
 
 
 class PackageIntegBase(TestCase):
+    kms_key = None
+    ecr_repo_name = None
+
     @classmethod
     def setUpClass(cls):
         cls.region_name = os.environ.get("AWS_DEFAULT_REGION")
@@ -22,8 +25,8 @@ class PackageIntegBase(TestCase):
         Our integration tests use S3 bucket and ECR Repo to run several tests.
         Given that S3 objects are eventually consistent and we are using same bucket for
         lot of integration tests, we want to have multiple buckets to reduce
-        transient failures. In order to achieve this we created 3 buckets one for each python version we support (3.6,
-        3.7 and 3.8). Tests running for respective python version will use respective bucket.
+        transient failures. In order to achieve this we created 3 buckets one for each python version we support (3.8,
+        and 3.9). Tests running for respective python version will use respective bucket.
 
         AWS_S3 will point to a new environment variable AWS_S3_36 or AWS_S3_37 or AWS_S3_38. This is controlled by
         Appveyor. These environment variables will hold bucket name to run integration tests. Eg:
@@ -57,6 +60,7 @@ class PackageIntegBase(TestCase):
         )
         cls.bucket_name = cls.pre_created_bucket if cls.pre_created_bucket else str(uuid.uuid4())
         cls.test_data_path = Path(__file__).resolve().parents[1].joinpath("testdata", "package")
+        cls.original_test_data_path = cls.test_data_path
 
         # Intialize S3 client
         s3 = boto3.resource("s3")
@@ -80,18 +84,8 @@ class PackageIntegBase(TestCase):
         self.s3_prefix = uuid.uuid4().hex
         super().setUp()
 
-    def tearDown(self):
-        super().tearDown()
-
-    def base_command(self):
-        command = "sam"
-        if os.getenv("SAM_CLI_DEV"):
-            command = "samdev"
-
-        return command
-
+    @staticmethod
     def get_command_list(
-        self,
         s3_bucket=None,
         template=None,
         template_file=None,
@@ -105,8 +99,9 @@ class PackageIntegBase(TestCase):
         image_repository=None,
         image_repositories=None,
         resolve_s3=False,
+        resolve_image_repos=False,
     ):
-        command_list = [self.base_command(), "package"]
+        command_list = [get_sam_command(), "package"]
 
         if s3_bucket:
             command_list = command_list + ["--s3-bucket", str(s3_bucket)]
@@ -136,6 +131,8 @@ class PackageIntegBase(TestCase):
             command_list = command_list + ["--image-repositories", str(image_repositories)]
         if resolve_s3:
             command_list = command_list + ["--resolve-s3"]
+        if resolve_image_repos:
+            command_list = command_list + ["--resolve-image-repos"]
         return command_list
 
     def _method_to_stack_name(self, method_name):
